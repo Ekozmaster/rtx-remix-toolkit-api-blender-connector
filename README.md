@@ -5,3 +5,5 @@ This addon speeds up transferring assets between Blender and Remix both ways. Wi
 Installation!!
 
 Simply go to Edit-Preferences-Add-On-Install-from-Disk, then find SimpleRemix19.zip you downloaded. Done!
+
+![image](https://github.com/user-attachments/assets/d287cd8f-5c02-4255-97a0-7070c3d12896)
