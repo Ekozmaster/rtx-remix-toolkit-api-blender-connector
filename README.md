@@ -6,4 +6,13 @@ Installation!!
 
 Simply go to Edit-Preferences-Add-On-Install-from-Disk, then find SimpleRemix19.zip you downloaded. Done! Latest toolkit version from Github is needed for latest bug fixes as of 12/12/24.
 
+Usage
+
+Importing
+Select all the meshes you want to import in Remix by holding shift. Press import.
+
+Export
+Select the mesh you want to attach the new mesh to. Press export. The add-on will export the OBJ, ingest it, add it as a reference, ingest any height textures, add them to the correct mesh in Remix.
+If the mesh in Remix is a past version, it will be replaced instead. Make sure to name your meshes different names to others in your scene or they will be replaced instead!
+
 ![image](https://github.com/user-attachments/assets/d287cd8f-5c02-4255-97a0-7070c3d12896)
