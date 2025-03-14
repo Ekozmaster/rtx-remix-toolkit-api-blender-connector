@@ -483,7 +483,7 @@ def attach_original_textures(imported_objects, context, base_dir):
 
         # Iterate over each imported object
         for obj in imported_objects:
-            print(f"Processing object: {obj.name}")  # Print to console
+            print(f"Processing object: {obj.name}")
             logging.info(f"Processing object: {obj.name}")
 
             for mat_slot in obj.material_slots:
@@ -493,16 +493,14 @@ def attach_original_textures(imported_objects, context, base_dir):
                     print(f"Object '{obj.name}' has an empty material slot.")
                     continue
 
-                print(f"Processing material: {mat.name}")  # Print to console
+                print(f"Processing material: {mat.name}")
                 logging.info(f"Processing material: {mat.name}")
 
-                # Enable nodes if not already enabled
                 if not mat.use_nodes:
                     mat.use_nodes = True
                     logging.info(f"Enabled node usage for material '{mat.name}'.")
                     print(f"Enabled node usage for material '{mat.name}'.")
 
-                # Ensure there is a Principled BSDF node
                 principled_bsdf = None
                 for node in mat.node_tree.nodes:
                     if node.type == 'BSDF_PRINCIPLED':
@@ -515,7 +513,6 @@ def attach_original_textures(imported_objects, context, base_dir):
                     logging.info(f"Created Principled BSDF node for material '{mat.name}'.")
                     print(f"Created Principled BSDF node for material '{mat.name}'.")
 
-                # Ensure there is an Image Texture node
                 image_texture = None
                 for node in mat.node_tree.nodes:
                     if node.type == 'TEX_IMAGE':
@@ -528,47 +525,38 @@ def attach_original_textures(imported_objects, context, base_dir):
                     logging.info(f"Created Image Texture node for material '{mat.name}'.")
                     print(f"Created Image Texture node for material '{mat.name}'.")
 
-                # Extract the material hash from the material name
-                # Updated regex to match 'mat_HASH.suffix' pattern
                 match = re.match(r'^mat_([A-Fa-f0-9]{16})\.', mat.name)
                 if match:
                     mat_hash = match.group(1)
                     logging.debug(f"Extracted hash '{mat_hash}' from material '{mat.name}'.")
                 else:
-                    # If the material name does not have a suffix after the hash (e.g., no dot), try to extract without it
                     match = re.match(r'^mat_([A-Fa-f0-9]{16})$', mat.name)
                     if match:
                         mat_hash = match.group(1)
                         logging.debug(f"Extracted hash '{mat_hash}' from material '{mat.name}'.")
                     else:
-                        # If no hash pattern is found, log and skip texture assignment
                         logging.warning(f"Material name '{mat.name}' does not match expected hash pattern.")
                         print(f"Material name '{mat.name}' does not match expected hash pattern.")
-                        continue  # Skip to next material
+                        continue
 
-                # Construct the expected texture file name (DDS format)
                 texture_file = f"{mat_hash}.dds"
                 texture_path = os.path.join(base_dir, "textures", texture_file).replace('\\', '/')
-                print(f"Looking for texture file: {texture_file}")  # Print to console
+                print(f"Looking for texture file: {texture_file}")
                 logging.info(f"Looking for texture file: {texture_file}")
 
                 if os.path.exists(texture_path):
                     if import_original_textures:
-                        # Define the PNG texture file path
                         png_filename = f"{mat_hash}.png"
                         png_path = os.path.join(textures_subdir, png_filename).replace('\\', '/')
                         logging.info(f"Preparing to convert DDS to PNG: {texture_path} -> {png_path}")
-                        print(f"Preparing to convert DDS to PNG: {texture_path} -> {png_path}")  # Print to console
+                        print(f"Preparing to convert DDS to PNG: {texture_path} -> {png_path}")
 
-                        # Check if PNG already exists to avoid redundant conversions
                         if not os.path.exists(png_path):
                             try:
-                                # Load the DDS image
                                 dds_image = bpy.data.images.load(texture_path)
                                 logging.info(f"Loaded DDS image: {texture_path}")
-                                print(f"Loaded DDS image: {texture_path}")  # Print to console
+                                print(f"Loaded DDS image: {texture_path}")
 
-                                # Create a new image for PNG
                                 png_image = bpy.data.images.new(
                                     name=os.path.basename(png_path),
                                     width=dds_image.size[0],
@@ -577,120 +565,92 @@ def attach_original_textures(imported_objects, context, base_dir):
                                 )
                                 logging.debug(f"Created new PNG image: {png_path}")
 
-                                # Copy pixel data from DDS to PNG
                                 png_image.pixels = list(dds_image.pixels)
                                 logging.debug(f"Copied pixel data from DDS to PNG for '{png_filename}'.")
 
-                                # Set file format to PNG and save
                                 png_image.file_format = 'PNG'
                                 png_image.filepath_raw = png_path
                                 png_image.save()
 
                                 logging.info(f"Saved PNG image: {png_path}")
-                                print(f"Saved PNG image: {png_path}")  # Print to console
+                                print(f"Saved PNG image: {png_path}")
 
-                                # Unload DDS image to free memory
                                 dds_image.user_clear()
                                 bpy.data.images.remove(dds_image)
                                 logging.debug(f"Unloaded DDS image: {texture_path}")
                             except Exception as e:
                                 logging.error(f"Failed to convert DDS to PNG for texture '{texture_file}': {e}")
-                                print(f"Failed to convert DDS to PNG for texture '{texture_file}': {e}")  # Print to console
-                                continue  # Skip to next material
+                                print(f"Failed to convert DDS to PNG for texture '{texture_file}': {e}")
+                                continue
                         else:
                             logging.info(f"PNG texture already exists: {png_path}")
-                            print(f"PNG texture already exists: {png_path}")  # Print to console
+                            print(f"PNG texture already exists: {png_path}")
 
-                        # Assign the PNG image to the Image Texture node
                         try:
-                            # Check if the image is already loaded to prevent duplicates
                             existing_png = bpy.data.images.get(os.path.basename(png_path))
                             if existing_png:
                                 image_texture.image = existing_png
                                 logging.info(f"Assigned existing PNG texture '{png_filename}' to material '{mat.name}'.")
-                                print(f"Assigned existing PNG texture '{png_filename}' to material '{mat.name}'.")  # Print to console
+                                print(f"Assigned existing PNG texture '{png_filename}' to material '{mat.name}'.")
                             else:
                                 png_image = bpy.data.images.load(png_path)
                                 image_texture.image = png_image
                                 logging.info(f"Assigned PNG texture '{png_filename}' to material '{mat.name}'.")
-                                print(f"Assigned PNG texture '{png_filename}' to material '{mat.name}'.")  # Print to console
-
-                            # **Establish the connection between Image Texture and Principled BSDF**
-                            # Check if the link already exists to prevent duplicates
+                                print(f"Assigned PNG texture '{png_filename}' to material '{mat.name}'.")
                             links = mat.node_tree.links
-                            # Find the Principled BSDF input for Base Color
                             base_color_input = principled_bsdf.inputs.get('Base Color')
                             if base_color_input:
-                                # Check if a link already exists
-                                existing_links = [
-                                    link for link in links if link.to_socket == base_color_input
-                                ]
-                                # Remove existing links to Base Color if any (optional)
+                                existing_links = [link for link in links if link.to_socket == base_color_input]
                                 for link in existing_links:
                                     links.remove(link)
                                     logging.debug(f"Removed existing link to Base Color for material '{mat.name}'.")
                                     print(f"Removed existing link to Base Color for material '{mat.name}'.")
-
-                                # Create a new link from Image Texture Color output to Base Color input
                                 links.new(image_texture.outputs['Color'], base_color_input)
                                 logging.info(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                                print(f"Connected Image Texture to Base Color for material '{mat.name}'.")  # Print to console
+                                print(f"Connected Image Texture to Base Color for material '{mat.name}'.")
                             else:
                                 logging.warning(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
                                 print(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-
                         except Exception as e:
                             logging.error(f"Failed to assign PNG texture '{png_filename}' to material '{mat.name}': {e}")
-                            print(f"Failed to assign PNG texture '{png_filename}' to material '{mat.name}': {e}")  # Print to console
+                            print(f"Failed to assign PNG texture '{png_filename}' to material '{mat.name}': {e}")
                     else:
-                        # Assign the original DDS texture directly
                         try:
-                            # Check if the image is already loaded to prevent duplicates
                             existing_dds = bpy.data.images.get(os.path.basename(texture_path))
                             if existing_dds:
                                 image_texture.image = existing_dds
                                 logging.info(f"Assigned existing DDS texture '{texture_file}' to material '{mat.name}'.")
-                                print(f"Assigned existing DDS texture '{texture_file}' to material '{mat.name}'.")  # Print to console
+                                print(f"Assigned existing DDS texture '{texture_file}' to material '{mat.name}'.")
                             else:
                                 dds_image = bpy.data.images.load(texture_path)
                                 image_texture.image = dds_image
                                 logging.info(f"Assigned DDS texture '{texture_file}' to material '{mat.name}'.")
-                                print(f"Assigned DDS texture '{texture_file}' to material '{mat.name}'.")  # Print to console
-
-                            # **Establish the connection between Image Texture and Principled BSDF**
-                            # Check if the link already exists to prevent duplicates
+                                print(f"Assigned DDS texture '{texture_file}' to material '{mat.name}'.")
                             links = mat.node_tree.links
-                            # Find the Principled BSDF input for Base Color
                             base_color_input = principled_bsdf.inputs.get('Base Color')
                             if base_color_input:
-                                # Check if a link already exists
-                                existing_links = [
-                                    link for link in links if link.to_socket == base_color_input
-                                ]
-                                # Remove existing links to Base Color if any (optional)
+                                existing_links = [link for link in links if link.to_socket == base_color_input]
                                 for link in existing_links:
                                     links.remove(link)
                                     logging.debug(f"Removed existing link to Base Color for material '{mat.name}'.")
                                     print(f"Removed existing link to Base Color for material '{mat.name}'.")
-
-                                # Create a new link from Image Texture Color output to Base Color input
                                 links.new(image_texture.outputs['Color'], base_color_input)
                                 logging.info(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                                print(f"Connected Image Texture to Base Color for material '{mat.name}'.")  # Print to console
+                                print(f"Connected Image Texture to Base Color for material '{mat.name}'.")
                             else:
                                 logging.warning(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
                                 print(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-
                         except Exception as e:
                             logging.error(f"Failed to assign DDS texture '{texture_file}' to material '{mat.name}': {e}")
-                            print(f"Failed to assign DDS texture '{texture_file}' to material '{mat.name}': {e}")  # Print to console
+                            print(f"Failed to assign DDS texture '{texture_file}' to material '{mat.name}': {e}")
                 else:
                     logging.warning(f"Texture file does not exist for material '{mat.name}': {texture_path}")
-                    print(f"Texture file does not exist for material '{mat.name}': {texture_path}")  # Print to console
+                    print(f"Texture file does not exist for material '{mat.name}': {texture_path}")
 
     except Exception as e:
         logging.error(f"Error attaching original textures: {e}")
-        print(f"Error attaching original textures: {e}")  # Print to console
+        print(f"Error attaching original textures: {e}")
+
 
 def attach_mesh_reference(prim_path, usd_file, context):
     addon_prefs = context.preferences.addons[__name__].preferences
@@ -721,6 +681,7 @@ def attach_mesh_reference(prim_path, usd_file, context):
         logging.error(f"Error attaching mesh reference: {e}")
         return None
     
+
 def construct_dynamic_prim_path(reference_path, obj_name, mesh_name, append_world=True):
     try:
         if not reference_path:
@@ -739,6 +700,7 @@ def construct_dynamic_prim_path(reference_path, obj_name, mesh_name, append_worl
         logging.error(f"Error constructing dynamic prim path: {e}")
         print(f"Error constructing dynamic prim path: {e}")
         return None
+
 
 def select_mesh_prim_in_remix(reference_prim, context):
     addon_prefs = context.preferences.addons[__name__].preferences
@@ -773,6 +735,7 @@ def select_mesh_prim_in_remix(reference_prim, context):
         print(f"Error selecting mesh prim: {e}")
         return False
 
+
 def get_actual_mesh_name(mesh_objects):
     try:
         if not mesh_objects:
@@ -783,6 +746,7 @@ def get_actual_mesh_name(mesh_objects):
         print(f"Error retrieving actual mesh name: {e}")
         return "DefaultMesh"
 
+
 def handle_height_textures(context, reference_prim, exported_objects=None):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
@@ -791,21 +755,16 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
         logging.debug(f"Reference Prim: {reference_prim}")
         print(f"Reference Prim: {reference_prim}")
 
-        # Ensure exported_objects is a list or tuple
         if exported_objects is not None and not isinstance(exported_objects, (list, tuple)):
             logging.error("exported_objects should be a list or tuple of Blender objects.")
             print("Error: exported_objects should be a list or tuple of Blender objects.")
             return {'CANCELLED'}
 
-        # If exported_objects are provided, only consider these.
-        # This ensures we only process materials from objects that were actually exported.
         if exported_objects is not None:
             mesh_objects = [obj for obj in exported_objects if obj.type == 'MESH']
             logging.debug(f"Exported Objects Provided: {[obj.name for obj in mesh_objects]}")
             print(f"Exported Objects Provided: {[obj.name for obj in mesh_objects]}")
         else:
-            # If not provided, fallback to all mesh objects in the scene
-            # but ideally, you should always provide exported_objects when "export selected only" is used.
             mesh_objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
             logging.debug(f"No exported_objects provided. Using all mesh objects in the scene: {[obj.name for obj in mesh_objects]}")
             print(f"No exported_objects provided. Using all mesh objects in the scene: {[obj.name for obj in mesh_objects]}")
@@ -813,7 +772,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
         logging.debug(f"Number of mesh objects considered for height textures: {len(mesh_objects)}")
         print(f"Number of mesh objects considered for height textures: {len(mesh_objects)}")
 
-        # Collect all unique materials used by these mesh objects
         used_materials = set()
         for obj in mesh_objects:
             for slot in obj.material_slots:
@@ -823,7 +781,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
         logging.debug(f"Number of unique materials used by these meshes: {len(used_materials)}")
         print(f"Number of unique materials used by these meshes: {len(used_materials)}")
 
-        # Collect height textures from displacement or bump nodes
         height_textures_collected = []
         for material in used_materials:
             if not material.use_nodes:
@@ -836,7 +793,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                 print(f"Material '{material.name}' has no node tree. Skipping.")
                 continue
 
-            # Find displacement or bump nodes connected to a height input
             for node in node_tree.nodes:
                 if node.type in {'DISPLACEMENT', 'BUMP'}:
                     height_input = node.inputs.get('Height')
@@ -851,7 +807,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                                 print(f"Height texture file does not exist: {texture_file_path}")
                                 continue
 
-                            # Store (prim, material name, texture path)
                             height_textures_collected.append((reference_prim, material.name, texture_file_path))
                             logging.debug(f"Collected height texture for '{reference_prim}' on material '{material.name}': {texture_file_path}")
                             print(f"Collected height texture for '{reference_prim}' on material '{material.name}': {texture_file_path}")
@@ -861,7 +816,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
             print("No height textures found to process.")
             return {'FINISHED'}
 
-        # Prepare the ingestion directory
         ingest_directory = addon_prefs.remix_ingest_directory
         textures_subdir = os.path.join(ingest_directory, "textures").replace('\\', '/')
         if not os.path.exists(textures_subdir):
@@ -875,23 +829,18 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
         base_url = addon_prefs.remix_export_url.rstrip('/')
         ingest_url = f"{base_url}/material"
 
-        # Helper to convert Blender material name to Remix style
-        # e.g. Material.001 -> Material_001
         def blender_mat_to_remix(mat_name):
             return mat_name.replace('.', '_')
 
-        # We will attempt these anchors in order if diffuse_texture does not exist
         possible_anchors = [
             "diffuse_texture",
             "normalmap_texture",
             "reflectionroughness_texture",
             "metallic_texture",
             "emissive_mask_texture"
-            # Add more if your pipeline uses different inputs
         ]
 
         for prim_path, material_name, texture_file_path in height_textures_collected:
-            # Step 1: Ingest the height texture
             ingest_payload = {
                 "executor": 1,
                 "name": "Material(s)",
@@ -917,7 +866,7 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                         "selector_plugins": [{"name": "AllMaterials", "data": {}}],
                         "data": {"shader_subidentifiers": {"AperturePBR_Opacity": ".*"}},
                         "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage","data": {}}
+                        "context_plugin": {"name": "CurrentStage", "data": {}}
                     },
                     {
                         "name": "ConvertToOctahedral",
@@ -927,34 +876,34 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                         ],
                         "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files_normal"}]},
                         "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage","data": {}}
+                        "context_plugin": {"name": "CurrentStage", "data": {}}
                     },
                     {
                         "name": "ConvertToDDS",
-                        "selector_plugins": [{"name": "AllShaders","data": {}}],
+                        "selector_plugins": [{"name": "AllShaders", "data": {}}],
                         "resultor_plugins": [
-                            {"name": "FileCleanup","data": {"channel": "cleanup_files","cleanup_output": False}}
+                            {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
                         ],
                         "data": {
                             "data_flows": [
-                                {"name": "InOutData","push_input_data": True,"push_output_data": True,"channel": "cleanup_files"},
-                                {"name": "InOutData","push_output_data": True,"channel": "write_metadata"},
-                                {"name": "InOutData","push_output_data": True,"channel": "ingestion_output"}
+                                {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"},
+                                {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"},
+                                {"name": "InOutData", "push_output_data": True, "channel": "ingestion_output"}
                             ]
                         },
                         "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage","data": {}}
+                        "context_plugin": {"name": "CurrentStage", "data": {}}
                     },
                     {
                         "name": "MassTexturePreview",
-                        "selector_plugins": [{"name": "Nothing","data": {}}],
+                        "selector_plugins": [{"name": "Nothing", "data": {}}],
                         "data": {"expose_mass_queue_action_ui": True},
                         "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage","data": {}}
+                        "context_plugin": {"name": "CurrentStage", "data": {}}
                     }
                 ],
                 "resultor_plugins": [
-                    {"name": "FileMetadataWritter","data": {"channel": "write_metadata"}}
+                    {"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}
                 ]
             }
 
@@ -979,7 +928,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                 print("No completed_schemas. Can't set shader texture.")
                 return {'CANCELLED'}
 
-            # Extract the final_texture_path from ConvertToDDS plugin output_data
             final_texture_path = None
             for schema in completed_schemas:
                 for plugin in schema.get("check_plugins", []):
@@ -999,7 +947,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                 print("No .rtex.dds file found. Can't set shader texture.")
                 return {'CANCELLED'}
 
-            # Re-select the prim so we get updated texture list and shader data
             select_success = select_mesh_prim_in_remix(reference_prim, context)
             if not select_success:
                 logging.warning(f"Failed to select mesh prim before fetching shader input for material '{material_name}'.")
@@ -1009,7 +956,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
             remix_mat_name = blender_mat_to_remix(material_name)
             server_url = addon_prefs.remix_server_url.rstrip('/')
 
-            # Try each anchor until one doesn't return 422 or we run out of anchors
             height_shader_prim = None
             for anchor in possible_anchors:
                 shader_prim = f"{reference_prim}/XForms/World/Looks/{remix_mat_name}/Shader.inputs:{anchor}"
@@ -1037,7 +983,6 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                             print(f"Found height shader prim: {height_shader_prim} using anchor '{anchor}'")
                             break
                 else:
-                    # If we got a 422 or other error, try next anchor
                     status = height_prim_response.status_code if height_prim_response else 'No Response'
                     logging.debug(f"Failed to find height input with anchor '{anchor}'. Status: {status}")
                     print(f"Failed to find height input with anchor '{anchor}'. Status: {status}")
@@ -1046,9 +991,8 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
             if not height_shader_prim:
                 logging.error(f"No suitable shader anchor found for material '{material_name}' to map height texture.")
                 print(f"No suitable shader anchor found for material '{material_name}' to map height texture. Skipping this material.")
-                continue  # Skip this material since we can't find a suitable anchor
+                continue
 
-            # Update the shader input with the final_texture_path
             put_url = f"{server_url}/textures/"
             headers_put = {
                 "accept": "application/lightspeed.remix.service+json; version=1.0",
@@ -1080,6 +1024,7 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
         print(f"Error handling height textures: {e}")
         return {'CANCELLED'}
 
+
 def trim_prim_path(prim_path, segments_to_trim=0):
     try:
         segments = prim_path.strip('/').split('/')
@@ -1108,7 +1053,7 @@ def trim_prim_path(prim_path, segments_to_trim=0):
         print(f"Error trimming prim path '{prim_path}': {e}")
         return prim_path
    
-# Operator Classes
+
 class OBJECT_OT_import_usd_from_remix(Operator):
     bl_idname = "object.import_usd_from_remix"
     bl_label = "Import USD from Remix"
@@ -1132,7 +1077,6 @@ class OBJECT_OT_import_usd_from_remix(Operator):
         logging.debug("Lock acquired for USD import process.")
 
         try:
-            # Using addon_prefs for the server URL and SSL
             assets_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
             logging.info(f"Fetching assets from Remix server: {assets_url}")
 
@@ -1351,7 +1295,6 @@ class OBJECT_OT_export_and_ingest(Operator):
             for material_name, old_path, new_path in replaced_textures:
                 replace_texture(material_name, old_path, new_path)
 
-            # Use addon_prefs for selection logic
             mesh_objects = [obj for obj in (context.selected_objects if addon_prefs.remix_use_selection_only else context.scene.objects) if obj.type == 'MESH']
             logging.debug(f"Number of mesh objects to process: {len(mesh_objects)}")
             if not mesh_objects:
@@ -1382,7 +1325,8 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             forward_axis = addon_prefs.obj_export_forward_axis
             up_axis = addon_prefs.obj_export_up_axis
-            export_scale = addon_prefs.remix_export_scale
+            # Increase scale by modifying the global_scale parameter:
+            export_scale = addon_prefs.remix_export_scale * 2.0
 
             result = bpy.ops.wm.obj_export(
                 filepath=temp_filepath,
@@ -1430,6 +1374,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                 export_smooth_groups=False,
                 smooth_group_bitflags=False,
                 filter_glob='*.obj;*.mtl',
+                collection=''
             )
 
             if result != {'FINISHED'} or not os.path.exists(temp_filepath):
@@ -1439,7 +1384,6 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             mtl_filepath = temp_filepath.replace('.obj', '.mtl')
 
-            # Use addon_prefs for ingest directory
             ingested_usd = upload_to_api(temp_filepath, addon_prefs.remix_ingest_directory, context)
             if not isinstance(ingested_usd, str):
                 self.report({'ERROR'}, "Failed to ingest OBJ into Remix.")
@@ -1480,7 +1424,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                             self.report({'WARNING'}, "Failed to select mesh prim in Remix.")
                             logging.warning("Failed to select mesh prim in Remix.")
 
-                        # Pass the exported_objects list so we only process those
                         ingest_result = handle_height_textures(context, new_reference_path, exported_objects=mesh_objects)
                         if ingest_result != {'FINISHED'}:
                             self.report({'ERROR'}, "Failed to process height textures.")
@@ -1787,285 +1730,143 @@ def upload_to_api(obj_path, ingest_dir, context):
               "selector_plugins": [
                 {
                   "name": "AllMeshes",
-                  "data": {
-                    "include_geom_subset": True
-                  }
+                  "data": {"include_geom_subset": True}
                 }
               ],
               "data": {},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "DefaultMaterial",
               "selector_plugins": [
-                {
-                  "name": "AllMeshes",
-                  "data": {}
-                }
+                {"name": "AllMeshes", "data": {}}
               ],
               "data": {},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "MaterialShaders",
               "selector_plugins": [
-                {
-                  "name": "AllMaterials",
-                  "data": {}
-                }
+                {"name": "AllMaterials", "data": {}}
               ],
-              "data": {
-                "shader_subidentifiers": {
-                  "AperturePBR_Translucent": "translucent|glass|trans",
-                  "AperturePBR_Opacity": ".*"
-                }
-              },
+              "data": {"shader_subidentifiers": {"AperturePBR_Translucent": "translucent|glass|trans", "AperturePBR_Opacity": ".*"}},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "ValueMapping",
               "selector_plugins": [
-                {
-                  "name": "AllShaders",
-                  "data": {}
-                }
+                {"name": "AllShaders", "data": {}}
               ],
-              "data": {
-                "attributes": {
-                  "inputs:emissive_intensity": [
-                    {
-                      "operator": "=",
-                      "input_value": 10000,
-                      "output_value": 1
-                    }
-                  ]
-                }
-              },
+              "data": {"attributes": {"inputs:emissive_intensity": [{"operator": "=", "input_value": 10000, "output_value": 1}]}},
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "ConvertToOctahedral",
               "selector_plugins": [
-                {
-                  "name": "AllShaders",
-                  "data": {}
-                }
+                {"name": "AllShaders", "data": {}}
               ],
               "resultor_plugins": [
-                {
-                  "name": "FileCleanup",
-                  "data": {
-                    "channel": "cleanup_files",
-                    "cleanup_output": False
-                  }
-                }
+                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
               ],
-              "data": {
-                "data_flows": [
-                  {
-                    "name": "InOutData",
-                    "push_input_data": True,
-                    "push_output_data": True,
-                    "channel": "cleanup_files"
-                  }
-                ]
-              },
+              "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "ConvertToDDS",
               "selector_plugins": [
-                {
-                  "name": "AllShaders",
-                  "data": {}
-                }
+                {"name": "AllShaders", "data": {}}
               ],
               "resultor_plugins": [
-                {
-                  "name": "FileCleanup",
-                  "data": {
-                    "channel": "cleanup_files",
-                    "cleanup_output": False
-                  }
-                }
+                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
               ],
               "data": {
                 "data_flows": [
-                  {
-                    "name": "InOutData",
-                    "push_input_data": True,
-                    "push_output_data": True,
-                    "channel": "cleanup_files"
-                  },
-                  {
-                    "name": "InOutData",
-                    "push_output_data": True,
-                    "channel": "write_metadata"
-                  }
+                  {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"},
+                  {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}
                 ]
               },
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "RelativeAssetPaths",
               "selector_plugins": [
-                {
-                  "name": "AllPrims",
-                  "data": {}
-                }
+                {"name": "AllPrims", "data": {}}
               ],
               "data": {},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "RelativeReferences",
               "selector_plugins": [
-                {
-                  "name": "AllPrims",
-                  "data": {}
-                }
+                {"name": "AllPrims", "data": {}}
               ],
               "data": {},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "DependencyIterator",
-                "data": {
-                  "save_all_layers_on_exit": True,
-                  "close_dependency_between_round": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "WrapRootPrims",
               "selector_plugins": [
-                {
-                  "name": "Nothing",
-                  "data": {}
-                }
+                {"name": "Nothing", "data": {}}
               ],
-              "data": {
-                "wrap_prim_name": "XForms"
-              },
+              "data": {"wrap_prim_name": "XForms"},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "CurrentStage",
-                "data": {
-                  "save_on_exit": True,
-                  "close_stage_on_exit": False
-                }
-              }
-            },
-            {
-              "name": "ApplyUnitScale",
-              "selector_plugins": [
-                {
-                  "name": "RootPrims",
-                  "data": {}
-                }
-              ],
-              "data": {
-                "meters_per_unit_target": 0.01,
-                "expose_mass_ui": True
-              },
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "CurrentStage",
-                "data": {
-                  "save_on_exit": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_on_exit": True, "close_stage_on_exit": False}
               }
             },
             {
               "name": "WrapRootPrims",
               "selector_plugins": [
-                {
-                  "name": "Nothing",
-                  "data": {}
-                }
+                {"name": "Nothing", "data": {}}
               ],
-              "data": {
-                "wrap_prim_name": "ReferenceTarget"
-              },
+              "data": {"wrap_prim_name": "ReferenceTarget"},
               "stop_if_fix_failed": True,
               "context_plugin": {
                 "name": "CurrentStage",
-                "data": {
-                  "save_on_exit": True,
-                  "close_stage_on_exit": False
-                }
+                "data": {"save_on_exit": True, "close_stage_on_exit": False}
               }
             }
           ],
           "resultor_plugins": [
             {
               "name": "FileCleanup",
-              "data": {
-                "channel": "cleanup_files",
-                "cleanup_output": False
-              }
+              "data": {"channel": "cleanup_files", "cleanup_output": False}
             },
             {
               "name": "FileMetadataWritter",
-              "data": {
-                "channel": "write_metadata"
-              }
+              "data": {"channel": "write_metadata"}
             }
           ]
         }
@@ -2094,6 +1895,7 @@ def upload_to_api(obj_path, ingest_dir, context):
     finally:
         pass
     
+
 def check_blend_file_in_prims(blend_name, context):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
@@ -2147,45 +1949,23 @@ def check_blend_file_in_prims(blend_name, context):
         logging.error(f"Error checking prims: {e}")
         return None, None
     
+
 def extract_base_name(blend_name):
     match = re.match(r"^(.*?)(?:_\d+)?$", blend_name)
     if match:
         return match.group(1)
     return blend_name
 
+
 def fetch_file_paths_from_reference_prim(reference_prim, context):
-    """
-    Updated version:
-    Previously, this function attempted to verify the existence of a .dds file 
-    before ingestion had produced it, causing premature failure.
-
-    Now, it only returns the directories or original texture paths as needed, 
-    without checking for the final .dds file. If you need to confirm that the 
-    original source texture exists, you can add a check for that instead.
-    """
-
     addon_prefs = context.preferences.addons[__name__].preferences
     ingest_directory = addon_prefs.remix_ingest_directory
     textures_subdir = os.path.join(ingest_directory, "textures").replace('\\', '/')
-
-    # If you have an original texture file you know should exist before ingestion,
-    # you can check for it here. For example, if you expect a JPG file:
-    # original_texture = "PavingStones142_2K-JPG_Displacement.jpg"
-    # original_path = os.path.join(textures_subdir, original_texture)
-    # if not os.path.exists(original_path):
-    #     logging.warning(f"Original texture file does not exist yet: {original_path}")
-    #     print(f"Original texture file does not exist yet: {original_path}")
-    #     return None, None
-
-    # Since we are removing the premature DDS check, just return the directory.
-    # The ingestion process will create the DDS later.
     logging.debug(f"Returning textures directory: {textures_subdir}")
     print(f"Returning textures directory: {textures_subdir}")
-
-    # Return (existing_path, existing_layer) format as before, 
-    # but now just directories or placeholders
     return textures_subdir, textures_subdir
     
+
 def replace_mesh_with_put_request(prim_path, new_usd, existing_path='', existing_layer='', context=None):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
@@ -2268,6 +2048,7 @@ def replace_mesh_with_put_request(prim_path, new_usd, existing_path='', existing
     finally:
         pass
     
+
 def append_mesh_with_post_request(reference_path, ingested_usd, context):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
@@ -2337,48 +2118,36 @@ def append_mesh_with_post_request(reference_path, ingested_usd, context):
         print(f"Error appending mesh via POST request: {e}")
         return False, None
     
-def mirror_object(obj):
-    """
-    Mirror the given object along the X-axis using bmesh and flip normals by reversing polygon winding.
 
-    :param obj: The Blender object to mirror.
-    """
+def mirror_object(obj):
     try:
         logging.debug(f"Starting mirroring process for object: {obj.name}")
 
-        # Ensure the object is a mesh
         if obj and obj.type == 'MESH':
-            # Deselect all objects and select the target object
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             bpy.context.view_layer.objects.active = obj
 
-            # Apply scale transformation
             bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
             logging.debug(f"Applied scale transformations for object '{obj.name}'.")
 
-            # Create a BMesh from the object's mesh data
             mesh = obj.data
             bm = bmesh.new()
             bm.from_mesh(mesh)
 
-            # Mirror the vertices along the X-axis
             for vert in bm.verts:
                 vert.co.x *= -1
 
             logging.debug(f"Mirrored vertices for object '{obj.name}' along the X-axis.")
 
-            # Flip the normals by reversing the vertex order of each face
             for face in bm.faces:
                 face.normal_flip()
 
             logging.debug(f"Flipped normals for object '{obj.name}'.")
 
-            # Update the mesh with the modified BMesh
             bm.to_mesh(mesh)
             bm.free()
 
-            # Update the mesh
             mesh.update()
             logging.debug(f"Mesh updated for object '{obj.name}'.")
 
@@ -2390,7 +2159,7 @@ def mirror_object(obj):
         logging.error(f"Error mirroring object '{obj.name}': {e}")
         print(f"Error mirroring object '{obj.name}': {e}")
         
-# Popup Operator
+
 class OBJECT_OT_show_popup(Operator):
     bl_idname = "object.show_popup"
     bl_label = "Popup Message"
