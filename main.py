@@ -1177,6 +1177,15 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def execute(self, context):
         addon_prefs = context.preferences.addons[__name__].preferences
+        
+        # Check if the ingest directory is still the default one.
+        if addon_prefs.remix_ingest_directory.strip() == "/ProjectFolder/Assets":
+            popup_message = "Please change the Ingest Directory to inside the Project folder."
+            logging.warning(popup_message)
+            # Using the same popup code as for unsaved blend file.
+            bpy.ops.object.show_popup('INVOKE_DEFAULT', message=popup_message, success=False)
+            return {'CANCELLED'}
+
         global export_lock
         if export_lock:
             self.report({'INFO'}, "Another export is already in progress.")
@@ -1189,6 +1198,7 @@ class OBJECT_OT_export_and_ingest(Operator):
             bpy.ops.object.show_popup('INVOKE_DEFAULT', message=popup_message, success=False)
             return {'CANCELLED'}
 
+        # (Rest of your existing code follows unchanged...)
         bpy.ops.file.unpack_all(method="USE_LOCAL")
         logging.info("Successfully unpacked all packed files.")
         self.report({'INFO'}, "All packed files have been unpacked.")
@@ -1213,14 +1223,12 @@ class OBJECT_OT_export_and_ingest(Operator):
                 for obj_name, mat_name, node_name, img_path in missing_textures:
                     error_message += f" - Object: {obj_name}, Material: {mat_name}, Node: {node_name}, Path: {img_path}\n"
                 logging.error(error_message)
-
                 self.report({'ERROR'}, "Missing texture files. Check the log for details.")
                 bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_message, success=False)
-
                 export_lock = False
                 logging.debug("Lock released for export process due to missing textures.")
                 return {'CANCELLED'}
-
+                
             success, replaced_textures = convert_exr_textures_to_png(context)
             if not isinstance(success, bool) or not isinstance(replaced_textures, list):
                 error_message = "convert_exr_textures_to_png() should return a tuple (bool, list)."
@@ -1618,6 +1626,9 @@ def copy_exported_files(obj_path, mtl_path, destination):
         logging.error(f"Failed to copy exported files: {e}")
         return False
 
+# At module scope, add this global variable:
+ingest_error_message = ""
+
 def upload_to_api(obj_path, ingest_dir, context):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
@@ -1633,189 +1644,208 @@ def upload_to_api(obj_path, ingest_dir, context):
         logging.debug(f"USD Output Path: {usd_output_path}")
 
         payload = {
-          "executor": 1,
-          "name": "Model(s)",
-          "context_plugin": {
-            "name": "AssetImporter",
-            "data": {
-              "context_name": "ingestcraft",
-              "input_files": [abs_obj_path],
-              "output_directory": meshes_subdir,
-              "allow_empty_input_files_list": True,
-              "data_flows": [
+            "executor": 1,
+            "name": "Model(s)",
+            "context_plugin": {
+                "name": "AssetImporter",
+                "data": {
+                    "context_name": "ingestcraft",
+                    "input_files": [abs_obj_path],
+                    "output_directory": meshes_subdir,
+                    "allow_empty_input_files_list": True,
+                    "data_flows": [
+                        {
+                            "name": "InOutData",
+                            "push_input_data": True,
+                            "push_output_data": True,
+                            "channel": "write_metadata"
+                        },
+                        {
+                            "name": "InOutData",
+                            "push_output_data": True,
+                            "channel": "ingestion_output"
+                        }
+                    ],
+                    "output_usd_extension": "usd",
+                    "hide_context_ui": True,
+                    "create_context_if_not_exist": True,
+                    "ignore_unbound_bones": False,
+                    "expose_mass_ui": True,
+                    "expose_mass_queue_action_ui": True,
+                    "cook_mass_template": True,
+                    "close_stage_on_exit": True
+                }
+            },
+            "check_plugins": [
                 {
-                  "name": "InOutData",
-                  "push_input_data": True,
-                  "push_output_data": True,
-                  "channel": "write_metadata"
+                    "name": "ClearUnassignedMaterial",
+                    "selector_plugins": [
+                        {
+                            "name": "AllMeshes",
+                            "data": {"include_geom_subset": True}
+                        }
+                    ],
+                    "data": {},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
                 },
                 {
-                  "name": "InOutData",
-                  "push_output_data": True,
-                  "channel": "ingestion_output"
-                }
-              ],
-              "output_usd_extension": "usd",
-              "hide_context_ui": True,
-              "create_context_if_not_exist": True,
-              "ignore_unbound_bones": False,
-              "expose_mass_ui": True,
-              "expose_mass_queue_action_ui": True,
-              "cook_mass_template": True,
-              "close_stage_on_exit": True
-            }
-          },
-          "check_plugins": [
-            {
-              "name": "ClearUnassignedMaterial",
-              "selector_plugins": [
+                    "name": "DefaultMaterial",
+                    "selector_plugins": [
+                        {"name": "AllMeshes", "data": {}}
+                    ],
+                    "data": {},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
                 {
-                  "name": "AllMeshes",
-                  "data": {"include_geom_subset": True}
+                    "name": "MaterialShaders",
+                    "selector_plugins": [
+                        {"name": "AllMaterials", "data": {}}
+                    ],
+                    "data": {"shader_subidentifiers": {"AperturePBR_Translucent": "translucent|glass|trans", "AperturePBR_Opacity": ".*"}},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "ValueMapping",
+                    "selector_plugins": [
+                        {"name": "AllShaders", "data": {}}
+                    ],
+                    "data": {"attributes": {"inputs:emissive_intensity": [{"operator": "=", "input_value": 10000, "output_value": 1}]}},
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "ConvertToOctahedral",
+                    "selector_plugins": [
+                        {"name": "AllShaders", "data": {}}
+                    ],
+                    "resultor_plugins": [
+                        {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
+                    ],
+                    "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "ConvertToDDS",
+                    "selector_plugins": [
+                        {"name": "AllShaders", "data": {}}
+                    ],
+                    "resultor_plugins": [
+                        {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
+                    ],
+                    "data": {
+                        "data_flows": [
+                            {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"},
+                            {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}
+                        ]
+                    },
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "RelativeAssetPaths",
+                    "selector_plugins": [
+                        {"name": "AllPrims", "data": {}}
+                    ],
+                    "data": {},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "RelativeReferences",
+                    "selector_plugins": [
+                        {"name": "AllPrims", "data": {}}
+                    ],
+                    "data": {},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "DependencyIterator",
+                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "WrapRootPrims",
+                    "selector_plugins": [
+                        {"name": "Nothing", "data": {}}
+                    ],
+                    "data": {"wrap_prim_name": "XForms"},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "CurrentStage",
+                        "data": {"save_on_exit": True, "close_stage_on_exit": False}
+                    }
+                },
+                {
+                    "name": "WrapRootPrims",
+                    "selector_plugins": [
+                        {"name": "Nothing", "data": {}}
+                    ],
+                    "data": {"wrap_prim_name": "ReferenceTarget"},
+                    "stop_if_fix_failed": True,
+                    "context_plugin": {
+                        "name": "CurrentStage",
+                        "data": {"save_on_exit": True, "close_stage_on_exit": False}
+                    }
                 }
-              ],
-              "data": {},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "DefaultMaterial",
-              "selector_plugins": [
-                {"name": "AllMeshes", "data": {}}
-              ],
-              "data": {},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "MaterialShaders",
-              "selector_plugins": [
-                {"name": "AllMaterials", "data": {}}
-              ],
-              "data": {"shader_subidentifiers": {"AperturePBR_Translucent": "translucent|glass|trans", "AperturePBR_Opacity": ".*"}},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "ValueMapping",
-              "selector_plugins": [
-                {"name": "AllShaders", "data": {}}
-              ],
-              "data": {"attributes": {"inputs:emissive_intensity": [{"operator": "=", "input_value": 10000, "output_value": 1}]}},
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "ConvertToOctahedral",
-              "selector_plugins": [
-                {"name": "AllShaders", "data": {}}
-              ],
-              "resultor_plugins": [
-                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
-              ],
-              "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "ConvertToDDS",
-              "selector_plugins": [
-                {"name": "AllShaders", "data": {}}
-              ],
-              "resultor_plugins": [
-                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
-              ],
-              "data": {
-                "data_flows": [
-                  {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"},
-                  {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}
-                ]
-              },
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "RelativeAssetPaths",
-              "selector_plugins": [
-                {"name": "AllPrims", "data": {}}
-              ],
-              "data": {},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "RelativeReferences",
-              "selector_plugins": [
-                {"name": "AllPrims", "data": {}}
-              ],
-              "data": {},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "DependencyIterator",
-                "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "WrapRootPrims",
-              "selector_plugins": [
-                {"name": "Nothing", "data": {}}
-              ],
-              "data": {"wrap_prim_name": "XForms"},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "CurrentStage",
-                "data": {"save_on_exit": True, "close_stage_on_exit": False}
-              }
-            },
-            {
-              "name": "WrapRootPrims",
-              "selector_plugins": [
-                {"name": "Nothing", "data": {}}
-              ],
-              "data": {"wrap_prim_name": "ReferenceTarget"},
-              "stop_if_fix_failed": True,
-              "context_plugin": {
-                "name": "CurrentStage",
-                "data": {"save_on_exit": True, "close_stage_on_exit": False}
-              }
-            }
-          ],
-          "resultor_plugins": [
-            {
-              "name": "FileCleanup",
-              "data": {"channel": "cleanup_files", "cleanup_output": False}
-            },
-            {
-              "name": "FileMetadataWritter",
-              "data": {"channel": "write_metadata"}
-            }
-          ]
+            ],
+            "resultor_plugins": [
+                {
+                    "name": "FileCleanup",
+                    "data": {"channel": "cleanup_files", "cleanup_output": False}
+                },
+                {
+                    "name": "FileMetadataWritter",
+                    "data": {"channel": "write_metadata"}
+                }
+            ]
         }
 
         logging.info(f"Uploading OBJ to {url}")
-        response = make_request_with_retries('POST', url, json_payload=payload, verify=addon_prefs.remix_verify_ssl)
-        if not response or response.status_code != 200:
-            logging.error(f"Failed to upload OBJ. Status: {response.status_code if response else 'No Response'}")
+        # Limit retries to 1 to avoid duplicate attempts.
+        response = make_request_with_retries('POST', url, json_payload=payload, verify=addon_prefs.remix_verify_ssl, retries=1)
+
+        if response is None:
+            logging.error("Failed to upload OBJ: No response from server.")
+            return None
+
+        if response.status_code == 500:
+            try:
+                response_data = response.json()
+                detail = response_data.get("detail", "")
+            except Exception:
+                detail = ""
+            if "The validation did not complete successfully" in detail:
+                error_msg = "Please change the Ingest Directory to inside the Project folder."
+                logging.error(error_msg)
+                print("DEBUG:", error_msg)  # Debug line printed to console
+                bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_msg, success=False)
+                return None
+
+        if response.status_code != 200:
+            logging.error(f"Failed to upload OBJ. Status: {response.status_code}, Response: {response.text}")
             return None
 
         response_data = response.json()
@@ -1835,7 +1865,6 @@ def upload_to_api(obj_path, ingest_dir, context):
             return None
     finally:
         pass
-    
 
 def check_blend_file_in_prims(blend_name, context):
     addon_prefs = context.preferences.addons[__name__].preferences
