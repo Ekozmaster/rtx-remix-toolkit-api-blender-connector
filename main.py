@@ -746,101 +746,62 @@ def get_actual_mesh_name(mesh_objects):
         print(f"Error retrieving actual mesh name: {e}")
         return "DefaultMesh"
 
-
+def blender_mat_to_remix(mat_name):
+    """
+    Convert a Blender material name to a Remix-friendly name.
+    For example, replace spaces and periods with underscores.
+    """
+    return mat_name.replace(" ", "_").replace(".", "_")
+    
 def handle_height_textures(context, reference_prim, exported_objects=None):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
         logging.info("Starting height texture processing.")
-        print("Starting height texture processing.")
-        logging.debug(f"Reference Prim: {reference_prim}")
-        print(f"Reference Prim: {reference_prim}")
-
-        if exported_objects is not None and not isinstance(exported_objects, (list, tuple)):
-            logging.error("exported_objects should be a list or tuple of Blender objects.")
-            print("Error: exported_objects should be a list or tuple of Blender objects.")
-            return {'CANCELLED'}
-
+        # Determine mesh objects to process
         if exported_objects is not None:
             mesh_objects = [obj for obj in exported_objects if obj.type == 'MESH']
-            logging.debug(f"Exported Objects Provided: {[obj.name for obj in mesh_objects]}")
-            print(f"Exported Objects Provided: {[obj.name for obj in mesh_objects]}")
         else:
             mesh_objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
-            logging.debug(f"No exported_objects provided. Using all mesh objects in the scene: {[obj.name for obj in mesh_objects]}")
-            print(f"No exported_objects provided. Using all mesh objects in the scene: {[obj.name for obj in mesh_objects]}")
 
-        logging.debug(f"Number of mesh objects considered for height textures: {len(mesh_objects)}")
-        print(f"Number of mesh objects considered for height textures: {len(mesh_objects)}")
-
+        # Collect unique materials used by these meshes
         used_materials = set()
         for obj in mesh_objects:
             for slot in obj.material_slots:
                 if slot.material:
                     used_materials.add(slot.material)
 
-        logging.debug(f"Number of unique materials used by these meshes: {len(used_materials)}")
-        print(f"Number of unique materials used by these meshes: {len(used_materials)}")
-
-        height_textures_collected = []
-        for material in used_materials:
-            if not material.use_nodes:
-                logging.debug(f"Material '{material.name}' does not use nodes. Skipping.")
-                print(f"Material '{material.name}' does not use nodes. Skipping.")
+        # Collect height texture data from each material:
+        # (each tuple: (reference prim, material name, texture file path))
+        height_textures = []
+        for mat in used_materials:
+            if not mat.use_nodes or not mat.node_tree:
                 continue
-            node_tree = material.node_tree
-            if not node_tree:
-                logging.debug(f"Material '{material.name}' has no node tree. Skipping.")
-                print(f"Material '{material.name}' has no node tree. Skipping.")
-                continue
-
-            for node in node_tree.nodes:
+            for node in mat.node_tree.nodes:
                 if node.type in {'DISPLACEMENT', 'BUMP'}:
                     height_input = node.inputs.get('Height')
                     if height_input and height_input.is_linked:
                         linked_node = height_input.links[0].from_node
                         if linked_node.type == 'TEX_IMAGE' and linked_node.image:
-                            texture_file_path = bpy.path.abspath(linked_node.image.filepath).replace('\\', '/')
-                            logging.debug(f"Found height texture node in material '{material.name}': {texture_file_path}")
-                            print(f"Found height texture node in material '{material.name}': {texture_file_path}")
-                            if not os.path.exists(texture_file_path):
-                                logging.warning(f"Height texture file does not exist: {texture_file_path}")
-                                print(f"Height texture file does not exist: {texture_file_path}")
-                                continue
-
-                            height_textures_collected.append((reference_prim, material.name, texture_file_path))
-                            logging.debug(f"Collected height texture for '{reference_prim}' on material '{material.name}': {texture_file_path}")
-                            print(f"Collected height texture for '{reference_prim}' on material '{material.name}': {texture_file_path}")
-
-        if not height_textures_collected:
+                            tex_path = bpy.path.abspath(linked_node.image.filepath).replace('\\', '/')
+                            if os.path.exists(tex_path):
+                                height_textures.append((reference_prim, mat.name, tex_path))
+        if not height_textures:
             logging.info("No height textures found to process.")
-            print("No height textures found to process.")
             return {'FINISHED'}
 
-        ingest_directory = addon_prefs.remix_ingest_directory
-        textures_subdir = os.path.join(ingest_directory, "textures").replace('\\', '/')
+        # Ensure the textures output directory exists
+        ingest_dir = addon_prefs.remix_ingest_directory
+        textures_subdir = os.path.join(ingest_dir, "textures").replace('\\', '/')
         if not os.path.exists(textures_subdir):
             os.makedirs(textures_subdir, exist_ok=True)
             logging.info(f"Created textures subdirectory: {textures_subdir}")
-            print(f"Created textures subdirectory: {textures_subdir}")
-        else:
-            logging.debug(f"Textures subdirectory already exists: {textures_subdir}")
-            print(f"Textures subdirectory already exists: {textures_subdir}")
 
+        # Base URL for the export API (strip trailing slash)
         base_url = addon_prefs.remix_export_url.rstrip('/')
-        ingest_url = f"{base_url}/material"
 
-        def blender_mat_to_remix(mat_name):
-            return mat_name.replace('.', '_')
-
-        possible_anchors = [
-            "diffuse_texture",
-            "normalmap_texture",
-            "reflectionroughness_texture",
-            "metallic_texture",
-            "emissive_mask_texture"
-        ]
-
-        for prim_path, material_name, texture_file_path in height_textures_collected:
+        # Process each collected height texture
+        for ref_prim, material_name, tex_file in height_textures:
+            # STEP 1: Ingest the texture file (via TextureImporter)
             ingest_payload = {
                 "executor": 1,
                 "name": "Material(s)",
@@ -848,12 +809,10 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                     "name": "TextureImporter",
                     "data": {
                         "context_name": "ingestcraft",
-                        "input_files": [[texture_file_path, "HEIGHT"]],
+                        "input_files": [[tex_file, "HEIGHT"]],
                         "output_directory": textures_subdir,
                         "allow_empty_input_files_list": True,
-                        "data_flows": [
-                            {"name": "InOutData", "push_input_data": True}
-                        ],
+                        "data_flows": [{"name": "InOutData", "push_input_data": True}],
                         "hide_context_ui": True,
                         "create_context_if_not_exist": True,
                         "expose_mass_ui": True,
@@ -874,7 +833,11 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                         "resultor_plugins": [
                             {"name": "FileCleanup", "data": {"channel": "cleanup_files_normal", "cleanup_output": False}}
                         ],
-                        "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files_normal"}]},
+                        "data": {
+                            "data_flows": [
+                                {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}
+                            ]
+                        },
                         "stop_if_fix_failed": True,
                         "context_plugin": {"name": "CurrentStage", "data": {}}
                     },
@@ -906,28 +869,14 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                     {"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}
                 ]
             }
-
-            headers_post = {
-                'accept': 'application/lightspeed.remix.service+json; version=1.0',
-                'Content-Type': 'application/lightspeed.remix.service+json; version=1.0'
-            }
-
-            logging.info(f"Ingesting height texture via POST to: {ingest_url} for material '{material_name}'")
-            print(f"Ingesting height texture via POST to: {ingest_url} for material '{material_name}'")
-
-            ingest_response = make_request_with_retries('POST', ingest_url, json_payload=ingest_payload, headers=headers_post, verify=addon_prefs.remix_verify_ssl)
+            ingest_response = make_request_with_retries(
+                'POST', f"{base_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl
+            )
             if not ingest_response or ingest_response.status_code not in [200, 201, 204]:
                 logging.error(f"Failed to ingest height texture for material '{material_name}'.")
-                print(f"Failed to ingest height texture for material '{material_name}'.")
                 return {'CANCELLED'}
-
-            ingest_result_data = ingest_response.json()
-            completed_schemas = ingest_result_data.get("completed_schemas", [])
-            if not completed_schemas:
-                logging.warning("No completed_schemas found after ingestion. Cannot find final texture path.")
-                print("No completed_schemas. Can't set shader texture.")
-                return {'CANCELLED'}
-
+            ingest_data = ingest_response.json()
+            completed_schemas = ingest_data.get("completed_schemas", [])
             final_texture_path = None
             for schema in completed_schemas:
                 for plugin in schema.get("check_plugins", []):
@@ -941,90 +890,82 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                             break
                 if final_texture_path:
                     break
-
             if not final_texture_path:
-                logging.warning("Could not find the final .rtex.dds file path in ConvertToDDS plugin output_data.")
-                print("No .rtex.dds file found. Can't set shader texture.")
+                logging.error("Failed to find final ingested texture path from ConvertToDDS.")
                 return {'CANCELLED'}
 
-            select_success = select_mesh_prim_in_remix(reference_prim, context)
-            if not select_success:
-                logging.warning(f"Failed to select mesh prim before fetching shader input for material '{material_name}'.")
-                print(f"Failed to select prim for material '{material_name}'.")
-                return {'CANCELLED'}
-
+            # STEP 2: Construct the material prim asset path dynamically
+            # Build material prim: reference prim + '/XForms/World/Looks/' + sanitized material name
             remix_mat_name = blender_mat_to_remix(material_name)
-            server_url = addon_prefs.remix_server_url.rstrip('/')
+            material_prim = f"{ref_prim}/XForms/World/Looks/{remix_mat_name}"
+            encoded_material_prim = urllib.parse.quote(material_prim, safe='')
 
-            height_shader_prim = None
-            for anchor in possible_anchors:
-                shader_prim = f"{reference_prim}/XForms/World/Looks/{remix_mat_name}/Shader.inputs:{anchor}"
-                encoded_shader_prim = urllib.parse.quote(shader_prim, safe='')
-                height_prim_url = f"{server_url}/textures/{encoded_shader_prim}/material/inputs?texture_type=HEIGHT"
+            # STEP 3: Fetch the list of shader input prims for this material
+            textures_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_material_prim}/textures"
+            textures_response = make_request_with_retries(
+                'GET', textures_url,
+                headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
+                verify=addon_prefs.remix_verify_ssl
+            )
+            if not textures_response or textures_response.status_code != 200:
+                logging.error(f"Failed to retrieve textures for material prim: {material_prim}")
+                return {'CANCELLED'}
+            textures_data = textures_response.json()
+            shader_input_prim = None
+            textures_list = textures_data.get("textures", [])
+            if textures_list and len(textures_list) > 0 and textures_list[0]:
+                shader_input_prim = textures_list[0][0]
+            else:
+                logging.error("No shader input prim found in textures response.")
+                return {'CANCELLED'}
 
-                logging.info(f"Fetching height shader input prim via GET: {height_prim_url} for material '{material_name}' with anchor '{anchor}'")
-                print(f"Fetching height shader input prim via GET: {height_prim_url} for material '{material_name}' with anchor '{anchor}'")
+            # STEP 4: Get the height shader input prim from the shader input prim
+            encoded_shader_input = urllib.parse.quote(shader_input_prim, safe='')
+            height_prim_url = f"{addon_prefs.remix_server_url.rstrip('/')}/textures/{encoded_shader_input}/material/inputs?texture_type=HEIGHT"
+            height_prim_response = make_request_with_retries(
+                'GET', height_prim_url,
+                headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
+                verify=addon_prefs.remix_verify_ssl
+            )
+            if not height_prim_response or height_prim_response.status_code != 200:
+                logging.error("Failed to fetch height shader input prim.")
+                return {'CANCELLED'}
+            height_prim_data = height_prim_response.json()
+            asset_paths = height_prim_data.get("asset_paths", [])
+            if not asset_paths or not asset_paths[0]:
+                logging.error("No height shader input prim returned in response.")
+                return {'CANCELLED'}
+            height_shader_prim = asset_paths[0]
 
-                headers_get = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
-                try:
-                    height_prim_response = make_request_with_retries('GET', height_prim_url, headers=headers_get, verify=addon_prefs.remix_verify_ssl)
-                except Exception as e:
-                    logging.error(f"Error during GET request for shader input prim: {e}")
-                    print(f"Error during GET request for shader input prim: {e}")
-                    height_prim_response = None
-
-                if height_prim_response and height_prim_response.status_code == 200:
-                    height_prim_data = height_prim_response.json()
-                    asset_paths = height_prim_data.get("asset_paths", [])
-                    if asset_paths:
-                        height_shader_prim = asset_paths[0]
-                        if height_shader_prim:
-                            logging.debug(f"Found height shader prim: {height_shader_prim} using anchor '{anchor}'")
-                            print(f"Found height shader prim: {height_shader_prim} using anchor '{anchor}'")
-                            break
-                else:
-                    status = height_prim_response.status_code if height_prim_response else 'No Response'
-                    logging.debug(f"Failed to find height input with anchor '{anchor}'. Status: {status}")
-                    print(f"Failed to find height input with anchor '{anchor}'. Status: {status}")
-                    continue
-
-            if not height_shader_prim:
-                logging.error(f"No suitable shader anchor found for material '{material_name}' to map height texture.")
-                print(f"No suitable shader anchor found for material '{material_name}' to map height texture. Skipping this material.")
-                continue
-
-            put_url = f"{server_url}/textures/"
-            headers_put = {
-                "accept": "application/lightspeed.remix.service+json; version=1.0",
-                "Content-Type": "application/lightspeed.remix.service+json; version=1.0"
-            }
+            # STEP 5: Update the shader input with the ingested height texture (via PUT)
+            put_url = f"{addon_prefs.remix_server_url.rstrip('/')}/textures/"
             put_payload = {
                 "force": False,
-                "textures": [[height_shader_prim, final_texture_path]]
+                "textures": [
+                    [height_shader_prim, final_texture_path]
+                ]
             }
-
-            logging.info(f"Updating shader input via PUT to: {put_url} with final_texture_path: {final_texture_path} for material '{material_name}'")
-            print(f"Updating shader input via PUT to: {put_url} with final_texture_path: {final_texture_path} for material '{material_name}'")
-
-            put_response = make_request_with_retries('PUT', put_url, json_payload=put_payload, headers=headers_put, verify=addon_prefs.remix_verify_ssl)
+            put_response = make_request_with_retries(
+                'PUT', put_url, json_payload=put_payload,
+                headers={
+                    "accept": "application/lightspeed.remix.service+json; version=1.0",
+                    "Content-Type": "application/lightspeed.remix.service+json; version=1.0"
+                },
+                verify=addon_prefs.remix_verify_ssl
+            )
             if not put_response or put_response.status_code not in [200, 201, 204]:
-                logging.error(f"Failed to update shader input with ingested height texture for material '{material_name}'.")
-                print(f"Failed to update shader input via PUT for material '{material_name}'.")
+                logging.error("Failed to update shader input with ingested height texture.")
                 return {'CANCELLED'}
 
-            logging.info(f"Successfully updated height texture for shader input path: {height_shader_prim} on material '{material_name}'")
-            print(f"Successfully updated height texture for shader input path: {height_shader_prim} on material '{material_name}'")
+            logging.info(f"Updated height texture for material '{material_name}' using prim: {height_shader_prim}")
 
         logging.info("Height texture processing for all materials completed successfully.")
-        print("Height texture processing completed successfully.")
         return {'FINISHED'}
 
     except Exception as e:
         logging.error(f"Error handling height textures: {e}")
-        print(f"Error handling height textures: {e}")
         return {'CANCELLED'}
-
-
+        
 def trim_prim_path(prim_path, segments_to_trim=0):
     try:
         segments = prim_path.strip('/').split('/')
