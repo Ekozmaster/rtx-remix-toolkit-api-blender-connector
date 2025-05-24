@@ -22,9 +22,14 @@ import shutil
 import re
 import logging
 import bmesh
+import collections
+from pxr import Usd, Sdf
 from bpy.props import BoolProperty, StringProperty, CollectionProperty, IntProperty, EnumProperty, FloatProperty
 from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
+import bpy_extras.io_utils
 import urllib.parse
+import subprocess
+from pathlib import Path
 
 # Initialize global variables
 log_file_path = ""
@@ -161,11 +166,38 @@ class RemixIngestorPreferences(AddonPreferences):
         default=False
     )
 
+    usd_import_forward_axis: EnumProperty( # New Property
+        name="USD Import Forward Axis",
+        description="Choose the forward axis for USD import. This tells Blender how to interpret the source USD's forward direction.",
+        items=[
+            ('X', 'X Positive', "Interpret source Forward as X Positive"),
+            ('Y', 'Y Positive', "Interpret source Forward as Y Positive"),
+            ('Z', 'Z Positive', "Interpret source Forward as Z Positive"),
+            ('NEGATIVE_X', 'X Negative', "Interpret source Forward as X Negative"),
+            ('NEGATIVE_Y', 'Y Negative', "Interpret source Forward as Y Negative"),
+            ('NEGATIVE_Z', 'Z Negative', "Interpret source Forward as Z Negative"),
+        ],
+        default='Y' # Default to Y, a common choice
+    )
+
+    # ------------------------------------------------------------------
+    # Added for Substance-Painter workflow
+    # ------------------------------------------------------------------
+    spp_exe: StringProperty(
+        name="Substance Painter Executable Path",
+        subtype='FILE_PATH',
+        default="C:/Program Files/Adobe/Adobe Substance 3D Painter/Adobe Substance 3D Painter.exe"
+    )
+    export_folder: StringProperty(
+        name="Object Export Folder Path",
+        subtype='DIR_PATH',
+        default=""
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.label(text="Global Preferences:")
         layout.prop(self, "apply_modifiers", text="Apply Modifiers")
-
 
 class AssetNumberItem(PropertyGroup):
     blend_name: StringProperty(name="Blend File Name")
@@ -466,191 +498,172 @@ def attach_original_textures(imported_objects, context, base_dir):
         blend_dir = os.path.dirname(blend_file_path).replace('\\', '/')
         textures_subdir = os.path.join(blend_dir, "textures").replace('\\', '/')
         logging.debug(f"Textures subdirectory path: {textures_subdir}")
-        print(f"Textures subdirectory path: {textures_subdir}")
+        # print(f"Textures subdirectory path: {textures_subdir}") # Redundant with logging
 
         if not os.path.exists(textures_subdir):
             try:
                 os.makedirs(textures_subdir, exist_ok=True)
                 logging.info(f"Created 'textures' subdirectory: {textures_subdir}")
-                print(f"Created 'textures' subdirectory: {textures_subdir}")
+                # print(f"Created 'textures' subdirectory: {textures_subdir}")
             except Exception as e:
                 logging.error(f"Failed to create textures subdirectory '{textures_subdir}': {e}")
-                print(f"Failed to create textures subdirectory '{textures_subdir}': {e}")
+                # print(f"Failed to create textures subdirectory '{textures_subdir}': {e}")
                 return
-        else:
-            logging.debug(f"'textures' subdirectory already exists: {textures_subdir}")
-            print(f"'textures' subdirectory already exists: {textures_subdir}")           
+        # else: # Not strictly necessary to log if it exists, can be verbose
+            # logging.debug(f"'textures' subdirectory already exists: {textures_subdir}")
+            # print(f"'textures' subdirectory already exists: {textures_subdir}")
 
-        # Iterate over each imported object
+        # --- OPTIMIZATION: Collect unique materials first ---
+        unique_materials = set()
         for obj in imported_objects:
-            print(f"Processing object: {obj.name}")
-            logging.info(f"Processing object: {obj.name}")
+            if obj.type == 'MESH': # Ensure we only consider mesh objects for materials
+                for mat_slot in obj.material_slots:
+                    if mat_slot.material:
+                        unique_materials.add(mat_slot.material)
+        
+        if not unique_materials:
+            logging.warning("No materials found on imported objects to process.")
+            return
 
-            for mat_slot in obj.material_slots:
-                mat = mat_slot.material
-                if not mat:
-                    logging.warning(f"Object '{obj.name}' has an empty material slot.")
-                    print(f"Object '{obj.name}' has an empty material slot.")
-                    continue
+        logging.info(f"Found {len(unique_materials)} unique materials to process for texture attachment.")
 
-                print(f"Processing material: {mat.name}")
-                logging.info(f"Processing material: {mat.name}")
+        # --- Process each unique material only once ---
+        for mat in unique_materials:
+            logging.info(f"Processing unique material: {mat.name}")
+            # print(f"Processing unique material: {mat.name}") # Redundant
 
-                if not mat.use_nodes:
-                    mat.use_nodes = True
-                    logging.info(f"Enabled node usage for material '{mat.name}'.")
-                    print(f"Enabled node usage for material '{mat.name}'.")
+            if not mat.use_nodes:
+                mat.use_nodes = True
+                logging.info(f"Enabled node usage for material '{mat.name}'.")
+                # print(f"Enabled node usage for material '{mat.name}'.")
 
-                principled_bsdf = None
-                for node in mat.node_tree.nodes:
-                    if node.type == 'BSDF_PRINCIPLED':
-                        principled_bsdf = node
-                        break
+            principled_bsdf = None
+            image_texture_node = None # Use a more descriptive name
 
-                if not principled_bsdf:
-                    principled_bsdf = mat.node_tree.nodes.new(type='ShaderNodeBsdfPrincipled')
-                    principled_bsdf.location = (400, 0)
-                    logging.info(f"Created Principled BSDF node for material '{mat.name}'.")
-                    print(f"Created Principled BSDF node for material '{mat.name}'.")
+            # Find existing Principled BSDF and Image Texture nodes
+            for node in mat.node_tree.nodes:
+                if node.type == 'BSDF_PRINCIPLED' and not principled_bsdf: # Take the first one
+                    principled_bsdf = node
+                elif node.type == 'TEX_IMAGE' and not image_texture_node: # Take the first one
+                    image_texture_node = node
+                if principled_bsdf and image_texture_node: # Found both, no need to continue loop
+                    break
+            
+            if not principled_bsdf:
+                principled_bsdf = mat.node_tree.nodes.new(type='ShaderNodeBsdfPrincipled')
+                principled_bsdf.location = (200, 0) # Adjusted location for clarity
+                logging.info(f"Created Principled BSDF node for material '{mat.name}'.")
+                # print(f"Created Principled BSDF node for material '{mat.name}'.")
 
-                image_texture = None
-                for node in mat.node_tree.nodes:
-                    if node.type == 'TEX_IMAGE':
-                        image_texture = node
-                        break
+            if not image_texture_node:
+                image_texture_node = mat.node_tree.nodes.new(type='ShaderNodeTexImage')
+                image_texture_node.location = (0, 0)
+                logging.info(f"Created Image Texture node for material '{mat.name}'.")
+                # print(f"Created Image Texture node for material '{mat.name}'.")
 
-                if not image_texture:
-                    image_texture = mat.node_tree.nodes.new(type='ShaderNodeTexImage')
-                    image_texture.location = (0, 0)
-                    logging.info(f"Created Image Texture node for material '{mat.name}'.")
-                    print(f"Created Image Texture node for material '{mat.name}'.")
+            # Extract hash from material name (assuming mat.name is consistently formatted)
+            match = re.match(r'^mat_([A-Fa-f0-9]{16})', mat.name) # Simplified regex if suffix doesn't matter for hash
+            if not match:
+                 # Fallback if the primary pattern with a dot isn't matched, or if it's just the hash
+                match = re.match(r'([A-Fa-f0-9]{16})', mat.name) # Try to find a 16-char hex hash anywhere
+            
+            if match:
+                # If the regex had a group for the hash specifically, use it.
+                # If it's the full match (e.g. r'([A-Fa-f0-9]{16})'), group(0) or group(1) might be it.
+                # Safest to check groups.
+                mat_hash = match.group(1) if match.groups() else match.group(0)
+                logging.debug(f"Extracted hash '{mat_hash}' from material '{mat.name}'.")
+            else:
+                logging.warning(f"Material name '{mat.name}' does not match expected hash pattern. Cannot determine texture.")
+                # print(f"Material name '{mat.name}' does not match expected hash pattern.")
+                continue # Skip this material if no hash
 
-                match = re.match(r'^mat_([A-Fa-f0-9]{16})\.', mat.name)
-                if match:
-                    mat_hash = match.group(1)
-                    logging.debug(f"Extracted hash '{mat_hash}' from material '{mat.name}'.")
-                else:
-                    match = re.match(r'^mat_([A-Fa-f0-9]{16})$', mat.name)
-                    if match:
-                        mat_hash = match.group(1)
-                        logging.debug(f"Extracted hash '{mat_hash}' from material '{mat.name}'.")
-                    else:
-                        logging.warning(f"Material name '{mat.name}' does not match expected hash pattern.")
-                        print(f"Material name '{mat.name}' does not match expected hash pattern.")
-                        continue
+            texture_file_dds = f"{mat_hash}.dds"
+            texture_path_dds = os.path.join(base_dir, "textures", texture_file_dds).replace('\\', '/')
+            # logging.info(f"Looking for DDS texture file: {texture_path_dds}") # Can be verbose
+            # print(f"Looking for texture file: {texture_file_dds}")
 
-                texture_file = f"{mat_hash}.dds"
-                texture_path = os.path.join(base_dir, "textures", texture_file).replace('\\', '/')
-                print(f"Looking for texture file: {texture_file}")
-                logging.info(f"Looking for texture file: {texture_file}")
+            if os.path.exists(texture_path_dds):
+                target_image_path_for_node = texture_path_dds
+                target_image_name_for_node = os.path.basename(texture_path_dds)
+                is_png_converted = False
 
-                if os.path.exists(texture_path):
-                    if import_original_textures:
-                        png_filename = f"{mat_hash}.png"
-                        png_path = os.path.join(textures_subdir, png_filename).replace('\\', '/')
-                        logging.info(f"Preparing to convert DDS to PNG: {texture_path} -> {png_path}")
-                        print(f"Preparing to convert DDS to PNG: {texture_path} -> {png_path}")
+                if import_original_textures: # DDS to PNG conversion path
+                    png_filename = f"{mat_hash}.png"
+                    png_path_full = os.path.join(textures_subdir, png_filename).replace('\\', '/')
+                    logging.info(f"Attempting to use/convert to PNG: {png_path_full} from DDS: {texture_path_dds}")
+                    # print(f"Preparing to convert DDS to PNG: {texture_path_dds} -> {png_path_full}")
 
-                        if not os.path.exists(png_path):
-                            try:
-                                dds_image = bpy.data.images.load(texture_path)
-                                logging.info(f"Loaded DDS image: {texture_path}")
-                                print(f"Loaded DDS image: {texture_path}")
-
-                                png_image = bpy.data.images.new(
-                                    name=os.path.basename(png_path),
-                                    width=dds_image.size[0],
-                                    height=dds_image.size[1],
-                                    alpha=(dds_image.channels == 4)
-                                )
-                                logging.debug(f"Created new PNG image: {png_path}")
-
-                                png_image.pixels = list(dds_image.pixels)
-                                logging.debug(f"Copied pixel data from DDS to PNG for '{png_filename}'.")
-
-                                png_image.file_format = 'PNG'
-                                png_image.filepath_raw = png_path
-                                png_image.save()
-
-                                logging.info(f"Saved PNG image: {png_path}")
-                                print(f"Saved PNG image: {png_path}")
-
-                                dds_image.user_clear()
-                                bpy.data.images.remove(dds_image)
-                                logging.debug(f"Unloaded DDS image: {texture_path}")
-                            except Exception as e:
-                                logging.error(f"Failed to convert DDS to PNG for texture '{texture_file}': {e}")
-                                print(f"Failed to convert DDS to PNG for texture '{texture_file}': {e}")
-                                continue
-                        else:
-                            logging.info(f"PNG texture already exists: {png_path}")
-                            print(f"PNG texture already exists: {png_path}")
-
+                    if not os.path.exists(png_path_full) or os.path.getmtime(texture_path_dds) > os.path.getmtime(png_path_full):
                         try:
-                            existing_png = bpy.data.images.get(os.path.basename(png_path))
-                            if existing_png:
-                                image_texture.image = existing_png
-                                logging.info(f"Assigned existing PNG texture '{png_filename}' to material '{mat.name}'.")
-                                print(f"Assigned existing PNG texture '{png_filename}' to material '{mat.name}'.")
-                            else:
-                                png_image = bpy.data.images.load(png_path)
-                                image_texture.image = png_image
-                                logging.info(f"Assigned PNG texture '{png_filename}' to material '{mat.name}'.")
-                                print(f"Assigned PNG texture '{png_filename}' to material '{mat.name}'.")
-                            links = mat.node_tree.links
-                            base_color_input = principled_bsdf.inputs.get('Base Color')
-                            if base_color_input:
-                                existing_links = [link for link in links if link.to_socket == base_color_input]
-                                for link in existing_links:
-                                    links.remove(link)
-                                    logging.debug(f"Removed existing link to Base Color for material '{mat.name}'.")
-                                    print(f"Removed existing link to Base Color for material '{mat.name}'.")
-                                links.new(image_texture.outputs['Color'], base_color_input)
-                                logging.info(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                                print(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                            else:
-                                logging.warning(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-                                print(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-                        except Exception as e:
-                            logging.error(f"Failed to assign PNG texture '{png_filename}' to material '{mat.name}': {e}")
-                            print(f"Failed to assign PNG texture '{png_filename}' to material '{mat.name}': {e}")
+                            dds_image_data = bpy.data.images.load(texture_path_dds, check_existing=True) # check_existing is important
+                            # Create a new image for PNG conversion to avoid modifying dds_image_data's filepath directly before saving
+                            png_image_data_new = bpy.data.images.new(
+                                name=png_filename, # Use clean filename
+                                width=dds_image_data.size[0],
+                                height=dds_image_data.size[1],
+                                alpha=(dds_image_data.channels == 4)
+                            )
+                            png_image_data_new.pixels = list(dds_image_data.pixels) # Copy pixels
+                            png_image_data_new.file_format = 'PNG'
+                            png_image_data_new.filepath_raw = png_path_full # Set path for saving
+                            png_image_data_new.save()
+                            logging.info(f"Converted and saved PNG image: {png_path_full}")
+                            # print(f"Saved PNG image: {png_path_full}")
+                            
+                            # Clean up the loaded DDS image datablock if it's no longer needed by other parts of Blender
+                            # (or if we exclusively want to use the PNG from now on)
+                            bpy.data.images.remove(dds_image_data)
+                            is_png_converted = True
+                            target_image_path_for_node = png_path_full
+                            target_image_name_for_node = png_filename
+
+                        except Exception as e_conv:
+                            logging.error(f"Failed to convert DDS to PNG for texture '{texture_file_dds}': {e_conv}")
+                            # print(f"Failed to convert DDS to PNG for texture '{texture_file_dds}': {e_conv}")
+                            # Fallback to DDS if conversion fails
+                            target_image_path_for_node = texture_path_dds
+                            target_image_name_for_node = texture_file_dds
                     else:
-                        try:
-                            existing_dds = bpy.data.images.get(os.path.basename(texture_path))
-                            if existing_dds:
-                                image_texture.image = existing_dds
-                                logging.info(f"Assigned existing DDS texture '{texture_file}' to material '{mat.name}'.")
-                                print(f"Assigned existing DDS texture '{texture_file}' to material '{mat.name}'.")
-                            else:
-                                dds_image = bpy.data.images.load(texture_path)
-                                image_texture.image = dds_image
-                                logging.info(f"Assigned DDS texture '{texture_file}' to material '{mat.name}'.")
-                                print(f"Assigned DDS texture '{texture_file}' to material '{mat.name}'.")
-                            links = mat.node_tree.links
-                            base_color_input = principled_bsdf.inputs.get('Base Color')
-                            if base_color_input:
-                                existing_links = [link for link in links if link.to_socket == base_color_input]
-                                for link in existing_links:
-                                    links.remove(link)
-                                    logging.debug(f"Removed existing link to Base Color for material '{mat.name}'.")
-                                    print(f"Removed existing link to Base Color for material '{mat.name}'.")
-                                links.new(image_texture.outputs['Color'], base_color_input)
-                                logging.info(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                                print(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                            else:
-                                logging.warning(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-                                print(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-                        except Exception as e:
-                            logging.error(f"Failed to assign DDS texture '{texture_file}' to material '{mat.name}': {e}")
-                            print(f"Failed to assign DDS texture '{texture_file}' to material '{mat.name}': {e}")
+                        logging.info(f"PNG texture already exists and is up-to-date: {png_path_full}")
+                        # print(f"PNG texture already exists: {png_path_full}")
+                        target_image_path_for_node = png_path_full
+                        target_image_name_for_node = png_filename
+                        is_png_converted = True # It exists, so it's "converted" for our purposes
+                
+                # Load the target image (either original DDS or converted PNG)
+                loaded_image_for_node = bpy.data.images.load(target_image_path_for_node, check_existing=True)
+                image_texture_node.image = loaded_image_for_node
+                logging.info(f"Assigned image '{target_image_name_for_node}' to texture node in material '{mat.name}'.")
+
+                # Link texture to Principled BSDF's Base Color
+                links = mat.node_tree.links
+                base_color_input = principled_bsdf.inputs.get('Base Color')
+                if base_color_input:
+                    # Remove existing links to Base Color if any
+                    for link in list(base_color_input.links): # Iterate over a copy
+                        links.remove(link)
+                        logging.debug(f"Removed existing link to Base Color for material '{mat.name}'.")
+                    
+                    links.new(image_texture_node.outputs['Color'], base_color_input)
+                    logging.info(f"Connected Image Texture to Base Color for material '{mat.name}'.")
+                    # print(f"Connected Image Texture to Base Color for material '{mat.name}'.")
                 else:
-                    logging.warning(f"Texture file does not exist for material '{mat.name}': {texture_path}")
-                    print(f"Texture file does not exist for material '{mat.name}': {texture_path}")
+                    logging.warning(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
+                    # print(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
+
+            else: # DDS file does not exist
+                logging.warning(f"Texture file does not exist for material '{mat.name}': {texture_path_dds}")
+                # print(f"Texture file does not exist for material '{mat.name}': {texture_path_dds}")
+                # Optionally clear the image on the node if the file is missing
+                if image_texture_node.image:
+                    image_texture_node.image = None 
+                    logging.info(f"Cleared missing image from texture node in material '{mat.name}'.")
+
 
     except Exception as e:
-        logging.error(f"Error attaching original textures: {e}")
-        print(f"Error attaching original textures: {e}")
-
+        logging.error(f"Error attaching original textures: {e}", exc_info=True)
+        # print(f"Error attaching original textures: {e}")
 
 def attach_mesh_reference(prim_path, usd_file, context):
     addon_prefs = context.preferences.addons[__name__].preferences
@@ -993,183 +1006,1473 @@ def trim_prim_path(prim_path, segments_to_trim=0):
         logging.error(f"Error trimming prim path '{prim_path}': {e}")
         print(f"Error trimming prim path '{prim_path}': {e}")
         return prim_path
+
+def batch_flip_normals_optimized(meshes_to_flip, context):
+  """
+  Flips normals for a list of mesh objects in a batch using bpy.ops.
+  Assumes context.scene and context.view_layer are set correctly for the objects.
+  """
+  if not meshes_to_flip:
+    logging.debug("Batch flip normals: No meshes to flip.")
+    return
+
+  logging.info(f"Batch flip normals: Preparing to flip {len(meshes_to_flip)} meshes.")
+
+  # Store original state
+  original_active_object = context.view_layer.objects.active
+  original_selected_objects = list(context.selected_objects) # Make a copy
+ 
+  # Determine original mode more robustly
+  original_mode = 'OBJECT' # Default
+  if context.object and hasattr(context.object, 'mode'):
+    original_mode = context.object.mode
+  elif context.mode: # Fallback for older Blender or different contexts
+    original_mode = context.mode
+ 
+  logging.debug(f"Batch flip normals: Original mode: {original_mode}, Active: {original_active_object.name if original_active_object else 'None'}, Selected: {len(original_selected_objects)}")
+
+  try:
+    # --- 1. Ensure OBJECT mode for reliable selection and active object setting ---
+    if context.mode != 'OBJECT':
+      can_set_object_mode = True
+      if not bpy.ops.object.mode_set.poll():
+        # If polling fails, it might be due to no active object suitable for the current mode.
+        # Try to set a temporary active object from the scene if one exists.
+        if not context.view_layer.objects.active and context.scene.objects:
+          # Pick any object, preferably not one we are about to process if possible,
+          # but any valid object will do to allow mode_set.
+          temp_active = next((obj for obj in context.scene.objects if obj.type in {'MESH', 'EMPTY', 'LIGHT', 'CAMERA'}), None)
+          if temp_active and temp_active.name in context.view_layer.objects:
+            context.view_layer.objects.active = temp_active
+          else: # If no suitable temp active can be found
+            can_set_object_mode = False
+        elif not context.view_layer.objects.active : # No scene objects at all
+          can_set_object_mode = False
+
+
+      if can_set_object_mode and bpy.ops.object.mode_set.poll():
+        bpy.ops.object.mode_set(mode='OBJECT')
+        logging.debug("Batch flip normals: Switched to OBJECT mode for setup.")
+      elif context.mode != 'OBJECT': # If still not in object mode
+        logging.warning("Batch flip normals: Could not switch to OBJECT mode for setup. Aborting flip.")
+        return # Cannot proceed reliably
+
+    # --- 2. Deselect all and select the target meshes ---
+    if bpy.ops.object.select_all.poll():
+      bpy.ops.object.select_all(action='DESELECT')
+
+    actually_selected_meshes = []
+    for mesh_obj in meshes_to_flip:
+      if mesh_obj and mesh_obj.name in context.view_layer.objects and mesh_obj.type == 'MESH':
+        try:
+          mesh_obj.select_set(True)
+          actually_selected_meshes.append(mesh_obj)
+        except RuntimeError as e:
+          logging.warning(f"Batch flip normals: Could not select mesh {mesh_obj.name}: {e}")
+      elif not mesh_obj:
+        logging.warning("Batch flip normals: Encountered a None object in meshes_to_flip list.")
+      else:
+        logging.warning(f"Batch flip normals: Mesh {mesh_obj.name} (type: {mesh_obj.type}) not in current view layer or not a MESH. Skipping.")
    
+    if not actually_selected_meshes:
+      logging.info("Batch flip normals: No valid meshes were selected for flipping from the provided list.")
+      return
+
+    # --- 3. Set Active Object (required for mode_set to EDIT) ---
+    # Ensure the active object is one of the selected meshes
+    if context.view_layer.objects.active not in actually_selected_meshes:
+      context.view_layer.objects.active = actually_selected_meshes[0]
+   
+    logging.debug(f"Batch flip normals: Selected {len(actually_selected_meshes)} meshes. Active for EDIT mode: {context.view_layer.objects.active.name if context.view_layer.objects.active else 'None'}")
+
+    # --- 4. Switch to EDIT mode and perform operations ---
+    if bpy.ops.object.mode_set.poll():
+      bpy.ops.object.mode_set(mode='EDIT')
+      logging.debug("Batch flip normals: Switched to EDIT mode.")
+    else:
+      logging.warning("Batch flip normals: Cannot switch to EDIT mode (poll failed). Aborting flip.")
+      # Attempt to restore object mode before returning as we might have changed selections
+      if context.mode != 'OBJECT' and bpy.ops.object.mode_set.poll():
+        bpy.ops.object.mode_set(mode='OBJECT')
+      return
+
+    if context.mode == 'EDIT':
+      bpy.ops.mesh.select_all(action='SELECT') # Select all geometry of all selected objects
+      bpy.ops.mesh.flip_normals()
+      logging.info(f"Batch flip normals: Flipped normals for {len(actually_selected_meshes)} meshes.")
+     
+      # Switch back to OBJECT mode
+      if bpy.ops.object.mode_set.poll():
+        bpy.ops.object.mode_set(mode='OBJECT')
+        logging.debug("Batch flip normals: Switched back to OBJECT mode.")
+      else:
+        logging.warning("Batch flip normals: Could not switch back to OBJECT mode after flipping (poll failed).")
+    else:
+      logging.warning("Batch flip normals: Not in EDIT mode after attempting switch. Normals not flipped.")
+
+  except Exception as e:
+    logging.error(f"Batch flip normals: Error during main operation: {e}", exc_info=True)
+    # Ensure we try to get back to object mode in case of error during edit mode ops
+    if context.mode == 'EDIT':
+      try:
+        if bpy.ops.object.mode_set.poll():
+          bpy.ops.object.mode_set(mode='OBJECT')
+      except Exception as e_restore_on_error:
+        logging.error(f"Batch flip normals: Error trying to restore OBJECT mode after main error: {e_restore_on_error}")
+  finally:
+    # --- 5. Restore original selection and mode ---
+    logging.debug("Batch flip normals: Entering finally block for state restoration.")
+    try:
+      # Ensure we are in OBJECT mode before restoring selection and original_active_object
+      if context.mode != 'OBJECT':
+        if bpy.ops.object.mode_set.poll():
+          bpy.ops.object.mode_set(mode='OBJECT')
+        else: # If we can't get to object mode, further restoration might be unstable
+          logging.warning("Batch flip normals (finally): Could not ensure OBJECT mode. State restoration might be incomplete.")
+     
+      # Deselect all current selections (made by this function)
+      if bpy.ops.object.select_all.poll():
+        bpy.ops.object.select_all(action='DESELECT')
+
+      # Reselect original objects
+      for obj in original_selected_objects:
+        if obj and obj.name in context.view_layer.objects: # Check if obj still exists and is in layer
+          try:
+            obj.select_set(True)
+          except RuntimeError as e_reselect:
+            logging.warning(f"Batch flip normals (finally): Could not re-select original object '{obj.name}': {e_reselect}")
+     
+      # Restore active object if it still exists and is in the current view layer
+      if original_active_object and original_active_object.name in context.view_layer.objects:
+        context.view_layer.objects.active = original_active_object
+      elif context.selected_objects: # If original active is gone/invalid, try setting to one of the reselected.
+        context.view_layer.objects.active = context.selected_objects[0]
+      else: # If nothing is selected (e.g. original selection was empty or objects deleted)
+        context.view_layer.objects.active = None
+     
+      logging.debug(f"Batch flip normals (finally): Restored active to: {context.view_layer.objects.active.name if context.view_layer.objects.active else 'None'}, Selected count: {len(context.selected_objects)}")
+
+      # Restore original mode (only if it was not OBJECT and conditions allow)
+      if original_mode != 'OBJECT' and context.mode == 'OBJECT':
+        can_restore_original_mode = False
+        if original_mode == 'EDIT': # Edit mode needs an active mesh/curve etc.
+          if context.view_layer.objects.active and context.view_layer.objects.active.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META', 'ARMATURE'}: # Armature for edit bones
+            can_restore_original_mode = True
+        elif original_mode in {'POSE', 'SCULPT', 'VERTEX_PAINT', 'WEIGHT_PAINT', 'TEXTURE_PAINT'}: # These modes also usually need a suitable active object
+          if context.view_layer.objects.active: # Check if active object is suitable might be more complex here, basic check for now
+            can_restore_original_mode = True
+       
+        if can_restore_original_mode and bpy.ops.object.mode_set.poll():
+          try:
+            bpy.ops.object.mode_set(mode=original_mode)
+            logging.debug(f"Batch flip normals (finally): Restored original mode to '{original_mode}'.")
+          except RuntimeError as e_mode_restore:
+            logging.warning(f"Batch flip normals (finally): Could not restore original mode '{original_mode}': {e_mode_restore}")
+        elif context.mode != original_mode : # If we couldn't restore
+          logging.warning(f"Batch flip normals (finally): Conditions not met to restore original mode '{original_mode}'. Mode remains '{context.mode}'.")
+      elif context.mode == original_mode:
+        logging.debug(f"Batch flip normals (finally): Mode already same as original ('{original_mode}'). No change.")
+
+
+    except Exception as e_finally:
+      logging.error(f"Batch flip normals: Critical error in 'finally' block during state restoration: {e_finally}", exc_info=True)
+    logging.info("Batch flip normals: Operation finished.")
+
+def batch_mirror_objects_optimized(meshes_to_mirror, context):
+    """
+    Mirrors a list of mesh objects by applying their scale (batched),
+    then performing bmesh vertex mirroring (X-axis) and normal flipping
+    within a single Edit Mode session for all meshes.
+    """
+    if not meshes_to_mirror:
+        logging.debug("Batch Mirror: No meshes to mirror.")
+        return
+
+    original_active_object = context.view_layer.objects.active
+    original_selected_objects = list(context.selected_objects) # Make a copy
+    original_mode = 'OBJECT'
+    if context.object and hasattr(context.object, 'mode'):
+        original_mode = context.object.mode
+    elif context.mode:
+        original_mode = context.mode
+
+    logging.info(f"Batch Mirror: Starting process for {len(meshes_to_mirror)} meshes.")
+    edit_mode_entered_successfully = False
+
+    try:
+        # --- Ensure OBJECT mode for all initial operations ---
+        if context.mode != 'OBJECT':
+            if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='OBJECT')
+                context.view_layer.update() 
+                logging.debug(f"Batch Mirror: Switched to OBJECT mode for setup. Current mode: {context.mode}")
+                if context.mode != 'OBJECT': 
+                    logging.error("Batch Mirror: Failed to switch to OBJECT mode even after command and update. Aborting.")
+                    return
+            else:
+                logging.error("Batch Mirror: Cannot poll to switch to OBJECT mode for setup. Aborting.")
+                return
+
+        # --- 1. Batch Apply Scale Transformations ---
+        bpy.ops.object.select_all(action='DESELECT')
+        
+        meshes_for_scale_apply = []
+        for obj in meshes_to_mirror:
+            if obj.type == 'MESH' and obj.name in context.view_layer.objects:
+                obj.select_set(True)
+                meshes_for_scale_apply.append(obj)
+        
+        if meshes_for_scale_apply:
+            context.view_layer.objects.active = meshes_for_scale_apply[0]
+            logging.debug(f"Batch Mirror: Applying scale to {len(meshes_for_scale_apply)} selected meshes. Active: '{meshes_for_scale_apply[0].name}'.")
+            try:
+                bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                logging.info(f"  Successfully batch applied scale to {len(meshes_for_scale_apply)} meshes.")
+            except RuntimeError as e_scale:
+                logging.warning(f"  Failed to batch apply scale: {e_scale}")
+        else:
+            logging.info("Batch Mirror: No valid mesh objects were selected for scale application.")
+            return
+
+        # --- 2. Prepare for BMesh Operations ---
+        selected_for_bmesh = [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+        if not selected_for_bmesh:
+            logging.info("Batch Mirror: No valid mesh objects are selected for BMesh operations after scale apply.")
+            return
+
+        active_for_edit_mode = context.view_layer.objects.active
+        if not (active_for_edit_mode and active_for_edit_mode in selected_for_bmesh and active_for_edit_mode.type == 'MESH'):
+            active_for_edit_mode = selected_for_bmesh[0]
+            context.view_layer.objects.active = active_for_edit_mode
+        
+        if not (active_for_edit_mode and active_for_edit_mode.type == 'MESH'): 
+            logging.warning("Batch Mirror: Active object is not suitable (not a mesh or not selected) for entering EDIT mode. Skipping BMesh part.")
+            return
+
+        logging.debug(f"Batch Mirror: Attempting to enter EDIT mode with active object '{active_for_edit_mode.name}'. Selected for BMesh: {len(selected_for_bmesh)}")
+
+        # --- 3. BMesh Vertex Mirror & Normal Flip (Single Edit Mode Session) ---
+        if bpy.ops.object.mode_set.poll(): 
+            logging.debug(f"Batch Mirror: Poll for object.mode_set successful (active: {context.view_layer.objects.active.name if context.view_layer.objects.active else 'None'}).")
+            bpy.ops.object.mode_set(mode='EDIT') 
+            logging.debug("Batch Mirror: bpy.ops.object.mode_set(mode='EDIT') called.")
+
+            context.view_layer.update() 
+            logging.debug(f"Batch Mirror: After mode_set and view_layer.update(), context.mode is now: '{context.mode}'")
+
+            # CORRECTED CONDITION HERE:
+            if context.mode == 'EDIT_MESH': # Check for 'EDIT_MESH' specifically for meshes
+                edit_mode_entered_successfully = True
+                logging.info("Batch Mirror: Successfully confirmed and entered EDIT_MESH mode.") # Updated log message
+                
+                processed_in_edit = 0
+                for obj_in_edit in bpy.context.selected_editable_objects:
+                    if obj_in_edit.type == 'MESH':
+                        mesh = obj_in_edit.data
+                        bm = bmesh.from_edit_mesh(mesh)
+
+                        for vert in bm.verts:
+                            vert.co.x *= -1
+                        for face in bm.faces:
+                            face.normal_flip()
+                        
+                        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                        processed_in_edit +=1
+                logging.debug(f"Batch Mirror: BMesh operations completed for {processed_in_edit} objects in Edit Mode.")
+                
+                if bpy.ops.object.mode_set.poll(): 
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    context.view_layer.update() 
+                    logging.debug(f"Batch Mirror: Exited EDIT_MESH mode. Current mode: {context.mode}")
+                    if context.mode != 'OBJECT':
+                        logging.warning("Batch Mirror: Attempted to exit EDIT_MESH mode, but still not in OBJECT mode.")
+                else:
+                    logging.warning("Batch Mirror: Could not poll to exit EDIT_MESH mode after BMesh operations.")
+            else:
+                logging.error(f"Batch Mirror: Failed to enter EDIT_MESH mode (context.mode was '{context.mode}' after command and update). BMesh operations skipped.")
+        else:
+            logging.error(f"Batch Mirror: bpy.ops.object.mode_set.poll() returned False. Cannot attempt to switch to EDIT mode. (Active: {context.view_layer.objects.active.name if context.view_layer.objects.active else 'None'}, Type: {context.view_layer.objects.active.type if context.view_layer.objects.active else 'N/A'}). BMesh operations skipped.")
+            
+    except Exception as e:
+        logging.error(f"Batch Mirror: Error during main operation: {e}", exc_info=True)
+        if edit_mode_entered_successfully and context.mode == 'EDIT_MESH': # Check EDIT_MESH here too
+            if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='OBJECT')
+                context.view_layer.update()
+    finally:
+        # --- 4. Restore Original State ---
+        logging.debug("Batch Mirror: Restoring original state...")
+        if context.mode != 'OBJECT':
+            if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='OBJECT')
+                context.view_layer.update()
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in original_selected_objects:
+            if obj and obj.name in context.view_layer.objects: 
+                try: obj.select_set(True)
+                except RuntimeError: pass
+        
+        if original_active_object and original_active_object.name in context.view_layer.objects: 
+            context.view_layer.objects.active = original_active_object
+        elif context.selected_objects: 
+             context.view_layer.objects.active = context.selected_objects[0]
+        else: 
+            context.view_layer.objects.active = None
+
+        if original_mode != 'OBJECT' and context.mode == 'OBJECT':
+            can_restore_original_mode = False
+            active_obj_for_restore = context.view_layer.objects.active
+            if active_obj_for_restore:
+                # For EDIT_MESH, the original_mode would have been 'EDIT_MESH' if it started there,
+                # but we usually assume original_mode is one of the main context.mode strings.
+                # The original_mode variable stores 'OBJECT', 'EDIT', 'POSE' etc.
+                # So if original_mode was 'EDIT' (generic), it should be fine to try to set it back.
+                if original_mode == 'EDIT' and active_obj_for_restore.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META', 'ARMATURE'}:
+                    can_restore_original_mode = True
+                elif original_mode == 'POSE' and active_obj_for_restore.type == 'ARMATURE':
+                     can_restore_original_mode = True
+                elif original_mode in {'SCULPT', 'VERTEX_PAINT', 'WEIGHT_PAINT', 'TEXTURE_PAINT'} and active_obj_for_restore.type == 'MESH':
+                    can_restore_original_mode = True
+            
+            if can_restore_original_mode and bpy.ops.object.mode_set.poll(mode=original_mode): 
+                try: bpy.ops.object.mode_set(mode=original_mode)
+                except RuntimeError as e_mode_restore: 
+                    logging.warning(f"Batch Mirror (finally): Could not restore original mode '{original_mode}': {e_mode_restore}")
+            elif context.mode != original_mode :
+                 logging.warning(f"Batch Mirror (finally): Conditions (or poll) not met to restore original mode '{original_mode}'. Mode remains '{context.mode}'.")
+        logging.info("Batch Mirror: Process finished.")
+        
+class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
+    """Import multiple USD files with isolated processing and transform application"""
+    bl_idname = "object.import_captures"
+    bl_label = "Import USD Captures (Robust)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".usd,.usda,.usdc,.usdz"
+
+    files: bpy.props.CollectionProperty( # type: ignore
+        name="File Path",
+        type=bpy.types.OperatorFileListElement,
+    )
+    directory: bpy.props.StringProperty( # type: ignore
+        subtype='DIR_PATH',
+    )
+
+    _addons_original_state = {} 
+
+    def _get_base_name_and_suffix_parts(self, obj_name):
+        # Pattern 1: Handles "name_S1.S2" (e.g., inst_62EC3A6022F09C50_0.001)
+        match_custom_extended = re.fullmatch(r'(.+?)_(\d+)\.(\d+)$', obj_name)
+        if match_custom_extended:
+            base, p1_str, p2_str = match_custom_extended.groups()
+            try:
+                return base, (int(p1_str), int(p2_str))
+            except ValueError:
+                pass 
+
+        # Pattern 2: Handles "name.S2" (e.g., inst_Cool.001)
+        match_blender_suffix = re.fullmatch(r'(.+?)\.(\d+)$', obj_name)
+        if match_blender_suffix:
+            base, num_str = match_blender_suffix.groups()
+            try:
+                return base, (int(num_str),)
+            except ValueError:
+                pass
+
+        # Pattern 3: Handles "name_S1" (e.g., inst_62EC3A6022F09C50_0)
+        match_custom_simple = re.fullmatch(r'(.+?)_(\d+)$', obj_name)
+        if match_custom_simple:
+            base, p1_str = match_custom_simple.groups()
+            try:
+                return base, (int(p1_str),)
+            except ValueError:
+                pass
+        
+        return obj_name, None
+
+    def _manage_addons(self, context, addons_to_target, disable_mode=True):
+        if disable_mode:
+            self._addons_original_state = {}
+            for addon_name in addons_to_target:
+                if addon_name in bpy.context.preferences.addons:
+                    self._addons_original_state[addon_name] = True 
+                    logging.info(f"Attempting to disable addon for import stability: {addon_name}")
+                    try:
+                        bpy.ops.preferences.addon_disable(module=addon_name)
+                        logging.info(f"Successfully disabled: {addon_name}")
+                    except RuntimeError: 
+                        logging.warning(f"Could not disable addon {addon_name} (possibly already disabled or not truly active).")
+                        self._addons_original_state[addon_name] = False 
+                    except Exception as e_disable:
+                        logging.warning(f"Error disabling addon {addon_name}: {e_disable}")
+                        self._addons_original_state[addon_name] = False
+                else:
+                    self._addons_original_state[addon_name] = False
+                    logging.info(f"Addon {addon_name} not found/installed. Skipping management for it.")
+        else: # Restore mode
+            for addon_name, should_try_enable in self._addons_original_state.items():
+                if should_try_enable: 
+                    if addon_name in bpy.context.preferences.addons:
+                        logging.info(f"Attempting to re-enable addon: {addon_name}")
+                        try:
+                            bpy.ops.preferences.addon_enable(module=addon_name)
+                            logging.info(f"Successfully re-enabled: {addon_name}")
+                        except Exception as e_enable:
+                            logging.error(f"Failed to re-enable addon {addon_name}: {e_enable}")
+                    else:
+                          logging.warning(f"Addon {addon_name} was targeted for re-enabling but is no longer found.")
+            self._addons_original_state = {}
+
+
+    def execute(self, context):
+        try:
+            addon_prefs_instance = context.preferences.addons[__name__].preferences
+        except KeyError:
+            self.report({'ERROR'}, f"Could not retrieve preferences for addon '{__name__}'. Import cancelled.")
+            logging.critical(f"KeyError accessing preferences for '{__name__}'. Addon might not be registered or enabled.")
+            return {'CANCELLED'}
+
+        if not self.files:
+            self.report({'WARNING'}, "No files selected for import.")
+            return {'CANCELLED'}
+
+        original_main_scene = context.scene
+        import_scene_temp = None
+        
+        addons_for_stability_management = ['blenderkit'] 
+
+        try:
+            self._manage_addons(context, addons_for_stability_management, disable_mode=True)
+
+            import_scene_temp = bpy.data.scenes.new("USD_Import_Captures_Temp_Scene")
+            logging.info(f"Created temporary scene: {import_scene_temp.name}")
+            
+            result = self._safe_execute_import_logic_captures(context, import_scene_temp, addon_prefs_instance, original_main_scene)
+            return result
+            
+        except Exception as e:
+            logging.critical(f"Fatal error during import execution (Captures): {str(e)}", exc_info=True)
+            self.report({'ERROR'}, "Critical import failure (Captures). Check logs.")
+            return {'CANCELLED'}
+        finally:
+            if import_scene_temp and import_scene_temp.name in bpy.data.scenes:
+                logging.info(f"Removing temporary scene: {import_scene_temp.name}")
+                for window in context.window_manager.windows:
+                    if window.scene == import_scene_temp:
+                        window.scene = original_main_scene 
+                bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
+            
+            self._manage_addons(context, addons_for_stability_management, disable_mode=False)
+            logging.info("Addon states restored (Captures).")
+
+    def _safe_execute_import_logic_captures(self, context, import_scene, addon_prefs, main_scene):
+        imported_files_details = self._perform_usd_import_phase_captures(context, import_scene, addon_prefs)
+
+        if not imported_files_details or not any(details.get('imported_object_names_in_temp') for details in imported_files_details):
+            self.report({'WARNING'}, "No USD files were successfully imported or no objects resulted (Captures).")
+            return {'CANCELLED'}
+
+        transform_stats = self._perform_transform_application_phase(context, import_scene)
+        
+        textures_attached_count = 0
+        if addon_prefs.remix_import_original_textures:
+            if not is_blend_file_saved(): 
+                self.report({'WARNING'}, "Blend file not saved. Skipping texture attachment for captures.")
+                logging.warning("Blend file not saved. Skipping texture attachment for captures.")
+            else:
+                logging.info("Starting texture attachment phase for captures.")
+                all_objects_to_texture_in_temp = []
+                
+                for file_detail in imported_files_details:
+                    usd_filepath = file_detail['filepath']
+                    base_dir_for_this_usd = os.path.dirname(usd_filepath)
+                    object_names_in_temp = file_detail['imported_object_names_in_temp']
+                    current_file_objects_in_temp = [import_scene.objects.get(name) for name in object_names_in_temp if import_scene.objects.get(name)]
+                    
+                    if current_file_objects_in_temp:
+                        logging.info(f"Attaching textures for objects from {os.path.basename(usd_filepath)} using base_dir: {base_dir_for_this_usd}")
+                        # Assuming attach_original_textures is defined elsewhere
+                        attach_original_textures(current_file_objects_in_temp, context, base_dir_for_this_usd)
+                        textures_attached_count += len(current_file_objects_in_temp) 
+                    else:
+                         logging.warning(f"No valid objects found in temp scene for names from {os.path.basename(usd_filepath)} for texturing.")
+                logging.info(f"Texture attachment phase for captures completed. Processed objects from {textures_attached_count} source objects.")
+        
+        transfer_stats = self._perform_object_transfer_phase(context, main_scene, import_scene)
+        cleanup_stats = self._perform_duplicate_cleanup_phase(context, main_scene)
+        
+        imported_count = len([d for d in imported_files_details if d.get('imported_object_names_in_temp')])
+        report_message = self._format_report_captures(
+            imported_count, 
+            transform_stats, 
+            transfer_stats, 
+            cleanup_stats,
+            textures_attached_count if addon_prefs.remix_import_original_textures and is_blend_file_saved() else 0
+        )
+        self.report({'INFO'}, report_message)
+        return {'FINISHED'}
+
+    def _perform_usd_import_phase_captures(self, context, target_scene, addon_prefs_instance): # Corrected parameter name usage
+        imported_files_details_list = []
+        user_selected_forward_axis = addon_prefs_instance.usd_import_forward_axis # Changed addon_prefs to addon_prefs_instance
+
+        all_newly_imported_meshes_for_post_processing = [] # type: list[bpy.types.Object]
+
+        original_importer_settings = {}
+        usd_importer_addon = context.preferences.addons.get('io_scene_usd')
+        if usd_importer_addon: # type: ignore
+          importer_prefs = usd_importer_addon.preferences
+          attrs_to_backup = [
+            'axis_forward', 'axis_up', 'scale', 'import_meshes', 'import_curves',
+            'import_materials', 'prim_path_mask', 'import_cameras', 'import_lights',
+            'import_blendshapes', 'import_armatures', 'import_skeletal_animation',
+            'import_transform_animation', 'import_payload', 'set_frame_range',
+            'import_subdiv', 'import_visible_only', 'import_guide_prims', 'import_instancers',
+            'read_mesh_uvs', 'read_mesh_colors', 'import_mesh_normals',
+            'api_schema_tmp_assign_materials' # Added in recent Blender versions
+          ]
+          for attr in attrs_to_backup:
+            if hasattr(importer_prefs, attr):
+              original_importer_settings[attr] = getattr(importer_prefs, attr)
+          logging.debug(f"Backed up USD importer settings for Captures: {list(original_importer_settings.keys())}")
+
+        original_window_scene = context.window.scene # type: bpy.types.Scene
+
+        try:
+          if usd_importer_addon: # type: ignore
+            importer_prefs = usd_importer_addon.preferences
+            logging.info(f"Applying custom USD import axis_forward for Captures: {user_selected_forward_axis}")
+            if hasattr(importer_prefs, 'axis_forward'):
+              importer_prefs.axis_forward = user_selected_forward_axis
+            if hasattr(importer_prefs, 'import_materials'): # Ensure materials are imported as preview surface
+              importer_prefs.import_materials = 'USD_PREVIEW_SURFACE' # Or 'BLENDER_SHADERS' if preferred for specific cases
+            if hasattr(importer_prefs, 'import_meshes'):
+              importer_prefs.import_meshes = True
+            if hasattr(importer_prefs, 'scale'): # Use a default scale, addon scale applied later
+              importer_prefs.scale = 1.0
+
+          if context.window.scene != target_scene:
+            context.window.scene = target_scene
+            logging.info(f"Temporarily set active window scene to '{target_scene.name}' for USD import (Captures).")
+
+          valid_extensions = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
+
+          for file_elem in self.files: # type: ignore
+            filepath = os.path.join(self.directory, file_elem.name) # type: ignore
+
+            if not (os.path.exists(filepath) and filepath.lower().endswith(valid_extensions)):
+              logging.warning(f"Skipping invalid or non-existent file (Captures): {filepath}")
+              continue
+
+            logging.info(f"Importing (Capture) '{filepath}' into temp scene '{target_scene.name}'")
+
+            objects_before_import_in_temp = set(target_scene.objects)
+            if bpy.ops.object.select_all.poll():
+              bpy.ops.object.select_all(action='DESELECT')
+
+            current_active_obj_before_mode_set = context.view_layer.objects.active
+
+            try:
+              bpy.ops.wm.usd_import(filepath=filepath)
+         
+              objects_after_import_in_temp = set(target_scene.objects)
+              newly_added_objects_this_file = list(objects_after_import_in_temp - objects_before_import_in_temp) # type: list[bpy.types.Object]
+         
+              if not newly_added_objects_this_file and context.selected_objects:
+                current_selection_in_target_scene = [obj for obj in context.selected_objects if obj.scene == target_scene]
+                newly_added_objects_this_file = [obj for obj in current_selection_in_target_scene if obj not in objects_before_import_in_temp]
+
+              imported_object_names_this_file = [obj.name for obj in newly_added_objects_this_file]
+
+              if newly_added_objects_this_file: # type: ignore
+                logging.info(f" Successfully imported {os.path.basename(filepath)}. New objects in '{target_scene.name}': {imported_object_names_this_file}")
+           
+                for obj in newly_added_objects_this_file: # type: ignore
+                  if obj.type == 'MESH':
+                    all_newly_imported_meshes_for_post_processing.append(obj)
+
+                # Use addon_prefs_instance here
+                import_scale_value = addon_prefs_instance.remix_import_scale # type: ignore
+                if import_scale_value != 1.0:
+                  for obj_to_scale in newly_added_objects_this_file: # type: ignore
+                    if obj_to_scale.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE'}:
+                      obj_to_scale.scale = tuple(s * import_scale_value for s in obj_to_scale.scale)
+                      logging.debug(f"  Applied import scale {import_scale_value} to captured object: {obj_to_scale.name}")
+           
+                imported_files_details_list.append({
+                  'filepath': filepath,
+                  'imported_object_names_in_temp': imported_object_names_this_file
+                })
+              else:
+                logging.warning(f" Imported {os.path.basename(filepath)} but no new objects detected by diff or selection in {target_scene.name}.")
+
+            except RuntimeError as e_imp:
+              logging.error(f" Runtime error importing (Capture) {filepath} into {target_scene.name}: {e_imp}")
+
+            except Exception as ex_gen:
+              logging.error(f" Unexpected error importing (Capture) {filepath}: {ex_gen}", exc_info=True)
+     
+          meshes_for_mirror = [obj for obj in all_newly_imported_meshes_for_post_processing if obj.type == 'MESH' and obj.name in target_scene.objects]
+          # Use addon_prefs_instance here
+          if addon_prefs_instance.mirror_import and meshes_for_mirror: # type: ignore
+            logging.info(f"Calling Batch Mirror for {len(meshes_for_mirror)} meshes (Captures).")
+            batch_mirror_objects_optimized(meshes_for_mirror, context)
+     
+          meshes_for_flip = [obj for obj in all_newly_imported_meshes_for_post_processing if obj.type == 'MESH' and obj.name in target_scene.objects]
+          # Use addon_prefs_instance here
+          if addon_prefs_instance.flip_normals_import and meshes_for_flip: # type: ignore
+            logging.info(f"Efficient Batch BMesh: Flipping normals for {len(meshes_for_flip)} imported meshes (Captures).")
+       
+            active_obj_in_temp_before_flip = context.view_layer.objects.active
+            selected_in_temp_before_flip = list(context.selected_objects)
+
+            edit_mode_entered_for_flip = False
+            try:
+              if context.mode != 'OBJECT':
+                if not context.view_layer.objects.active or context.view_layer.objects.active not in meshes_for_flip:
+                  if meshes_for_flip: context.view_layer.objects.active = meshes_for_flip[0]
+
+                if bpy.ops.object.mode_set.poll():
+                  bpy.ops.object.mode_set(mode='OBJECT')
+                  context.view_layer.update()
+                if context.mode != 'OBJECT':
+                  logging.error("Efficient Batch BMesh Flip: Failed to switch to OBJECT mode. Aborting flip.")
+                  raise RuntimeError("Could not set OBJECT mode for normal flip.")
+
+              if bpy.ops.object.select_all.poll():
+                bpy.ops.object.select_all(action='DESELECT')
+         
+              selected_meshes_for_flip_op = []
+              for mesh_obj in meshes_for_flip:
+                if mesh_obj.name in target_scene.objects and mesh_obj.name in context.view_layer.objects:
+                  mesh_obj.select_set(True)
+                  selected_meshes_for_flip_op.append(mesh_obj)
+                else:
+                  logging.warning(f"Efficient Batch BMesh Flip: Mesh {mesh_obj.name} not found in target scene's current view_layer. Skipping selection.")
+         
+              if not selected_meshes_for_flip_op:
+                logging.info("Efficient Batch BMesh Flip: No valid meshes were selected for flipping. Skipping.")
+                raise StopIteration
+
+              if context.view_layer.objects.active not in selected_meshes_for_flip_op:
+                context.view_layer.objects.active = selected_meshes_for_flip_op[0]
+         
+              if not context.view_layer.objects.active:
+                logging.error("Efficient Batch BMesh Flip: No active object set before attempting EDIT mode. Aborting.")
+                raise RuntimeError("No active object for normal flip.")
+
+              if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='EDIT')
+                edit_mode_entered_for_flip = (context.mode == 'EDIT' or context.mode == 'EDIT_MESH')
+                if not edit_mode_entered_for_flip:
+                    logging.warning(f"Efficient Batch BMesh Flip: Attempted EDIT mode, but context.mode is {context.mode}. Normals may not be flipped.")
+              else:
+                logging.error("Efficient Batch BMesh Flip: Cannot poll to switch to EDIT mode. Aborting flip.")
+                raise RuntimeError("Cannot switch to EDIT mode for normal flip.")
+
+              if edit_mode_entered_for_flip:
+                logging.info(f" Efficient Batch BMesh Flip: Entered EDIT mode. Processing {len(bpy.context.selected_editable_objects)} editable objects.")
+                processed_count_flip = 0
+                for obj_in_edit in bpy.context.selected_editable_objects:
+                  if obj_in_edit.type == 'MESH' and obj_in_edit in selected_meshes_for_flip_op:
+                    mesh_data = obj_in_edit.data
+                    bm = bmesh.from_edit_mesh(mesh_data)
+                    for face in bm.faces:
+                      face.normal_flip()
+                    bmesh.update_edit_mesh(mesh_data, loop_triangles=False, destructive=False)
+                    processed_count_flip += 1
+                logging.info(f" Efficient Batch BMesh Flip: Normals flipped for {processed_count_flip} meshes.")
+       
+            except StopIteration:
+              pass
+            except Exception as e_flip_batch:
+              logging.error(f"Error during Efficient Batch BMesh normal flipping (Captures): {e_flip_batch}", exc_info=True)
+            finally:
+              if edit_mode_entered_for_flip and (context.mode == 'EDIT' or context.mode == 'EDIT_MESH'):
+                if bpy.ops.object.mode_set.poll():
+                  bpy.ops.object.mode_set(mode='OBJECT')
+                else:
+                    logging.warning("Efficient Batch BMesh Flip: Could not poll to switch back to OBJECT mode from EDIT.")
+         
+              if bpy.ops.object.select_all.poll():
+                bpy.ops.object.select_all(action='DESELECT')
+         
+              for obj_s in selected_in_temp_before_flip:
+                if obj_s and obj_s.name in target_scene.objects and obj_s.name in context.view_layer.objects:
+                  try: obj_s.select_set(True)
+                  except RuntimeError: pass
+         
+              if active_obj_in_temp_before_flip and \
+               active_obj_in_temp_before_flip.name in target_scene.objects and \
+               active_obj_in_temp_before_flip.name in context.view_layer.objects:
+                context.view_layer.objects.active = active_obj_in_temp_before_flip
+              elif context.selected_objects:
+                context.view_layer.objects.active = context.selected_objects[0]
+              else:
+                context.view_layer.objects.active = None
+              logging.info(f"Efficient Batch BMesh Flip: Finished normal flipping for captures.")
+
+        finally:
+          if usd_importer_addon and original_importer_settings: # type: ignore
+            importer_prefs = usd_importer_addon.preferences # type: ignore
+            logging.info("Restoring original USD importer settings for Captures...")
+            for attr, value in original_importer_settings.items():
+              if hasattr(importer_prefs, attr):
+                try:
+                  setattr(importer_prefs, attr, value)
+                except Exception as e_restore_setting:
+                  logging.warning(f" Failed to restore USD importer setting '{attr}' to '{value}': {e_restore_setting}")
+            logging.info("USD importer settings restoration attempt complete for Captures.")
+
+          if context.window.scene != original_window_scene:
+            try:
+              context.window.scene = original_window_scene
+              logging.info(f"Restored active window scene to '{original_window_scene.name}' after USD import (Captures).")
+            except Exception as e_restore_scene:
+                logging.error(f"Failed to restore original window scene '{original_window_scene.name}' (Captures): {e_restore_scene}", exc_info=True)
+
+        return imported_files_details_list
+
+    def _perform_transform_application_phase(self, context, scene_to_process):
+        processed_count = 0
+        logging.info(f"Starting BATCH transform_apply phase for scene: '{scene_to_process.name if scene_to_process else 'None'}'.")
+        if not scene_to_process:
+          logging.error("Transform phase: scene_to_process is None. Aborting.")
+          return {'transformed': 0}
+   
+        original_window_scene = context.window.scene
+        original_active_object_in_original_scene = context.active_object
+        original_selected_objects_in_original_scene = list(context.selected_objects)
+        original_mode = 'OBJECT'
+        if original_window_scene == context.scene:
+          if context.object and hasattr(context.object, 'mode'):
+            original_mode = context.object.mode
+          else:
+            original_mode = context.mode
+   
+        try:
+          if context.window.scene != scene_to_process:
+            context.window.scene = scene_to_process
+            logging.info(f"Transform phase: Temporarily set active window scene to '{scene_to_process.name}'.")
+     
+          if not scene_to_process.view_layers or not context.view_layer:
+            logging.error(f"Transform phase: Scene '{scene_to_process.name}' has no view layers or no active context view layer. Aborting.")
+            return {'transformed': 0}
+          target_view_layer = context.view_layer
+          logging.info(f"Transform phase: Using view layer '{target_view_layer.name}' for scene '{scene_to_process.name}'.")
+
+          if context.mode != 'OBJECT':
+            current_active = target_view_layer.objects.active
+            if not current_active and scene_to_process.objects:
+              candidate_active = next((obj for obj in scene_to_process.objects if obj.type in {'MESH', 'EMPTY', 'CURVE', 'ARMATURE'}), None)
+              if candidate_active: target_view_layer.objects.active = candidate_active
+       
+            if bpy.ops.object.mode_set.poll():
+              try: bpy.ops.object.mode_set(mode='OBJECT')
+              except RuntimeError as e_mode:
+                logging.error(f"Transform phase: Could not switch to OBJECT mode in '{scene_to_process.name}': {e_mode}. Aborting.", exc_info=False)
+                return {'transformed': 0}
+            else:
+              logging.error(f"Transform phase: Cannot poll mode_set to OBJECT in '{scene_to_process.name}'. Active: {target_view_layer.objects.active}. Aborting.")
+              return {'transformed': 0}
+            if not target_view_layer.objects.active and current_active and current_active.name in target_view_layer.objects:
+              target_view_layer.objects.active = current_active
+
+
+          if bpy.ops.object.select_all.poll():
+            bpy.ops.object.select_all(action='DESELECT')
+
+          objects_to_transform_in_batch = []
+          total_eligible_objects = 0
+          for obj in scene_to_process.objects:
+            if obj.type in {'MESH', 'CURVE', 'FONT', 'SURFACE', 'EMPTY', 'ARMATURE'}:
+              if obj.type == 'EMPTY' or (obj.data is not None):
+                total_eligible_objects += 1
+                if obj.name in target_view_layer.objects:
+                  try:
+                    obj.select_set(True)
+                    objects_to_transform_in_batch.append(obj)
+                  except RuntimeError as e_select_vl:
+                    logging.warning(f"Transform phase: Could not select object '{obj.name}' in view layer '{target_view_layer.name}': {e_select_vl}")
+                else:
+                  logging.warning(f"Transform phase: Object '{obj.name}' in scene '{scene_to_process.name}' but not in its active view layer '{target_view_layer.name}'. Cannot select for transform.")
+     
+          if not objects_to_transform_in_batch:
+            logging.info(f"Transform phase: No objects were selected in '{scene_to_process.name}' for batch transform (Total eligible: {total_eligible_objects}).")
+            return {'transformed': 0}
+
+          logging.info(f"Transform phase: Selected {len(objects_to_transform_in_batch)} objects in '{scene_to_process.name}' for batch transform.")
+     
+          current_active_in_target_vl = target_view_layer.objects.active
+          if not current_active_in_target_vl or current_active_in_target_vl not in objects_to_transform_in_batch:
+            if objects_to_transform_in_batch:
+              target_view_layer.objects.active = objects_to_transform_in_batch[0]
+          logging.info(f"Transform phase: Active object for batch transform in '{scene_to_process.name}': {target_view_layer.objects.active.name if target_view_layer.objects.active else 'None'}")
+
+          if objects_to_transform_in_batch and target_view_layer.objects.active:
+            logging.info(f" BATCH APPLY: Applying Rotation & Scale to {len(context.selected_objects)} selected objects in '{scene_to_process.name}'. Active: {context.active_object.name if context.active_object else 'None'}") # type: ignore
+            bpy.ops.object.transform_apply(location=False, rotation=True, scale=True, properties=False)
+       
+            for obj_verify in objects_to_transform_in_batch:
+              if obj_verify.data and hasattr(obj_verify.data, 'update'): obj_verify.data.update()
+              rotation_applied = all(abs(angle) < 0.0001 for angle in obj_verify.rotation_euler)
+              scale_applied = all(abs(s - 1.0) < 0.0001 for s in obj_verify.scale)
+              if rotation_applied and scale_applied:
+                logging.debug(f"  VERIFIED BATCH: Transforms applied for {obj_verify.name}")
+                processed_count += 1
+              else:
+                logging.warning(f"  VERIFICATION FAILED BATCH for {obj_verify.name}: Rot {obj_verify.rotation_euler}, Scale {obj_verify.scale}")
+          else:
+            logging.warning(f" BATCH APPLY: Skipped due to no selected objects or no active object in '{scene_to_process.name}' for transform_apply.")
+
+          if bpy.ops.object.select_all.poll():
+            bpy.ops.object.select_all(action='DESELECT')
+          logging.info(f" BATCH APPLY: Done. Verified {processed_count} objects successfully transformed in '{scene_to_process.name}'.")
+
+        except Exception as e_transform:
+          logging.error(f"Transform phase: Error during transform application in '{scene_to_process.name}': {e_transform}", exc_info=True)
+        finally:
+          current_scene_name_at_finally_start = context.window.scene.name
+          if context.window.scene != original_window_scene:
+            context.window.scene = original_window_scene
+            logging.info(f"Transform phase: Restored active window scene to '{original_window_scene.name}' (was '{current_scene_name_at_finally_start}').")
+     
+          if bpy.ops.object.select_all.poll():
+            bpy.ops.object.select_all(action='DESELECT')
+     
+          for obj_ref in original_selected_objects_in_original_scene:
+            if obj_ref and obj_ref.name in original_window_scene.objects:
+              scene_obj_to_select = original_window_scene.objects.get(obj_ref.name)
+              if scene_obj_to_select and scene_obj_to_select.name in context.view_layer.objects:
+                try: scene_obj_to_select.select_set(True)
+                except RuntimeError as e_select:
+                  logging.warning(f"Could not re-select object '{scene_obj_to_select.name}' in '{original_window_scene.name}': {e_select}")
+     
+          if original_active_object_in_original_scene and \
+           original_active_object_in_original_scene.name in original_window_scene.objects:
+            scene_obj_to_activate = original_window_scene.objects.get(original_active_object_in_original_scene.name)
+            if scene_obj_to_activate and scene_obj_to_activate.name in context.view_layer.objects:
+              try: context.view_layer.objects.active = scene_obj_to_activate
+              except Exception as e_active:
+                logging.warning(f"Could not restore active object to '{scene_obj_to_activate.name}' in '{original_window_scene.name}': {e_active}")
+          elif context.view_layer.objects.active is not None :
+            context.view_layer.objects.active = None
+            logging.debug(f"Original active object not restored in '{original_window_scene.name}'; active object cleared.")
+
+          current_context_mode_final = context.mode
+          if current_context_mode_final != original_mode:
+            can_set_original_mode = (original_mode == 'OBJECT') or (context.view_layer.objects.active is not None)
+       
+            if can_set_original_mode and bpy.ops.object.mode_set.poll():
+              try: bpy.ops.object.mode_set(mode=original_mode)
+              except RuntimeError as e_mode_restore_final_ctx:
+                logging.warning(f"Transform phase (finally): Could not restore mode in '{original_window_scene.name}' to '{original_mode}': {e_mode_restore_final_ctx}")
+            elif not can_set_original_mode:
+               logging.warning(f"Transform phase (finally): Conditions not met to restore mode to '{original_mode}' in '{original_window_scene.name}'. Mode remains '{current_context_mode_final}'.")
+   
+        logging.info(f"Finished BATCH transform_apply phase. Processed {processed_count} objects in '{scene_to_process.name if scene_to_process else 'None'}'.")
+        return {'transformed': processed_count}
+
+    def _perform_object_transfer_phase(self, context, main_scene, source_scene):
+        """
+        Batch-transfer all objects from source_scene into main_scene.collection.
+        Unlink each object from any collections except the target, then link them all at once.
+        """
+        transferred_count = 0
+
+        # Ensure main scene has a master collection
+        main_collection = main_scene.collection
+        if main_collection is None:
+            logging.error(f"Object transfer: Main scene '{main_scene.name}' has no master collection.")
+            return {'transferred_count': 0}
+
+        # Gather all objects in the source scene
+        objects_to_transfer = list(source_scene.objects)
+        logging.info(f"Object transfer: Preparing to move {len(objects_to_transfer)} objects from '{source_scene.name}' to '{main_scene.name}'.")
+
+        # -- 1. Batch-unlink: for each object, remove it from every collection except the main target
+        for obj in objects_to_transfer:
+            # Copy the list because we're modifying it during iteration
+            for coll in list(obj.users_collection):
+                if coll != main_collection:
+                    try:
+                        coll.objects.unlink(obj)
+                    except Exception as e:
+                        logging.warning(f"Object transfer: could not unlink {obj.name} from {coll.name}: {e}")
+
+        # -- 2. Batch-link: link each object to the main scene collection if not already linked
+        for obj in objects_to_transfer:
+            if obj.name not in main_collection.objects:
+                try:
+                    main_collection.objects.link(obj)
+                    transferred_count += 1
+                except Exception as e:
+                    logging.error(f"Object transfer: could not link {obj.name} to {main_collection.name}: {e}")
+
+        # -- 3. Refresh view layer and scene tags
+        if main_scene.view_layers:
+            # Update the first view layer (or whichever is active)
+            main_scene.view_layers[0].update()
+        main_scene.update_tag()
+
+        logging.info(f"Finished object transfer. Transferred {transferred_count} objects from '{source_scene.name}' to '{main_scene.name}'.")
+        return {'transferred_count': transferred_count}
+
+    def _perform_duplicate_cleanup_phase(self, context, scene_to_clean):
+        logging.info(f"Starting combined cleanup in scene: '{scene_to_clean.name}'")
+    
+        deleted_objects_count_inst = 0 
+        deleted_objects_mesh_pattern = 0 
+
+        original_window_scene = context.window.scene
+        original_active_object_in_original_scene = context.active_object 
+        original_selected_objects_in_original_scene = list(context.selected_objects)
+    
+        original_mode = 'OBJECT' 
+        if original_window_scene == context.scene: 
+            if context.object and hasattr(context.object, 'mode'):
+                original_mode = context.object.mode 
+            elif context.mode: 
+                original_mode = context.mode
+    
+        try: 
+            if context.window.scene != scene_to_clean:
+                context.window.scene = scene_to_clean
+                logging.debug(f"Cleanup phase: Switched active window scene to '{scene_to_clean.name}'.")
+
+            if context.mode != 'OBJECT':
+                active_obj_for_mode_set = context.view_layer.objects.active 
+                if not active_obj_for_mode_set and scene_to_clean.objects:
+                    candidate_active = next((obj for obj in scene_to_clean.objects if obj.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE'}), None)
+                    if candidate_active and candidate_active.name in context.view_layer.objects: 
+                        context.view_layer.objects.active = candidate_active
+                
+                if bpy.ops.object.mode_set.poll(): 
+                    try: 
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                        logging.debug(f"Cleanup phase: Switched to OBJECT mode in '{scene_to_clean.name}'.")
+                    except RuntimeError as e: 
+                        logging.warning(f"Cleanup phase: Could not set OBJECT mode in '{scene_to_clean.name}': {e}")
+                else:
+                    logging.warning(f"Cleanup phase: Cannot poll bpy.ops.object.mode_set to OBJECT in '{scene_to_clean.name}'. Mode remains {context.mode}.")
+        
+            logging.info(f"Starting 'inst_' object cleanup in '{scene_to_clean.name}'.")
+            if bpy.ops.object.select_all.poll():
+                bpy.ops.object.select_all(action='DESELECT')
+
+            objects_to_delete_inst_collector = [] 
+            objects_to_keep_inst_collector = []    
+
+            grouped_by_base_inst = collections.defaultdict(list)
+            prefix_to_scan_inst = "inst_"
+            all_inst_objects_in_scene = [obj for obj in scene_to_clean.objects if obj.name.startswith(prefix_to_scan_inst)]
+
+            for obj_inst in all_inst_objects_in_scene: 
+                base_name_part, suffix_key_part = self._get_base_name_and_suffix_parts(obj_inst.name)
+                # logging.debug(f"Parsing inst_ name: '{obj_inst.name}' -> base: '{base_name_part}', suffix_key: {suffix_key_part}") # Reduced verbosity
+                grouped_by_base_inst[base_name_part].append({
+                    'obj': obj_inst, 
+                    'name': obj_inst.name, 
+                    'suffix_key': suffix_key_part
+                })
+
+            for base_name_part, obj_infos_list in grouped_by_base_inst.items():
+                plain_originals = [info for info in obj_infos_list if info['suffix_key'] is None]
+                suffixed_duplicates = [info for info in obj_infos_list if info['suffix_key'] is not None]
+            
+                object_to_keep_info_dict = None 
+                current_group_objects_to_delete = [] 
+
+                if plain_originals:
+                    plain_originals.sort(key=lambda x: x['name']) 
+                    object_to_keep_info_dict = plain_originals[0] 
+                    current_group_objects_to_delete.extend(p_info['obj'] for p_info in plain_originals[1:])
+                    current_group_objects_to_delete.extend(s_info['obj'] for s_info in suffixed_duplicates)
+                elif suffixed_duplicates: 
+                    suffixed_duplicates.sort(key=lambda x: (x['suffix_key'], x['name'])) # type: ignore
+                    object_to_keep_info_dict = suffixed_duplicates[0] 
+                    current_group_objects_to_delete.extend(s_info['obj'] for s_info in suffixed_duplicates[1:])
+                else: 
+                    if obj_infos_list: 
+                          logging.warning(f"'inst_' cleanup for base '{base_name_part}': Group with {len(obj_infos_list)} items had no plain or suffixed. Fallback: keep first by name.")
+                          if len(obj_infos_list) > 0: 
+                            obj_infos_list.sort(key=lambda x: x['name'])
+                            object_to_keep_info_dict = obj_infos_list[0]
+                            current_group_objects_to_delete.extend(info['obj'] for info in obj_infos_list[1:])
+
+                if object_to_keep_info_dict:
+                    objects_to_keep_inst_collector.append(object_to_keep_info_dict['obj'])
+                    # logging.debug(f"'inst_' cleanup for base '{base_name_part}': Keeping '{object_to_keep_info_dict['name']}'...") # Reduced verbosity
+                # else: # Reduced verbosity
+                    # logging.debug(f"'inst_' cleanup for base '{base_name_part}': No object chosen to keep...")
+                objects_to_delete_inst_collector.extend(current_group_objects_to_delete)
+
+            kept_inst_objects_set = set(objects_to_keep_inst_collector) 
+            unique_objects_to_delete_inst_final = list(set(
+                obj for obj in objects_to_delete_inst_collector 
+                if obj and obj.name in scene_to_clean.objects and obj not in kept_inst_objects_set 
+            ))
+        
+            if unique_objects_to_delete_inst_final:
+                logging.info(f"'inst_' cleanup: Identified {len(unique_objects_to_delete_inst_final)} unique 'inst_' objects for deletion.")
+                if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+                active_obj_inst_del = context.view_layer.objects.active
+                active_obj_inst_del_cleared = False
+                if active_obj_inst_del and active_obj_inst_del in unique_objects_to_delete_inst_final:
+                    context.view_layer.objects.active = None
+                    active_obj_inst_del_cleared = True
+
+                selected_for_deletion_count = 0
+                for obj_to_del in unique_objects_to_delete_inst_final: 
+                    if obj_to_del.name in context.view_layer.objects : 
+                        try:
+                            obj_to_del.select_set(True); selected_for_deletion_count +=1
+                        except RuntimeError as e_select: logging.warning(f"Could not select '{obj_to_del.name}' for inst_ deletion: {e_select}")
+                    else: logging.warning(f"'{obj_to_del.name}' for inst_ deletion not in view layer.")
+            
+                if selected_for_deletion_count > 0: 
+                    bpy.ops.object.delete(); deleted_objects_count_inst = selected_for_deletion_count 
+                    logging.info(f"'inst_' cleanup: Batch deleted {deleted_objects_count_inst} objects.")
+                else: logging.info("'inst_' cleanup: No 'inst_' objects ultimately selected for deletion.")
+            
+                if active_obj_inst_del_cleared: 
+                    if active_obj_inst_del and (active_obj_inst_del.name not in scene_to_clean.objects): 
+                        if scene_to_clean.objects: 
+                            new_active_candidate = next((obj for obj in scene_to_clean.objects if obj.type in {'MESH', 'EMPTY', 'ARMATURE'}), None)
+                            if new_active_candidate and new_active_candidate.name in context.view_layer.objects:
+                                   context.view_layer.objects.active = new_active_candidate
+                    elif active_obj_inst_del and active_obj_inst_del.name in scene_to_clean.objects: 
+                        if active_obj_inst_del.name in context.view_layer.objects :
+                            context.view_layer.objects.active = active_obj_inst_del
+            else: logging.info("'inst_' cleanup: No 'inst_' objects scheduled for deletion.")
+
+            final_kept_inst_objects_set = { obj for obj in objects_to_keep_inst_collector if obj.name in scene_to_clean.objects }
+            logging.info(f"After 'inst_' cleanup, {len(final_kept_inst_objects_set)} 'inst_' objects remain for mesh.#### cleanup reference.")
+        
+            logging.info(f"Starting 'mesh.####' OBJECT cleanup in scene: '{scene_to_clean.name}'.")
+            objects_to_delete_mesh_pattern_collector = []
+            if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+
+            all_mesh_dot_pattern_objects_in_scene = [ obj for obj in scene_to_clean.objects if obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", obj.name) ]
+
+            if all_mesh_dot_pattern_objects_in_scene:
+                for mesh_obj in all_mesh_dot_pattern_objects_in_scene:
+                    is_used_or_parented_safely = False
+                    if mesh_obj.parent and mesh_obj.parent in final_kept_inst_objects_set:
+                        is_used_or_parented_safely = True; # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: parent is kept inst.")
+                    if not is_used_or_parented_safely:
+                        for inst_obj in final_kept_inst_objects_set: 
+                            if inst_obj.type == 'EMPTY': 
+                                if inst_obj.instance_type == 'OBJECT' and inst_obj.instance_object == mesh_obj: is_used_or_parented_safely = True; break
+                                if inst_obj.instance_type == 'COLLECTION' and inst_obj.instance_collection and mesh_obj.name in inst_obj.instance_collection.all_objects: is_used_or_parented_safely = True; break
+                    if not is_used_or_parented_safely and mesh_obj.parent:
+                        parent_obj = mesh_obj.parent
+                        if parent_obj.name in scene_to_clean.objects: 
+                            is_parent_kept_inst = parent_obj in final_kept_inst_objects_set
+                            is_parent_mesh_dot = parent_obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", parent_obj.name)
+                            if not is_parent_kept_inst and not is_parent_mesh_dot: is_used_or_parented_safely = True; # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: parent is regular.")
+                    if not is_used_or_parented_safely and mesh_obj.data and mesh_obj.data.users > 1:
+                        for user_obj in scene_to_clean.objects: 
+                            if user_obj.data == mesh_obj.data and user_obj != mesh_obj:
+                                is_user_kept_inst = user_obj in final_kept_inst_objects_set
+                                is_user_mesh_dot = user_obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", user_obj.name)
+                                is_user_deleted_inst = user_obj.name.startswith(prefix_to_scan_inst) and not is_user_kept_inst
+                                if not is_user_mesh_dot and not is_user_deleted_inst : is_used_or_parented_safely = True; break # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: data used by other significant obj.")
+                    if not is_used_or_parented_safely:
+                        is_in_root = scene_to_clean.collection and mesh_obj.name in scene_to_clean.collection.objects
+                        if mesh_obj.parent is None and (is_in_root or not any(coll == scene_to_clean.collection for coll in mesh_obj.users_collection)): # If unparented & in root, or unparented & not in any other meaningful collection part of main scene structure (heuristic)
+                            objects_to_delete_mesh_pattern_collector.append(mesh_obj) # logging.info(f"Unused 'mesh.####' object '{mesh_obj.name}' scheduled for deletion.")
+
+                if objects_to_delete_mesh_pattern_collector:
+                    unique_objects_to_delete_mesh_final = list(set( obj for obj in objects_to_delete_mesh_pattern_collector if obj and obj.name in scene_to_clean.objects ))
+                    if unique_objects_to_delete_mesh_final:
+                        logging.info(f"'mesh.####' cleanup: Identified {len(unique_objects_to_delete_mesh_final)} objects for deletion.")
+                        if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+                        active_obj_mesh_del = context.view_layer.objects.active; active_obj_mesh_del_cleared = False
+                        if active_obj_mesh_del and active_obj_mesh_del in unique_objects_to_delete_mesh_final: context.view_layer.objects.active = None; active_obj_mesh_del_cleared = True
+                        
+                        selected_for_mesh_del_count = 0
+                        for obj_to_del in unique_objects_to_delete_mesh_final:
+                            if obj_to_del.name in context.view_layer.objects: obj_to_del.select_set(True); selected_for_mesh_del_count +=1
+                            else: logging.warning(f"'{obj_to_del.name}' for mesh.#### deletion not in view layer.")
+                        
+                        if selected_for_mesh_del_count > 0 and context.selected_objects: 
+                            bpy.ops.object.delete(); deleted_objects_mesh_pattern = selected_for_mesh_del_count
+                            logging.info(f"'mesh.####' cleanup: Batch deleted {deleted_objects_mesh_pattern} objects.")
+                            if active_obj_mesh_del_cleared: 
+                                if active_obj_mesh_del and (active_obj_mesh_del.name not in scene_to_clean.objects): 
+                                    if scene_to_clean.objects: 
+                                        new_active = next((o for o in scene_to_clean.objects if o.type in {'MESH', 'EMPTY'}), None)
+                                        if new_active and new_active.name in context.view_layer.objects: context.view_layer.objects.active = new_active
+                                elif active_obj_mesh_del and active_obj_mesh_del.name in scene_to_clean.objects and active_obj_mesh_del.name in context.view_layer.objects:
+                                    context.view_layer.objects.active = active_obj_mesh_del
+                        else: logging.info("'mesh.####' cleanup: No objects ultimately selected for deletion.")
+                    else: logging.info("'mesh.####' cleanup: No objects for deletion after filtering.")
+                else: logging.info("'mesh.####' cleanup: No candidates initially identified.")
+
+        except Exception as e_cleanup_main: 
+            logging.error(f"Error during main cleanup phase in '{scene_to_clean.name}': {e_cleanup_main}", exc_info=True)
+        finally: 
+            current_scene_name_at_finally = context.window.scene.name
+            if context.window.scene != original_window_scene: context.window.scene = original_window_scene; # logging.debug(f"Cleanup: Restored window scene to '{original_window_scene.name}'.")
+            if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+            for obj_ref in original_selected_objects_in_original_scene: 
+                if obj_ref and obj_ref.name in original_window_scene.objects: 
+                    s_obj = original_window_scene.objects.get(obj_ref.name)
+                    if s_obj and s_obj.name in context.view_layer.objects: 
+                        try: s_obj.select_set(True)
+                        except RuntimeError: pass
+            o_active_name = original_active_object_in_original_scene.name if original_active_object_in_original_scene else None
+            if o_active_name and o_active_name in original_window_scene.objects:
+                s_active = original_window_scene.objects.get(o_active_name)
+                if s_active and s_active.name in context.view_layer.objects: 
+                    try: context.view_layer.objects.active = s_active
+                    except Exception: pass
+            elif context.view_layer.objects.active is not None: context.view_layer.objects.active = None 
+            
+            final_mode = context.mode 
+            if final_mode != original_mode:
+                can_set_orig = (original_mode == 'OBJECT') or (context.view_layer.objects.active is not None) 
+                if can_set_orig and bpy.ops.object.mode_set.poll():
+                    try: bpy.ops.object.mode_set(mode=original_mode)
+                    except RuntimeError : pass # logging.warning(f"Cleanup (finally): Could not restore mode to '{original_mode}'.")
+    
+        logging.info(f"Finished cleanup for scene '{scene_to_clean.name}'. Deleted {deleted_objects_count_inst} 'inst_', {deleted_objects_mesh_pattern} 'mesh.####'.")
+        return {'deleted_objects_inst': deleted_objects_count_inst, 'deleted_objects_mesh_pattern': deleted_objects_mesh_pattern}
+
+    def _format_report_captures(self, imported_count, transforms_info, transfer_info, cleanup_info, textures_processed_count):
+        transformed_objects = transforms_info.get('transformed', 0)
+        transferred_objects = transfer_info.get('transferred_count', 0)
+        deleted_inst = cleanup_info.get('deleted_objects_inst', 0)
+        deleted_mesh_pattern = cleanup_info.get('deleted_objects_mesh_pattern', 0)
+        
+        report_parts = [
+            f"Imported {imported_count} USD file(s) (Captures).",
+            f"Applied transforms to {transformed_objects} objects.",
+            f"Transferred {transferred_objects} objects to main scene.",
+            f"Cleaned {deleted_inst} 'inst_' and {deleted_mesh_pattern} 'mesh.####' objects."
+        ]
+        
+        addon_prefs = bpy.context.preferences.addons[__name__].preferences 
+        if addon_prefs.remix_import_original_textures:
+            if is_blend_file_saved(): 
+                if textures_processed_count > 0:
+                    report_parts.append(f"Processed textures for {textures_processed_count} objects/groups.")
+                else:
+                    report_parts.append("Texture processing: No objects processed for textures (check logs).") # Slightly rephrased
+            else:
+                report_parts.append("Texture processing skipped (blend file not saved).")
+        else:
+             report_parts.append("Texture processing skipped (option disabled).")
+        
+        return " ".join(report_parts)
+
+    def invoke(self, context, event): 
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
 class OBJECT_OT_import_usd_from_remix(Operator):
     bl_idname = "object.import_usd_from_remix"
-    bl_label = "Import USD from Remix"
+    bl_label = "Import USD from Remix (Robust)"
     bl_options = {'REGISTER', 'UNDO'}
+
+    # This operator will reuse helper methods from OBJECT_OT_import_captures
+    # for transform application and object transfer.
+
+    def _perform_usd_import_into_scene(self, context, target_scene, usd_file_paths_to_import, addon_prefs_instance):
+        """
+        Imports specified USD files into the target_scene for Remix workflow.
+        Manages USD importer preferences.
+        Applies Remix-specific post-import operations like scaling, mirroring, normal flipping.
+        Returns a list of top-level Blender objects created from the imported USDs.
+        """
+        imported_top_level_objects_map = {} # Store as {usd_filepath: [objects]}
+        user_selected_forward_axis = addon_prefs_instance.usd_import_forward_axis
+
+        original_importer_settings = {}
+        usd_importer_addon = context.preferences.addons.get('io_scene_usd')
+        if usd_importer_addon:
+            importer_prefs = usd_importer_addon.preferences
+            attrs_to_backup = ['axis_forward', 'axis_up', 'scale', 'import_materials', 'import_meshes'] # Add more if needed
+            for attr in attrs_to_backup:
+                if hasattr(importer_prefs, attr):
+                    original_importer_settings[attr] = getattr(importer_prefs, attr)
+            logging.debug(f"Backed up USD importer settings for Remix import: {original_importer_settings.keys()}")
+        
+        original_window_scene = context.window.scene
+        
+        try:
+            if usd_importer_addon:
+                importer_prefs = usd_importer_addon.preferences
+                if hasattr(importer_prefs, 'axis_forward'):
+                    importer_prefs.axis_forward = user_selected_forward_axis
+                    logging.info(f"Remix import: Set USD importer axis_forward to '{user_selected_forward_axis}'.")
+                # Set other "default" UMI-like settings
+                if hasattr(importer_prefs, 'import_materials'): importer_prefs.import_materials = 'USD_PREVIEW_SURFACE'
+                if hasattr(importer_prefs, 'import_meshes'): importer_prefs.import_meshes = True
+                # Add other desired defaults for USD import here
+            
+            if context.window.scene != target_scene:
+                context.window.scene = target_scene
+                logging.info(f"Temporarily set active window scene to '{target_scene.name}' for Remix USD import.")
+
+            for usd_file_path in usd_file_paths_to_import:
+                logging.info(f"Importing (Remix) '{usd_file_path}' into temp scene '{target_scene.name}'")
+                
+                # Store objects already in the temp scene to identify newly added ones
+                objects_before_import_in_temp = set(target_scene.objects)
+                bpy.ops.object.select_all(action='DESELECT') # Deselect in temp scene
+
+                try:
+                    bpy.ops.wm.usd_import(filepath=usd_file_path)
+                    logging.info(f"  Successfully imported (Remix) {os.path.basename(usd_file_path)} into {target_scene.name}.")
+                    
+                    objects_after_import_in_temp = set(target_scene.objects)
+                    newly_added_objects = list(objects_after_import_in_temp - objects_before_import_in_temp)
+                    
+                    if not newly_added_objects:
+                        # Sometimes USD import might select objects instead of just adding them,
+                        # or if it imports into an existing hierarchy, the diff might be complex.
+                        # Fallback to selected if any, otherwise log a warning.
+                        if context.selected_objects:
+                            newly_added_objects = list(context.selected_objects)
+                            logging.debug(f"  Remix import of {os.path.basename(usd_file_path)}: using selected objects as newly added.")
+                        else:
+                            logging.warning(f"  Remix import of {os.path.basename(usd_file_path)}: No new objects detected by diff and nothing selected. Subsequent per-object operations might be skipped for this file.")
+                            imported_top_level_objects_map[usd_file_path] = []
+                            continue # Skip to next file if nothing seems to have been imported from this one
+
+                    imported_top_level_objects_map[usd_file_path] = newly_added_objects
+                    logging.info(f"  Remix import: Identified {len(newly_added_objects)} new top-level objects from {os.path.basename(usd_file_path)}.")
+
+                    # Apply your addon-specific scaling, mirroring, normal flipping
+                    import_scale = addon_prefs_instance.remix_import_scale
+                    if import_scale != 1.0:
+                        for obj in newly_added_objects:
+                            if obj.type in {'MESH', 'CURVE', 'EMPTY'}: # Apply scale to relevant types
+                                obj.scale = tuple(s * import_scale for s in obj.scale) # Direct multiplication
+                                logging.debug(f"  Applied import scale {import_scale} to object: {obj.name} (Remix temp).")
+                    
+                    if addon_prefs_instance.mirror_import:
+                        for obj in newly_added_objects:
+                             if obj.type == 'MESH':
+                                logging.info(f"  Mirroring object: {obj.name} (Remix temp).")
+                                mirror_object(obj) # Your existing function
+
+                    if addon_prefs_instance.flip_normals_import:
+                        for obj in newly_added_objects:
+                            if obj.type == 'MESH':
+                                flip_normals_api(obj) # Your existing function
+                                logging.debug(f"  Flipped normals for imported object: {obj.name} (Remix temp).")
+                
+                except RuntimeError as e_imp_remix:
+                    logging.error(f"  Runtime error importing (Remix) {usd_file_path} into {target_scene.name}: {e_imp_remix}", exc_info=True)
+                    # self.report is not available here, main execute will report
+                except Exception as ex_gen_remix:
+                    logging.error(f"  Unexpected error importing (Remix) {usd_file_path}: {ex_gen_remix}", exc_info=True)
+
+        finally: # Restore settings and original scene
+            if usd_importer_addon and original_importer_settings:
+                importer_prefs = usd_importer_addon.preferences
+                for attr, val in original_importer_settings.items():
+                    try: setattr(importer_prefs, attr, val)
+                    except Exception: pass # Logged in captures version
+                logging.debug("Restored Blender's USD importer preferences (Remix).")
+            
+            if context.window.scene != original_window_scene:
+                try:
+                    context.window.scene = original_window_scene
+                    logging.info(f"Restored active window scene to '{original_window_scene.name}' (Remix).")
+                except Exception as e_restore_scene_remix:
+                    logging.error(f"Failed to restore original window scene '{original_window_scene.name}' (Remix): {e_restore_scene_remix}", exc_info=True)
+
+        return imported_top_level_objects_map
+
 
     def execute(self, context):
         addon_prefs = context.preferences.addons[__name__].preferences
         global remix_import_lock
         if remix_import_lock:
-            self.report({'INFO'}, "Another USD import is already in progress.")
-            logging.info("Another USD import is already in progress.")
+            self.report({'INFO'}, "Another USD import (Remix) is already in progress.")
             return {'CANCELLED'}
 
         if not is_blend_file_saved():
-            popup_message = "Please save your Blender file before importing USD assets."
-            logging.warning(popup_message)
-            bpy.ops.object.show_popup('INVOKE_DEFAULT', message=popup_message, success=False)
+            bpy.ops.object.show_popup('INVOKE_DEFAULT', message="Please save your Blender file before importing USD assets from Remix.", success=False)
             return {'CANCELLED'}
 
         remix_import_lock = True
-        logging.debug("Lock acquired for USD import process.")
+        logging.debug("Lock acquired for USD import process (Remix).")
+
+        main_scene = context.scene
+        import_scene_temp = None
+        all_imported_usd_filepaths_to_process = []
+        base_dir_for_textures = ""
+        all_newly_imported_objects_in_temp = [] # Collect all objects from all USDs
 
         try:
+            # --- Step 1: Fetch USD paths from Remix server (Your existing logic) ---
             assets_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
-            logging.info(f"Fetching assets from Remix server: {assets_url}")
-
             response = make_request_with_retries(
-                method='GET',
-                url=assets_url,
+                method='GET', url=assets_url,
                 headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
                 verify=addon_prefs.remix_verify_ssl
             )
-
             if not response or response.status_code != 200:
-                self.report({'ERROR'}, "Failed to connect to the Remix server after multiple attempts.")
-                logging.error("Failed to connect to the Remix server after multiple attempts.")
+                self.report({'ERROR'}, "Failed to connect to Remix server for asset list.")
+                logging.error("Failed to connect to Remix server for asset list.")
                 return {'CANCELLED'}
 
             data = response.json()
-            mesh_paths = [path for path in data.get("asset_paths", []) if "meshes" in path.lower()]
-            logging.debug(f"Mesh Paths Retrieved: {mesh_paths}")
-
-            if not mesh_paths:
-                self.report({'WARNING'}, "Mesh assets not found in Remix server.")
-                logging.warning("Mesh assets not found in Remix server.")
+            mesh_prim_paths_from_remix = [path for path in data.get("asset_paths", []) if "meshes" in path.lower()]
+            if not mesh_prim_paths_from_remix:
+                self.report({'WARNING'}, "No mesh assets found in Remix server selection.")
+                logging.warning("No mesh assets found in Remix server selection.")
                 return {'CANCELLED'}
 
-            imported_objects = []
-            base_dir = ""
-
-            first_mesh_path = mesh_paths[0]
-            trimmed_segments = first_mesh_path.split('/')[:4]
-            trimmed_prim_path = '/'.join(trimmed_segments)
-            logging.debug(f"Trimmed Prim Path: {trimmed_prim_path}")
-
-            encoded_trimmed_path = urllib.parse.quote(trimmed_prim_path, safe='')
-            logging.debug(f"Encoded Trimmed Prim Path: {encoded_trimmed_path}")
-
-            file_paths_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_trimmed_path}/file-paths"
-            logging.debug(f"Constructed File Paths URL: {file_paths_url}")
-
-            response = make_request_with_retries(
-                method='GET',
-                url=file_paths_url,
+            # Determine base_dir and list of USD files to import (Your existing logic)
+            first_mesh_path_remix = mesh_prim_paths_from_remix[0]
+            trimmed_segments_remix = first_mesh_path_remix.split('/')[:4] 
+            trimmed_prim_path_remix = '/'.join(trimmed_segments_remix)
+            encoded_trimmed_path_remix = urllib.parse.quote(trimmed_prim_path_remix, safe='')
+            
+            file_paths_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_trimmed_path_remix}/file-paths"
+            response_files = make_request_with_retries(
+                method='GET', url=file_paths_url,
                 headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
                 verify=addon_prefs.remix_verify_ssl
             )
 
-            if not response or response.status_code != 200:
-                self.report({'ERROR'}, f"Failed to retrieve file paths for prim: {trimmed_prim_path}")
-                logging.error(f"Failed to retrieve file paths for prim: {trimmed_prim_path}")
+            if not response_files or response_files.status_code != 200:
+                self.report({'ERROR'}, f"Failed to retrieve file paths for reference prim: {trimmed_prim_path_remix}")
+                logging.error(f"Failed to retrieve file paths for reference prim: {trimmed_prim_path_remix}")
                 return {'CANCELLED'}
 
-            file_data = response.json()
-            reference_paths = file_data.get("reference_paths", [])
-            logging.debug(f"Reference Paths Retrieved: {reference_paths}")
-
-            if not reference_paths:
-                self.report({'WARNING'}, "No reference paths found in the Remix server response.")
+            file_data = response_files.json()
+            reference_paths_list = file_data.get("reference_paths", [])
+            
+            # Robust base_dir determination
+            if not reference_paths_list or not reference_paths_list[0]:
+                self.report({'WARNING'}, "No reference paths found in the Remix server response to determine base directory.")
                 logging.warning("No reference paths found in the Remix server response.")
                 return {'CANCELLED'}
 
-            usd_paths = reference_paths[0][1] if len(reference_paths[0]) > 1 else []
-            if len(usd_paths) < 2:
-                self.report({'WARNING'}, "Insufficient file paths in the response.")
-                logging.warning("Insufficient file paths in the response.")
+            potential_base_path_source = None
+            if len(reference_paths_list[0]) > 1 and isinstance(reference_paths_list[0][1], str): # Usually the specific layer
+                potential_base_path_source = reference_paths_list[0][1]
+            elif isinstance(reference_paths_list[0][0], str): # Fallback to the main reference path
+                potential_base_path_source = reference_paths_list[0][0]
+
+            if potential_base_path_source and os.path.exists(os.path.dirname(potential_base_path_source)):
+                base_dir_for_textures = os.path.dirname(potential_base_path_source).replace('\\', '/')
+                logging.info(f"Base directory for USDs and textures (Remix): {base_dir_for_textures}")
+            else:
+                self.report({'ERROR'}, f"Could not determine a valid base directory from Remix response. Path tried: {potential_base_path_source}")
+                logging.error(f"Could not determine a valid base directory from Remix response. Path tried: {potential_base_path_source}")
                 return {'CANCELLED'}
 
-            existing_layer_id = usd_paths[1]
-            base_dir = os.path.dirname(existing_layer_id).replace('\\', '/')
-            logging.debug(f"Base Directory from Layer ID: {base_dir}")
 
-            for mesh_path in mesh_paths:
-                segments = mesh_path.strip('/').split('/')
+            for mesh_path_remix in mesh_prim_paths_from_remix:
+                segments = mesh_path_remix.strip('/').split('/')
                 if len(segments) >= 3:
-                    mesh_name = segments[2]
-                    relative_usd_path = f"meshes/{mesh_name}.usd"
-                    logging.debug(f"Relative USD Path: {relative_usd_path}")
-
-                    usd_file = os.path.join(base_dir, relative_usd_path).replace('\\', '/')
-                    logging.debug(f"Constructed USD File Path: {usd_file}")
-                else:
-                    logging.warning(f"Mesh path '{mesh_path}' does not have expected format.")
-                    continue
-
-                mesh_object_name = os.path.splitext(os.path.basename(usd_file))[0]
-                existing_obj = bpy.data.objects.get(mesh_object_name)
-
-                if existing_obj:
-                    logging.info(f"Mesh '{mesh_object_name}' already exists in the scene. Skipping import.")
-                    self.report({'INFO'}, f"Mesh '{mesh_object_name}' already exists. Skipping import.")
-                    continue
-                else:
-                    logging.info(f"Mesh '{mesh_object_name}' does not exist. Proceeding with import.")
-                    self.report({'INFO'}, f"Importing mesh '{mesh_object_name}'.")
-
-                try:
-                    bpy.ops.wm.usd_import(filepath=usd_file)
-                    logging.info(f"Imported USD file: {usd_file}")
-
-                    import_scale = addon_prefs.remix_import_scale
-                    if import_scale != 1.0:
-                        for obj in bpy.context.selected_objects:
-                            obj.scale *= import_scale
-                            obj.scale = tuple(round(s, 6) for s in obj.scale)
-                            logging.debug(f"Applied import scale {import_scale} to object: {obj.name}")
-                            print(f"Applied import scale {import_scale} to object: {obj.name}")
-
-                    bpy.context.view_layer.update()
-
-                    current_imported_objects = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
-                    imported_objects.extend(current_imported_objects)
-                    logging.debug(f"Imported Objects: {[obj.name for obj in current_imported_objects]}")
-
-                    if addon_prefs.mirror_import:
-                        for obj in current_imported_objects:
-                            logging.info(f"Mirroring object: {obj.name}")
-                            print(f"Mirroring object: {obj.name}")
-                            mirror_object(obj)
-
-                    if addon_prefs.flip_normals_import:
-                        for obj in current_imported_objects:
-                            flip_normals_api(obj)
-                            logging.debug(f"Flipped normals for imported object: {obj.name}")
-                            print(f"Flipped normals for imported object: {obj.name}")
-                        logging.info("Normals flipped for imported objects during import as per user setting.")
-                        print("Normals flipped for imported objects during import as per user setting.")
+                    mesh_name_from_prim = segments[2] 
+                    relative_usd_path = f"meshes/{mesh_name_from_prim}.usd" # Assuming USD has same base name
+                    usd_file_full_path = os.path.join(base_dir_for_textures, relative_usd_path).replace('\\', '/')
+                    
+                    if os.path.exists(usd_file_full_path):
+                        mesh_object_name_expected = os.path.splitext(os.path.basename(usd_file_full_path))[0]
+                        # Check against main scene for existing objects
+                        if bpy.data.objects.get(mesh_object_name_expected):
+                            logging.info(f"Mesh '{mesh_object_name_expected}' already exists in the main scene. Skipping import from Remix.")
+                            self.report({'INFO'}, f"Mesh '{mesh_object_name_expected}' from Remix already exists. Skipping.")
+                            continue
+                        all_imported_usd_filepaths_to_process.append(usd_file_full_path)
                     else:
-                        logging.info("Normals not flipped during import as per user setting.")
-                        print("Normals not flipped during import as per user setting.")
+                        logging.warning(f"Constructed USD file path from Remix data does not exist: {usd_file_full_path}")
+                else:
+                    logging.warning(f"Mesh path '{mesh_path_remix}' from Remix does not have expected format for filename extraction.")
+            
+            if not all_imported_usd_filepaths_to_process:
+                self.report({'INFO'}, "No new USD files from Remix selection to import (all may exist or paths invalid).")
+                return {'FINISHED'}
 
-                except Exception as e:
-                    self.report({'ERROR'}, f"USD Import failed for '{mesh_object_name}': {e}")
-                    logging.error(f"USD Import failed for '{mesh_object_name}': {e}")
-                    continue
+            # --- Step 2: Create isolated import environment ---
+            import_scene_temp = bpy.data.scenes.new("Remix_USD_Import_Temp_Scene")
+            logging.info(f"Created temporary scene for Remix import: {import_scene_temp.name}")
 
-            if addon_prefs.remix_import_original_textures:
-                logging.info("Import Original Textures option is enabled. Attaching original textures.")
-                print("Import Original Textures option is enabled. Attaching original textures.")
-                attach_original_textures(imported_objects, context, base_dir)
+            # --- Step 3: Perform actual USD import into temporary scene ---
+            imported_obj_map = self._perform_usd_import_into_scene(
+                context, 
+                import_scene_temp, 
+                all_imported_usd_filepaths_to_process, 
+                addon_prefs
+            )
+            
+            # Collect all successfully imported objects in the temp scene
+            for objs_list in imported_obj_map.values():
+                all_newly_imported_objects_in_temp.extend(objs_list)
 
-            self.report({'INFO'}, "USD import process completed successfully.")
-            logging.info("USD import process completed successfully.")
-            print("USD import process completed successfully.")
+            if not all_newly_imported_objects_in_temp and not import_scene_temp.objects: # Check both sources
+                self.report({'WARNING'}, "No objects were imported into the temporary scene from Remix.")
+                # Cleanup is handled in finally
+                return {'CANCELLED'}
+            
+            # --- Step 4: Apply Transforms in temporary scene (reuse from Captures operator) ---
+            captures_op_instance = OBJECT_OT_import_captures() # Temp instance to access its methods
+            transform_stats = captures_op_instance._perform_transform_application_phase(context, import_scene_temp)
+            logging.info(f"Transform application phase for Remix import completed: {transform_stats}")
+
+            # --- Step 5: Transfer objects to main scene (reuse from Captures operator) ---
+            transfer_stats = captures_op_instance._perform_object_transfer_phase(context, main_scene, import_scene_temp)
+            logging.info(f"Object transfer phase for Remix import completed: {transfer_stats}")
+
+
+            # --- Step 6: Attach original textures (Your existing logic) ---
+            # Need to get the objects as they are now in the main_scene
+            # A simple way: find by name based on what was in all_newly_imported_objects_in_temp
+            final_objects_in_main_scene = []
+            if all_newly_imported_objects_in_temp : # if any object was tracked from temp_scene
+                for temp_obj in all_newly_imported_objects_in_temp:
+                    main_scene_obj = main_scene.objects.get(temp_obj.name)
+                    if main_scene_obj:
+                        final_objects_in_main_scene.append(main_scene_obj)
+            else: # Fallback if no objects were tracked, try to get all from the temp scene name list
+                 for temp_obj_name in [o.name for o in import_scene_temp.objects]: # if scene was populated but tracking failed
+                    main_scene_obj = main_scene.objects.get(temp_obj_name)
+                    if main_scene_obj:
+                        final_objects_in_main_scene.append(main_scene_obj)
+
+
+            if addon_prefs.remix_import_original_textures and base_dir_for_textures and final_objects_in_main_scene:
+                logging.info("Attaching original textures (Remix import).")
+                attach_original_textures(final_objects_in_main_scene, context, base_dir_for_textures)
+            elif not final_objects_in_main_scene:
+                 logging.warning("No final objects identified in main scene for texture attachment (Remix).")
+
+
+            # Optional: Duplicate cleanup can also be reused if Remix imports might create "inst_" duplicates
+            # cleanup_stats = captures_op_instance._perform_duplicate_cleanup_phase(context, main_scene)
+            # logging.info(f"Duplicate cleanup for Remix import: {cleanup_stats}")
+
+            self.report({'INFO'}, f"Remix USD import completed. Processed {len(all_imported_usd_filepaths_to_process)} files. Transformed {transform_stats.get('transformed',0)} objects.")
             return {'FINISHED'}
 
-        except Exception as e:
-            logging.error(f"Unexpected error during USD import: {e}")
-            self.report({'ERROR'}, f"Unexpected error: {e}")
+        except Exception as e_remix_main:
+            logging.error(f"Unexpected error during main Remix USD import execute: {e_remix_main}", exc_info=True)
+            self.report({'ERROR'}, f"Unexpected error during Remix import: {str(e_remix_main)}")
             return {'CANCELLED'}
-
         finally:
-            remix_import_lock = False
-            logging.debug("Lock released for USD import process.")
+            if import_scene_temp and import_scene_temp.name in bpy.data.scenes:
+                logging.info(f"Removing temporary Remix import scene: {import_scene_temp.name}")
+                for window in context.window_manager.windows: # Ensure no window uses it
+                    if window.scene == import_scene_temp:
+                        window.scene = main_scene 
+                bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
             
+            remix_import_lock = False
+            logging.debug("Lock released for USD import process (Remix).")
+
 class OBJECT_OT_export_and_ingest(Operator):
     bl_idname = "object.export_and_ingest"
     bl_label = "Export and Ingest Selected Objects"
@@ -2208,6 +3511,94 @@ class OBJECT_OT_reset_options(Operator):
         logging.info("Remix Ingestor options have been reset to default, except for the custom base OBJ name.")
         return {'FINISHED'}
 
+class EXPORT_OT_SubstancePainterExporter(Operator):
+    """Export selected mesh objects to Substance Painter"""
+    bl_idname = "export.substance_painter"
+    bl_label = "Export to Substance Painter"
+
+    def execute(self, context):
+        preferences = context.preferences
+        export_folder = preferences.addons[__name__].preferences.export_folder
+        substance_painter_path = preferences.addons[__name__].preferences.spp_exe
+        objects = context.selected_objects
+
+        # Validate export folder
+        if not os.path.exists(export_folder):
+            from pathlib import Path
+            export_folder = Path(bpy.path.abspath('//'))
+
+        # Validate selection
+        if not objects:
+            self.report({"INFO"}, "No object selected")
+            return {'CANCELLED'}
+
+        export_paths = []
+        try:
+            for obj in objects:
+                path = self.export_object(export_folder, obj)
+                if path:
+                    export_paths.append(path)
+
+            if export_paths:
+                self.open_substance_painter(export_paths, substance_painter_path)
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to export objects: {str(e)}")
+            return {'CANCELLED'}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def check_material(self, obj):
+        """Ensure each mesh has at least one material with nodes"""
+        if len(obj.data.materials) == 0:
+            new_mat = bpy.data.materials.new(name=f"{obj.name}_material")
+            new_mat.use_nodes = True
+            obj.data.materials.append(new_mat)
+            self.report({"INFO"}, f"{obj.name}: material '{new_mat.name}' added")
+
+    def export_object(self, export_folder, obj):
+        """Export a single mesh object as FBX and return its path"""
+        if obj.type != 'MESH':
+            self.report({"WARNING"}, f"{obj.name} is not a mesh, skipped")
+            return None
+
+        self.check_material(obj)
+
+        object_folder = os.path.join(export_folder, obj.name)
+        os.makedirs(object_folder, exist_ok=True)
+        texture_folder = os.path.join(object_folder, f"{obj.name}_textures")
+        os.makedirs(texture_folder, exist_ok=True)
+
+        export_path = os.path.join(object_folder, f"{obj.name}.fbx")
+        bpy.ops.export_scene.fbx(
+            filepath=export_path,
+            global_scale=1.0,
+            apply_unit_scale=True,
+            use_selection=True
+        )
+        self.report({"INFO"}, f"Exported {obj.name} to {export_path}")
+        return export_path
+
+    def open_substance_painter(self, export_paths, spp_exe):
+        try:
+            # ---- project-creation options --------------------------------------
+            args = [
+                spp_exe,
+                '--size', '2048',                                # document resolution
+                '--template', 'pbr-metal-rough-alpha-blend',     # project template
+                '--normal_format', 'OpenGL',                     # normal map space
+                '--uvtile'                                       # enable UV-tile workflow
+            ]
+            # --------------------------------------------------------------------
+
+            # keep the original --mesh pairs
+            args += [mesh for path in export_paths for mesh in ["--mesh", path]]
+
+            subprocess.Popen(args, stdout=subprocess.PIPE, text=True)
+            self.report({"INFO"}, "Opening Substance Painter with: " + " ".join(args))
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open Substance Painter: {str(e)}")
 
 class VIEW3D_PT_remix_ingestor(Panel):
     bl_label = "Remix Asset Ingestion"
@@ -2247,6 +3638,12 @@ class VIEW3D_PT_remix_ingestor(Panel):
         row.label(text="Up Axis")
         row.prop(addon_prefs, "obj_export_up_axis", text="", expand=False)
         export_box.prop(addon_prefs, "remix_export_scale", text="Export Scale")
+
+        # ------------------------------------------------------------------
+        # New button: Export to Substance
+        # ------------------------------------------------------------------
+        #export_box.operator("export.substance_painter", text="Export to Substance", icon='EXPORT')
+
         export_box.operator("object.export_and_ingest", text="Export and Ingest")
 
         import_box = layout.box()
@@ -2255,7 +3652,14 @@ class VIEW3D_PT_remix_ingestor(Panel):
         import_box.prop(addon_prefs, "flip_normals_import", text="Flip Normals During Import")
         import_box.prop(addon_prefs, "remix_import_scale", text="Import Scale")
         import_box.prop(addon_prefs, "remix_import_original_textures", text="Import Original Textures")
+        
+        # New Dropdown for USD Import Forward Axis
+        #row = import_box.row(align=True)
+        #row.label(text="Forward Axis (USD Source):")
+        #row.prop(addon_prefs, "usd_import_forward_axis", text="")
+
         import_box.operator("object.import_usd_from_remix", text="Import USD from Remix")
+        import_box.operator("object.import_captures", text="Import USD Captures")
 
         reset_box = layout.box()
         reset_box.label(text="Reset Options", icon='FILE_REFRESH')
@@ -2265,18 +3669,19 @@ class VIEW3D_PT_remix_ingestor(Panel):
         info_row = info_box.row()
         info_row.operator("object.info_operator", text="Hover for Information", icon='INFO')
 
-
 classes = [
     RemixIngestorPreferences,
     OBJECT_OT_export_and_ingest,
     OBJECT_OT_import_usd_from_remix,
+    OBJECT_OT_import_captures, # Added new class here
     OBJECT_OT_reset_options,
     OBJECT_OT_show_popup,
     VIEW3D_PT_remix_ingestor,
     OBJECT_OT_info_operator,
     OBJECT_OT_toggle_info_display,
     AssetNumberItem,
-    CustomSettingsBackup
+    CustomSettingsBackup,
+    EXPORT_OT_SubstancePainterExporter
 ]
 
 def register():
