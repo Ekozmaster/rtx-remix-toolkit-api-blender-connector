@@ -1434,6 +1434,8 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             logging.critical(f"KeyError accessing preferences for '{__name__}'. Addon might not be registered or enabled.")
             return {'CANCELLED'}
 
+        # The is_blend_file_saved() check is now in invoke()
+
         if not self.files:
             self.report({'WARNING'}, "No files selected for import.")
             return {'CANCELLED'}
@@ -2170,6 +2172,10 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
         return " ".join(report_parts)
 
     def invoke(self, context, event): 
+        if not is_blend_file_saved():
+            bpy.ops.object.show_popup('INVOKE_DEFAULT', message="Please save your Blender file before importing USD captures.", success=False)
+            logging.warning("USD Captures import cancelled: Blender file not saved.")
+            return {'CANCELLED'}
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
