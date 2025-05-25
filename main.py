@@ -2632,7 +2632,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 export_smooth_groups=False,
                 smooth_group_bitflags=False,
                 filter_glob='*.obj;*.mtl',
-                collection=''
             )
 
             if result != {'FINISHED'} or not os.path.exists(temp_filepath):
