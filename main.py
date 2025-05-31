@@ -168,6 +168,8 @@ class RemixIngestorPreferences(AddonPreferences):
         default=False
     )
 
+    # CORRECTED: Default value for usd_import_up_axis changed to 'Z' to have a valid default pair.
+    # A common setup is Z-Up, Y-Forward.
     usd_import_forward_axis: EnumProperty( # New Property
         name="USD Import Forward Axis",
         description="Choose the forward axis for USD import. This tells Blender how to interpret the source USD's forward direction.",
@@ -179,12 +181,13 @@ class RemixIngestorPreferences(AddonPreferences):
             ('NEGATIVE_Y', 'Y Negative', "Interpret source Forward as Y Negative"),
             ('NEGATIVE_Z', 'Z Negative', "Interpret source Forward as Z Negative"),
         ],
-        default='Y' # Default to Y, a common choice
+        default='Y' 
     )
     usd_import_up_axis: EnumProperty(
         name="USD Up Axis",
-        items=[('X','X',''),('Y','Y',''),('Z','Z',''),('-X','-X',''),('-Y','-Y',''),('-Z','-Z','')],
-        default='Y',
+        description="Choose the up axis for USD import. This tells Blender how to interpret the source USD's up direction.",
+        items=[('X','X Positive',''),('Y','Y Positive',''),('Z','Z Positive',''),('-X','X Negative',''),('-Y','Y Negative',''),('-Z','Z Negative','')],
+        default='Z', # CORRECTED: Changed default from 'Y' to 'Z'
     )
 
     # ------------------------------------------------------------------
@@ -1844,8 +1847,8 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             for addon_name in addons_to_target:
                 addon_entry = addons.get(addon_name)
                 if addon_entry:
-                    module       = addon_entry.module
-                    was_enabled  = bool(module and getattr(module, "__BL_REGISTERED__", False))
+                    module = addon_entry.module
+                    was_enabled = bool(module and getattr(module, "__BL_REGISTERED__", False))
                     self._addons_original_state[addon_name] = (module, was_enabled)
 
                     if was_enabled:
@@ -1888,11 +1891,11 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
     def _import_and_process_files_iteratively(self, context, temp_scene, addon_prefs, main_scene_ref):
         """
-        1) Optionally override USD importer’s axis prefs so meshes aren’t “all facing upward.”  
-        2) Import each USD into `temp_scene` (no per‐file redraws).  
-        3) Detect newly created objects via a “marker” property.  
-        4) Keep only unique meshes by conceptual base name.  
-        5) Collapse transforms, optionally attach textures, then prune any dead references.  
+        1) Optionally override USD importer’s axis prefs so meshes aren’t “all facing upward.”
+        2) Import each USD into `temp_scene` (no per‐file redraws).
+        3) Detect newly created objects via a “marker” property.
+        4) Keep only unique meshes by conceptual base name.
+        5) Collapse transforms, optionally attach textures, then prune any dead references.
         6) Return a final list of still‐alive keeper objects, plus counts of processed files/textures.
         """
 
@@ -1908,7 +1911,7 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
             # Pull from addon_prefs: assume “usd_import_forward_axis” and “usd_import_up_axis” exist
             forward_axis = getattr(addon_prefs, "usd_import_forward_axis", "-Z")
-            up_axis      = getattr(addon_prefs, "usd_import_up_axis", "Y")
+            up_axis = getattr(addon_prefs, "usd_import_up_axis", "Y")
             if hasattr(importer_prefs, "axis_forward"):
                 importer_prefs.axis_forward = forward_axis
             if hasattr(importer_prefs, "axis_up"):
@@ -1918,16 +1921,16 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
         # Local aliases for speed
         data_materials = bpy.data.materials
-        data_objects   = bpy.data.objects
+        data_objects = bpy.data.objects
         materials_seen = set(data_materials.keys())
         processed_bases = self._processed_conceptual_asset_bases
 
         # 2) Cache transform/texture flags once
-        remix_scale         = getattr(addon_prefs, "remix_import_scale", 1.0)
-        scale_needed        = abs(remix_scale - 1.0) > 1e-6
-        mirror_flag         = bool(getattr(addon_prefs, "mirror_import", False))
-        flip_flag           = bool(getattr(addon_prefs, "flip_normals_import", False))
-        attach_textures_flag= bool(getattr(addon_prefs, "remix_import_original_textures", False))
+        remix_scale = getattr(addon_prefs, "remix_import_scale", 1.0)
+        scale_needed = abs(remix_scale - 1.0) > 1e-6
+        mirror_flag = bool(getattr(addon_prefs, "mirror_import", False))
+        flip_flag = bool(getattr(addon_prefs, "flip_normals_import", False))
+        attach_textures_flag = bool(getattr(addon_prefs, "remix_import_original_textures", False))
 
         if scale_needed:
             scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
@@ -1984,8 +1987,8 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
             # 5) Classify “unique meshes” vs “discards” in one pass
             unique_meshes = []
-            discards       = []
-            get_base       = self._get_conceptual_asset_base_name
+            discards = []
+            get_base = self._get_conceptual_asset_base_name
 
             for obj_raw in newly_added_raw_objects:
                 if obj_raw.type != 'MESH':
@@ -2004,8 +2007,8 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                 discards = newly_added_raw_objects.copy()
             else:
                 # Also keep any parents of each unique mesh (if they live in the newly‐added set)
-                newly_set  = set(newly_added_raw_objects)
-                keepers_set= set(unique_meshes)
+                newly_set = set(newly_added_raw_objects)
+                keepers_set = set(unique_meshes)
                 for mesh in unique_meshes:
                     parent = mesh.parent
                     while parent and parent in newly_set:
@@ -2044,7 +2047,7 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             for keeper_obj in unique_meshes:
                 # Scale (only top‐level objects)
                 if scale_needed and keeper_obj.type in {
-                    'MESH','CURVE','EMPTY','ARMATURE','LIGHT','CAMERA'
+                    'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'
                 }:
                     if not keeper_obj.parent or keeper_obj.parent not in unique_meshes:
                         keeper_obj.matrix_world = scale_matrix @ keeper_obj.matrix_world
@@ -2103,8 +2106,8 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
         context.window.scene = original_scene_for_loop
 
         # 11) FINAL DEDUPLICATION (only still‐alive objects)
-        keepers_by_name    = {}
-        all_keep_objs_valid= []
+        keepers_by_name = {}
+        all_keep_objs_valid = []
         for obj in all_keep_objs:
             if not obj:
                 continue
@@ -2222,10 +2225,12 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                 # If your USDs still import “lying flat/upside‐down,” change `axis='X'` and `angle` as needed.
                 # For example, to rotate −90° about X so “front” faces +Y instead of +Z:
                 do_orientation_fix = True  # set False if you don’t need it
-                if do_orientation_fix:
-                    rot_x_neg_90 = Matrix.Rotation(-math.pi/2, 4, 'X')
-                    for ob in valid_keepers:
-                        ob.matrix_world = rot_x_neg_90 @ ob.matrix_world
+                logging.info("Applying +90 degree X-axis rotation to fix orientation.")
+                # This creates a rotation matrix for +90 degrees around the X axis
+                rot_x_pos_90 = Matrix.Rotation(math.pi / 2, 4, 'X') 
+                for ob in valid_keepers:
+                    # Apply the rotation to the object's world matrix
+                    ob.matrix_world = rot_x_pos_90 @ ob.matrix_world
 
                 logging.info(f"Applying final transforms to {len(valid_keepers)} keepers.")
                 _perform_transform_application_phase_module(context, import_scene_temp)
