@@ -31,6 +31,7 @@ import urllib.parse
 import subprocess
 from pathlib import Path
 from mathutils import Matrix
+import math
 
 # Initialize global variables
 log_file_path = ""
@@ -179,6 +180,11 @@ class RemixIngestorPreferences(AddonPreferences):
             ('NEGATIVE_Z', 'Z Negative', "Interpret source Forward as Z Negative"),
         ],
         default='Y' # Default to Y, a common choice
+    )
+    usd_import_up_axis: EnumProperty(
+        name="USD Up Axis",
+        items=[('X','X',''),('Y','Y',''),('Z','Z',''),('-X','-X',''),('-Y','-Y',''),('-Z','-Z','')],
+        default='Y',
     )
 
     # ------------------------------------------------------------------
@@ -1784,9 +1790,9 @@ def _perform_duplicate_cleanup_phase_module(context, scene_to_clean):
     return {'deleted_objects_inst': deleted_objects_count_inst, 'deleted_objects_mesh_pattern': deleted_objects_mesh_pattern}
         
 class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
-    """Import multiple USD files, treating base_name.### as same asset, with per-file texture handling."""
+    """Import multiple USD files, treating base_name.### as the same asset, with per-file texture handling."""
     bl_idname = "object.import_captures"
-    bl_label = "Import USD Captures (Smart V3)"
+    bl_label = "Import USD Captures (Smart V3 – Extra Optimized)"
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext: StringProperty(default=".usd,.usda,.usdc,.usdz", options={'HIDDEN'})
@@ -1796,377 +1802,349 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
     )
     directory: StringProperty(subtype='DIR_PATH')
 
-    # ─── Precompile regexes once ──────────────────────────────────────────────
-    _inst_re = re.compile(r'inst_[0-9a-fA-F]+_\d+')
-    _suffix_re_dot = re.compile(r'\.\d+$')
-    _suffix_re_uscore = re.compile(r'(_\d+)$')
+    # ─── Precompile regexes once ─────────────────────────────────────────────────────
+    _inst_re    = re.compile(r'inst_[0-9a-fA-F]+_\d+')
+    _suffix_re  = re.compile(r'[._]\d+$')
 
     _addons_original_state: dict
     _processed_conceptual_asset_bases: set
 
     def _get_conceptual_asset_base_name(self, obj: bpy.types.Object) -> str:
         """
-        Determines the conceptual base name for an object.
-        It prioritizes names of ancestors matching an "inst_HEX_ID_NUMBER" pattern.
-        If no such ancestor is found, it falls back to stripping Blender numeric suffixes.
+        Determine the conceptual base name for an object.
+        1) Climb ancestors looking for “inst_HEXID_NUM”.
+        2) If none, strip a single “.NNN” or “_NNN” suffix via one regex.
         """
-        topmost_inst_name_candidate = None
+        topmost_inst_name = None
         temp_obj = obj
 
-        # Traverse up the hierarchy, first matching the precompiled inst pattern
+        # Traverse up: if name (split at first dot) matches inst pattern, keep the highest ancestor’s name
         while temp_obj:
-            core_name = temp_obj.name.split('.')[0]
+            core_name = temp_obj.name.partition('.')[0]
             if OBJECT_OT_import_captures._inst_re.fullmatch(core_name):
-                topmost_inst_name_candidate = core_name
+                topmost_inst_name = core_name
             temp_obj = temp_obj.parent
 
-        if topmost_inst_name_candidate:
-            return topmost_inst_name_candidate
+        if topmost_inst_name:
+            return topmost_inst_name
 
-        # Fallback: strip ".NNN" suffix
-        obj_name = obj.name
-        base_for_versioning = OBJECT_OT_import_captures._suffix_re_dot.sub('', obj_name)
-
-        # If no ".NNN" was stripped, try "_NNN" but ensure not empty
-        if base_for_versioning == obj_name:
-            temp_strip = OBJECT_OT_import_captures._suffix_re_uscore.sub('', base_for_versioning)
-            if temp_strip:
-                base_for_versioning = temp_strip
-        else:
-            # Already stripped ".NNN"; still check "_NNN" if present
-            temp_strip = OBJECT_OT_import_captures._suffix_re_uscore.sub('', base_for_versioning)
-            if temp_strip:
-                base_for_versioning = temp_strip
-
-        return base_for_versioning
+        # Otherwise strip “.123” or “_123” via one compiled regex
+        return OBJECT_OT_import_captures._suffix_re.sub("", obj.name)
 
     def _manage_addons(self, context: bpy.types.Context, addons_to_target: list, disable_mode: bool = True):
         """
-        Efficiently disable or re-enable addons by manipulating their modules,
-        avoiding bpy.ops.preferences.addon_disable/enable calls.
+        Disable or re-enable addons by manipulating their modules directly (no bpy.ops).
+        Stores (module, was_enabled) in self._addons_original_state.
         """
         prefs = context.preferences
+        addons = prefs.addons
 
         if disable_mode:
             self._addons_original_state = {}
             for addon_name in addons_to_target:
-                addon_entry = prefs.addons.get(addon_name)
+                addon_entry = addons.get(addon_name)
                 if addon_entry:
-                    module = addon_entry.module
-                    is_enabled = False
-                    if module and hasattr(module, "__BL_REGISTERED__"):
-                        is_enabled = bool(module.__BL_REGISTERED__)
-                    self._addons_original_state[addon_name] = is_enabled
+                    module       = addon_entry.module
+                    was_enabled  = bool(module and getattr(module, "__BL_REGISTERED__", False))
+                    self._addons_original_state[addon_name] = (module, was_enabled)
 
-                    if is_enabled:
-                        logging.info(f"Attempting to disable addon for import stability: {addon_name}")
-                        try:
-                            unregister = getattr(module, "unregister", None)
-                            if unregister:
-                                unregister()
+                    if was_enabled:
+                        logging.info(f"Disabling addon for import stability: {addon_name}")
+                        unregister_fn = getattr(module, "unregister", None)
+                        if unregister_fn:
+                            try:
+                                unregister_fn()
                                 module.__BL_REGISTERED__ = False
                                 logging.info(f"Successfully disabled: {addon_name}")
-                            else:
-                                logging.warning(f"Addon {addon_name} has no unregister() function.")
-                        except Exception as e_disable:
-                            logging.warning(f"Error disabling addon {addon_name}: {e_disable}")
+                            except Exception as e_disable:
+                                logging.warning(f"Error disabling addon {addon_name}: {e_disable}")
+                        else:
+                            logging.warning(f"Addon {addon_name} has no unregister() function.")
                     else:
                         logging.info(f"Addon {addon_name} was already disabled or not fully registered.")
                 else:
-                    self._addons_original_state[addon_name] = None
+                    # Mark as not installed
+                    self._addons_original_state[addon_name] = (None, None)
                     logging.info(f"Addon {addon_name} not found/installed.")
         else:
-            # Re-enable only those that were originally True
-            for addon_name, original_state in self._addons_original_state.items():
-                if original_state is True:
-                    addon_entry = prefs.addons.get(addon_name)
-                    if addon_entry:
-                        module = addon_entry.module
-                        logging.info(f"Attempting to re-enable addon: {addon_name}")
+            for addon_name, (module, original_state) in self._addons_original_state.items():
+                if module and original_state:
+                    logging.info(f"Re-enabling addon: {addon_name}")
+                    register_fn = getattr(module, "register", None)
+                    if register_fn:
                         try:
-                            register = getattr(module, "register", None)
-                            if register:
-                                register()
-                                module.__BL_REGISTERED__ = True
-                                logging.info(f"Successfully re-enabled: {addon_name}")
-                            else:
-                                logging.error(f"Addon {addon_name} has no register() function.")
+                            register_fn()
+                            module.__BL_REGISTERED__ = True
+                            logging.info(f"Successfully re-enabled: {addon_name}")
                         except Exception as e_enable:
                             logging.error(f"Failed to re-enable addon {addon_name}: {e_enable}")
                     else:
-                        logging.info(f"Addon {addon_name} not found/installed, skipping restore.")
+                        logging.error(f"Addon {addon_name} has no register() function.")
                 elif original_state is None:
                     logging.info(f"Addon {addon_name} was not installed originally; no action taken.")
                 else:
                     logging.info(f"Addon {addon_name} was originally disabled; leaving as is.")
             self._addons_original_state = {}
 
-    def _handle_material_duplicates_for_import(self, context: bpy.types.Context, new_objects: list[bpy.types.Object], materials_before_import: set[str]):
-        """
-        Efficiently handles material duplicates for a single import operation.
-        One‐pass: for each new object, swap duplicates onto existing masters and remove unused.
-        """
-        for obj in new_objects:
-            if not obj or not obj.material_slots:
-                continue
-
-            for slot in obj.material_slots:
-                mat = slot.material
-                if not mat:
-                    continue
-
-                # Base name ignoring any ".NNN" suffix
-                base_name = mat.name.split('.')[0]
-                if base_name in materials_before_import and base_name != mat.name:
-                    master_mat = bpy.data.materials.get(base_name)
-                    if master_mat:
-                        slot.material = master_mat
-                        # If the duplicate now has zero users, remove it immediately
-                        if mat.users == 0:
-                            try:
-                                bpy.data.materials.remove(mat, do_unlink=True)
-                            except Exception as e_rm:
-                                logging.debug(f"Could not remove material {mat.name}: {e_rm}")
-
     def _import_and_process_files_iteratively(self, context, temp_scene, addon_prefs, main_scene_ref):
         """
-        Import each USD, keep only unique conceptual assets, apply transforms directly,
-        attach textures if required, then return keeper objects for final linking.
+        1) Optionally override USD importer’s axis prefs so meshes aren’t “all facing upward.”  
+        2) Import each USD into `temp_scene` (no per‐file redraws).  
+        3) Detect newly created objects via a “marker” property.  
+        4) Keep only unique meshes by conceptual base name.  
+        5) Collapse transforms, optionally attach textures, then prune any dead references.  
+        6) Return a final list of still‐alive keeper objects, plus counts of processed files/textures.
         """
-        all_keeper_objects_for_final_linking = []
-        processed_files_count = 0
-        textures_actually_processed_for_count = 0
 
-        # ─── Snapshot and override USD importer prefs ONCE ─────────────────────────────────
+        # 1) Override USD importer preferences ONCE at the start of this batch
         original_importer_settings = {}
         usd_importer_addon = context.preferences.addons.get('io_scene_usd')
         if usd_importer_addon:
             importer_prefs = usd_importer_addon.preferences
-            attrs_to_backup = [
-                'axis_forward', 'axis_up', 'scale', 'import_meshes', 'import_curves',
-                'import_materials', 'prim_path_mask', 'import_cameras', 'import_lights',
-                'import_blendshapes', 'import_armatures', 'import_skeletal_animation',
-                'import_transform_animation', 'import_payload', 'set_frame_range',
-                'import_subdiv', 'import_visible_only', 'import_guide_prims', 'import_instancers',
-                'read_mesh_uvs', 'read_mesh_colors', 'import_mesh_normals', 'api_schema_tmp_assign_materials'
-            ]
-            for attr in attrs_to_backup:
+            # Back up the axis settings and scale
+            for attr in ("axis_forward", "axis_up"):
                 if hasattr(importer_prefs, attr):
                     original_importer_settings[attr] = getattr(importer_prefs, attr)
 
-            # Apply batch import settings once
-            if hasattr(importer_prefs, 'axis_forward') and hasattr(addon_prefs, 'usd_import_forward_axis'):
-                importer_prefs.axis_forward = addon_prefs.usd_import_forward_axis
-            if hasattr(importer_prefs, 'import_materials'):
-                importer_prefs.import_materials = 'USD_PREVIEW_SURFACE'
-            if hasattr(importer_prefs, 'import_meshes'):
-                importer_prefs.import_meshes = True
-            if hasattr(importer_prefs, 'scale'):
-                importer_prefs.scale = 1.0
-            if hasattr(importer_prefs, 'prim_path_mask'):
-                importer_prefs.prim_path_mask = ""
-            logging.debug(f"USD Importer settings configured for batch import into {temp_scene.name}.")
+            # Pull from addon_prefs: assume “usd_import_forward_axis” and “usd_import_up_axis” exist
+            forward_axis = getattr(addon_prefs, "usd_import_forward_axis", "-Z")
+            up_axis      = getattr(addon_prefs, "usd_import_up_axis", "Y")
+            if hasattr(importer_prefs, "axis_forward"):
+                importer_prefs.axis_forward = forward_axis
+            if hasattr(importer_prefs, "axis_up"):
+                importer_prefs.axis_up = up_axis
 
-        original_active_scene_for_loop = context.window.scene
-        valid_extensions = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
+            logging.debug(f"USD Importer axes set to Forward={forward_axis}, Up={up_axis}.")
+
+        # Local aliases for speed
+        data_materials = bpy.data.materials
+        data_objects   = bpy.data.objects
+        materials_seen = set(data_materials.keys())
+        processed_bases = self._processed_conceptual_asset_bases
+
+        # 2) Cache transform/texture flags once
+        remix_scale         = getattr(addon_prefs, "remix_import_scale", 1.0)
+        scale_needed        = abs(remix_scale - 1.0) > 1e-6
+        mirror_flag         = bool(getattr(addon_prefs, "mirror_import", False))
+        flip_flag           = bool(getattr(addon_prefs, "flip_normals_import", False))
+        attach_textures_flag= bool(getattr(addon_prefs, "remix_import_original_textures", False))
+
+        if scale_needed:
+            scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
+        if mirror_flag:
+            mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
+
+        valid_exts = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
+
+        all_keep_objs = []
+        processed_files_count = 0
+        textures_processed_for_count = 0
+
+        # 3) Switch to temp_scene once (avoiding repeated context switches)
+        original_scene_for_loop = context.window.scene
+        context.window.scene = temp_scene
 
         for file_elem in self.files:
             filepath = os.path.join(self.directory, file_elem.name)
-            if not (os.path.exists(filepath) and filepath.lower().endswith(valid_extensions)):
+            if not (os.path.exists(filepath) and filepath.lower().endswith(valid_exts)):
                 logging.warning(f"Skipping invalid file: {filepath}")
                 continue
 
             processed_files_count += 1
-            logging.info(f"Iterative processing of file ({processed_files_count}/{len(self.files)}): {filepath}")
+            if getattr(bpy.app, "debug", False):
+                logging.debug(f"[{processed_files_count}/{len(self.files)}] Importing: {filepath}")
 
-            # ─── Explicitly switch window.scene to temp_scene ───────────────────────────
-            if context.window.scene != temp_scene:
-                context.window.scene = temp_scene
+            # Tag all existing objects in temp_scene with a “pre‐import marker”
+            for obj in temp_scene.objects:
+                obj["_pre_import_marker"] = True
 
-            # Snapshot material state BEFORE import
-            materials_before_import = {m.name for m in bpy.data.materials}
-
-            # Record which objects were already in temp_scene
-            objects_in_temp_before = {obj.name for obj in temp_scene.objects}
-
-            # Perform the USD import (this runs in temp_scene)
+            # Import WITHOUT calling view_layer.update() each time
             try:
                 bpy.ops.wm.usd_import(filepath=filepath)
-            except RuntimeError as e_usd_import_loop:
-                logging.error(f"  Runtime error during import of {filepath}: {e_usd_import_loop}", exc_info=True)
-                continue
-            except Exception as e_gen_loop:
-                logging.error(f"  General error processing file {filepath}: {e_gen_loop}", exc_info=True)
+            except Exception as e_import:
+                logging.error(f"Error importing {filepath}: {e_import}", exc_info=True)
+                # Clean up markers
+                for obj in temp_scene.objects:
+                    obj.pop("_pre_import_marker", None)
                 continue
 
-            context.view_layer.update()
-
-            # Identify newly added objects by name-diff
-            newly_added_names = {obj.name for obj in temp_scene.objects} - objects_in_temp_before
+            # 4) Collect newly created objects: those missing the marker
             newly_added_raw_objects = [
-                temp_scene.objects[n] for n in newly_added_names if n in temp_scene.objects
+                obj for obj in temp_scene.objects
+                if "_pre_import_marker" not in obj
             ]
 
-            if newly_added_raw_objects:
-                self._handle_material_duplicates_for_import(context, newly_added_raw_objects, materials_before_import)
-            else:
-                # Fallback if no names detected
-                selected_in_temp = [
-                    ob for ob in context.selected_objects if ob.scene == temp_scene
-                ]
-                newly_added_raw_objects = [
-                    ob for ob in selected_in_temp if ob.name not in objects_in_temp_before
-                ]
-                if not newly_added_raw_objects:
-                    logging.warning(f"No new objects detected from {filepath} in {temp_scene.name}.")
-                    continue
+            # Remove markers from all
+            for obj in temp_scene.objects:
+                obj.pop("_pre_import_marker", None)
 
-            # ─── Identify unique conceptual meshes ───────────────────────────────────
-            current_file_conceptual_keepers = []
-            objects_to_discard = []
+            if not newly_added_raw_objects:
+                logging.warning(f"No new objects detected in {filepath}")
+                continue
+
+            # 5) Classify “unique meshes” vs “discards” in one pass
             unique_meshes = []
+            discards       = []
+            get_base       = self._get_conceptual_asset_base_name
 
             for obj_raw in newly_added_raw_objects:
-                if not obj_raw or obj_raw.type != 'MESH':
+                if obj_raw.type != 'MESH':
+                    discards.append(obj_raw)
                     continue
-                base_name = self._get_conceptual_asset_base_name(obj_raw)
-                if base_name not in self._processed_conceptual_asset_bases:
-                    self._processed_conceptual_asset_bases.add(base_name)
+
+                base_name = get_base(obj_raw)
+                if base_name not in processed_bases:
+                    processed_bases.add(base_name)
                     unique_meshes.append(obj_raw)
-                    logging.info(f"    Keeping new conceptual MESH: '{obj_raw.name}' (base: '{base_name}')")
                 else:
-                    objects_to_discard.append(obj_raw)
-                    logging.info(f"    Skipping MESH (conceptual duplicate): '{obj_raw.name}' (base: '{base_name}')")
+                    discards.append(obj_raw)
 
             if not unique_meshes:
-                logging.info(f"  No new unique conceptual meshes in {filepath}. Discarding all {len(newly_added_raw_objects)} objects.")
-                objects_to_discard.extend(ob for ob in newly_added_raw_objects if ob not in objects_to_discard)
+                # No unique meshes ⇒ discard everything
+                discards = newly_added_raw_objects.copy()
             else:
-                # Include any parent hierarchy up to root among newly_added_raw_objects
-                newly_added_set = set(newly_added_raw_objects)
-                keepers_set = set(unique_meshes)
+                # Also keep any parents of each unique mesh (if they live in the newly‐added set)
+                newly_set  = set(newly_added_raw_objects)
+                keepers_set= set(unique_meshes)
                 for mesh in unique_meshes:
                     parent = mesh.parent
-                    while parent and parent in newly_added_set:
+                    while parent and parent in newly_set:
                         keepers_set.add(parent)
                         parent = parent.parent
-                current_file_conceptual_keepers = list(keepers_set)
 
-                # Everything that isn’t in keepers_set is discarded
-                for ob_raw in newly_added_raw_objects:
-                    if ob_raw not in current_file_conceptual_keepers and ob_raw not in objects_to_discard:
-                        objects_to_discard.append(ob_raw)
+                for obj_raw in newly_added_raw_objects:
+                    if obj_raw not in keepers_set and obj_raw not in discards:
+                        discards.append(obj_raw)
 
-                if current_file_conceptual_keepers:
-                    logging.info(f"  From {filepath}, processing {len(current_file_conceptual_keepers)} keeper objects.")
+                unique_meshes = list(keepers_set)
 
-                    # ─── Apply import-scale (matrix) if needed ──────────────────────
-                    import_scale_val = getattr(addon_prefs, 'remix_import_scale', 1.0)
-                    if abs(import_scale_val - 1.0) > 1e-6:
-                        scale_matrix = Matrix.Diagonal((import_scale_val, import_scale_val, import_scale_val, 1.0))
-                        for keeper_obj in current_file_conceptual_keepers:
-                            if keeper_obj and keeper_obj.name in temp_scene.objects and keeper_obj.type in {
-                                'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'
-                            }:
-                                # Only scale top‐level (non‐parented within this USD)
-                                if not keeper_obj.parent or keeper_obj.parent not in current_file_conceptual_keepers:
-                                    keeper_obj.matrix_world = scale_matrix @ keeper_obj.matrix_world
+            # 6) Material dedupe: “one‐pass” replacement of duplicate materials
+            mats_before = materials_seen.copy()
+            for obj in unique_meshes:
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if not mat:
+                        continue
+                    base_mat_name = mat.name.split('.')[0]
+                    if base_mat_name in mats_before and base_mat_name != mat.name:
+                        master_mat = data_materials.get(base_mat_name)
+                        if master_mat:
+                            slot.material = master_mat
+                            if mat.users == 0:
+                                try:
+                                    data_materials.remove(mat, do_unlink=True)
+                                except Exception:
+                                    pass
+                    else:
+                        mats_before.add(mat.name)
+            materials_seen = mats_before
 
-                    # ─── Mirror operation (matrix) if requested ───────────────────
-                    if getattr(addon_prefs, 'mirror_import', False):
-                        mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
-                        for keeper_obj in current_file_conceptual_keepers:
-                            if keeper_obj and keeper_obj.name in temp_scene.objects and keeper_obj.type == 'MESH':
-                                if keeper_obj.select_get():
-                                    keeper_obj.matrix_world = mirror_matrix @ keeper_obj.matrix_world
+            # 7) Apply transforms (scale, mirror, flip), collect meshes_for_texture
+            meshes_for_texture = []
+            for keeper_obj in unique_meshes:
+                # Scale (only top‐level objects)
+                if scale_needed and keeper_obj.type in {
+                    'MESH','CURVE','EMPTY','ARMATURE','LIGHT','CAMERA'
+                }:
+                    if not keeper_obj.parent or keeper_obj.parent not in unique_meshes:
+                        keeper_obj.matrix_world = scale_matrix @ keeper_obj.matrix_world
 
-                    # ─── Flip normals (mesh‐API) if requested ─────────────────────
-                    if getattr(addon_prefs, 'flip_normals_import', False):
-                        for keeper_obj in current_file_conceptual_keepers:
-                            if keeper_obj and keeper_obj.name in temp_scene.objects and keeper_obj.type == 'MESH':
-                                mesh_data = keeper_obj.data
-                                if hasattr(mesh_data, "flip_normals"):
-                                    mesh_data.flip_normals()
+                # Mirror (only selected meshes)
+                if mirror_flag and keeper_obj.type == 'MESH' and keeper_obj.select_get():
+                    keeper_obj.matrix_world = mirror_matrix @ keeper_obj.matrix_world
 
-                    # ─── Attach original textures if requested ─────────────────────
-                    if getattr(addon_prefs, 'remix_import_original_textures', False) and is_blend_file_saved():
-                        mesh_objs_for_texture = [
-                            ob for ob in current_file_conceptual_keepers
-                            if ob and ob.type == 'MESH' and ob.name in temp_scene.objects
-                        ]
-                        if mesh_objs_for_texture:
-                            logging.info(f"    Attaching textures for {len(mesh_objs_for_texture)} meshes from {filepath}")
-                            attach_original_textures(mesh_objs_for_texture, context, os.path.dirname(filepath))
-                            textures_actually_processed_for_count += len(mesh_objs_for_texture)
+                # Flip normals
+                if flip_flag and keeper_obj.type == 'MESH':
+                    mesh_data = keeper_obj.data
+                    if hasattr(mesh_data, "flip_normals"):
+                        mesh_data.flip_normals()
 
-                    all_keeper_objects_for_final_linking.extend(
-                        ob for ob in current_file_conceptual_keepers if ob
-                    )
+                # Mark for texture attachment
+                if attach_textures_flag and keeper_obj.type == 'MESH':
+                    meshes_for_texture.append(keeper_obj)
 
-            # ─── Directly remove discarded objects (no bpy.ops) ───────────────────
-            to_remove = []
-            for obj_del in objects_to_discard:
-                if obj_del and obj_del.name in temp_scene.objects:
-                    to_remove.append(obj_del)
+            # 8) Attach textures if requested (ONLY on still‐alive meshes)
+            if meshes_for_texture and is_blend_file_saved():
+                attach_original_textures(meshes_for_texture, context, os.path.dirname(filepath))
+                textures_processed_for_count += len(meshes_for_texture)
 
-            for obj_del in to_remove:
-                # Unlink from all collections within temp_scene
-                for coll in temp_scene.collection.children_recursive:
-                    if obj_del.name in coll.objects:
+            # 9) Delete/discard “discards” if still present
+            for obj_del in discards:
+                if obj_del.name in temp_scene.objects:
+                    # Unlink from only those collections that reference it
+                    for coll in list(obj_del.users_collection):
                         coll.objects.unlink(obj_del)
-                if obj_del.name in temp_scene.collection.objects:
-                    temp_scene.collection.objects.unlink(obj_del)
-                data_block = obj_del.data
-                bpy.data.objects.remove(obj_del, do_unlink=True)
-                if data_block and data_block.users == 0:
-                    if isinstance(data_block, bpy.types.Mesh):
-                        bpy.data.meshes.remove(data_block)
-                    elif isinstance(data_block, bpy.types.Curve):
-                        bpy.data.curves.remove(data_block)
-                    # Extend removal for other data types if needed
+                    if obj_del.name in temp_scene.collection.objects:
+                        temp_scene.collection.objects.unlink(obj_del)
+                    data_blk = obj_del.data
+                    data_objects.remove(obj_del, do_unlink=True)
+                    if data_blk and data_blk.users == 0:
+                        if isinstance(data_blk, bpy.types.Mesh):
+                            bpy.data.meshes.remove(data_blk)
+                        elif isinstance(data_blk, bpy.types.Curve):
+                            bpy.data.curves.remove(data_blk)
 
-        # ─── End for file_elem ─────────────────────────────────────────────────────────────────
+            # 10) CRASH‐FIXED FILTER: prune any dead references from unique_meshes
+            pruned = []
+            for o in unique_meshes:
+                try:
+                    nm = o.name
+                except ReferenceError:
+                    continue
+                if nm in temp_scene.objects:
+                    pruned.append(o)
+            unique_meshes[:] = pruned
 
-        # Restore original active scene
-        if context.window.scene != original_active_scene_for_loop:
-            context.window.scene = original_active_scene_for_loop
+            all_keep_objs.extend(unique_meshes)
 
-        # Restore USD importer settings once
+        # end for file_elem
+
+        # Restore original scene
+        context.window.scene = original_scene_for_loop
+
+        # 11) FINAL DEDUPLICATION (only still‐alive objects)
+        keepers_by_name    = {}
+        all_keep_objs_valid= []
+        for obj in all_keep_objs:
+            if not obj:
+                continue
+            try:
+                nm = obj.name
+            except ReferenceError:
+                continue
+            if nm in bpy.data.objects and nm not in keepers_by_name:
+                keepers_by_name[nm] = obj
+                all_keep_objs_valid.append(obj)
+
+        all_keep_objs = all_keep_objs_valid
+
+        # 12) Restore USD importer prefs back to what they were
         if usd_importer_addon and original_importer_settings:
             importer_prefs = usd_importer_addon.preferences
-            for attr, value in original_importer_settings.items():
+            for attr, val in original_importer_settings.items():
                 if hasattr(importer_prefs, attr):
                     try:
-                        setattr(importer_prefs, attr, value)
-                    except Exception as e_restore_final:
-                        logging.warning(f"Could not restore USD importer setting {attr}: {e_restore_final}")
-            logging.info("Original USD importer settings restored after loop.")
+                        setattr(importer_prefs, attr, val)
+                    except Exception as e_restore:
+                        logging.warning(f"Could not restore USD importer setting {attr}: {e_restore}")
+            logging.debug("USD importer axis settings restored.")
 
-        # Final dedupe of keeper objects by name
-        seen_names = set()
-        unique_keepers = []
-        for obj in all_keeper_objects_for_final_linking:
-            if obj and obj.name not in seen_names:
-                unique_keepers.append(obj)
-                seen_names.add(obj.name)
-        all_keeper_objects_for_final_linking = unique_keepers
-
-        return (
-            all_keeper_objects_for_final_linking,
-            processed_files_count,
-            textures_actually_processed_for_count,
-        )
+        return all_keep_objs, processed_files_count, textures_processed_for_count
 
     def execute(self, context: bpy.types.Context) -> set[str]:
+        """
+        1) Disable addons that might interfere.  
+        2) Create (or optionally reuse) a temp scene.  
+        3) Run the optimized _import_and_process_files_iteratively().  
+        4) Apply a final “orientation fix” if meshes still end up upside‐down.  
+        5) Transfer keepers to the main scene, remove extras, restore addons.
+        """
         start_time = time.perf_counter()
         try:
-            current_addon_name = __name__.split('.')[0]
-            addon_prefs_instance = context.preferences.addons[current_addon_name].preferences
-        except KeyError:
-            self.report({'ERROR'}, f"Could not retrieve addon preferences for '{current_addon_name}'. Import cancelled.")
-            return {'CANCELLED'}
-        except AttributeError:
-            self.report({'ERROR'}, f"Addon preferences for '{current_addon_name}' not found. Import cancelled.")
+            current_addon_name    = __name__.split('.')[0]
+            addon_prefs_instance  = context.preferences.addons[current_addon_name].preferences
+        except (KeyError, AttributeError):
+            self.report({'ERROR'}, "Could not retrieve addon preferences. Import cancelled.")
             return {'CANCELLED'}
 
         if not self.files:
@@ -2174,21 +2152,21 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             return {'CANCELLED'}
 
         original_main_scene = context.scene
-        import_scene_temp = None
-        addons_for_stability_management = ['blenderkit']
+        import_scene_temp   = None
+        addons_for_stability= ['blenderkit']
 
         self._processed_conceptual_asset_bases = set()
-        self._addons_original_state = {}
+        self._addons_original_state           = {}
 
-        all_processed_keeper_objects_in_temp = []
+        all_keep_in_temp = []
         imported_files_count = 0
-        textures_processed_for_count = 0
+        textures_count = 0
 
         try:
-            # Disable stability‐threatening addons directly
-            self._manage_addons(context, addons_for_stability_management, disable_mode=True)
+            # ─── 1) Disable interfering addons ─────────────────────────────────
+            self._manage_addons(context, addons_for_stability, disable_mode=True)
 
-            # Create a uniquely named temp scene
+            # ─── 2) Create a uniquely named temp scene ─────────────────────────
             temp_scene_name = "USD_Import_Temp_V3"
             idx = 0
             while temp_scene_name in bpy.data.scenes:
@@ -2197,8 +2175,8 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             import_scene_temp = bpy.data.scenes.new(temp_scene_name)
             logging.info(f"Created temporary scene: {import_scene_temp.name}")
 
-            # Run the import & per-file processing entirely in import_scene_temp
-            all_processed_keeper_objects_in_temp, imported_files_count, textures_processed_for_count = \
+            # ─── 3) Import & per‐file processing ───────────────────────────────
+            all_keep_in_temp, imported_files_count, textures_count = \
                 self._import_and_process_files_iteratively(
                     context,
                     import_scene_temp,
@@ -2206,95 +2184,114 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                     original_main_scene
                 )
 
-            if not all_processed_keeper_objects_in_temp:
-                self.report({'INFO'}, f"Processed {imported_files_count} files. No new unique assets were kept.")
+            if not all_keep_in_temp:
+                self.report(
+                    {'INFO'},
+                    f"Processed {imported_files_count} files. No unique assets were kept."
+                )
                 return {'FINISHED'}
 
-            # ─── Final Transforms Phase ─────────────────────────────────────────────────────
-            # Switch to temp scene, operate, then restore
+            # ─── 4) Final Transforms Phase (apply orientation fix) ──────────────
             if context.window.scene != import_scene_temp:
                 context.window.scene = import_scene_temp
 
-            # Deselect everything
-            for ob in import_scene_temp.objects:
-                ob.select_set(False)
+            # Deselect everything if something is selected
+            if any(ob.select_get() for ob in import_scene_temp.objects):
+                for ob in import_scene_temp.objects:
+                    ob.select_set(False)
 
-            valid_keepers_for_transform = []
-            active_obj_for_transform = None
-            for obj_k in all_processed_keeper_objects_in_temp:
-                if obj_k and obj_k.name in import_scene_temp.objects and obj_k.name in context.view_layer.objects:
+            valid_keepers = []
+            active_for_transform = None
+            for obj_k in all_keep_in_temp:
+                if not obj_k:
+                    continue
+                try:
+                    nm = obj_k.name
+                except ReferenceError:
+                    continue
+                if nm in import_scene_temp.objects and nm in context.view_layer.objects:
                     obj_k.select_set(True)
-                    valid_keepers_for_transform.append(obj_k)
-                    if not active_obj_for_transform:
-                        active_obj_for_transform = obj_k
+                    valid_keepers.append(obj_k)
+                    if active_for_transform is None:
+                        active_for_transform = obj_k
 
-            if valid_keepers_for_transform and active_obj_for_transform:
-                context.view_layer.objects.active = active_obj_for_transform
-                logging.info(f"Applying final transforms to {len(valid_keepers_for_transform)} keepers in {import_scene_temp.name}.")
+            if valid_keepers and active_for_transform:
+                context.view_layer.objects.active = active_for_transform
+
+                # — Orientation Fix —  
+                # If your USDs still import “lying flat/upside‐down,” change `axis='X'` and `angle` as needed.
+                # For example, to rotate −90° about X so “front” faces +Y instead of +Z:
+                do_orientation_fix = True  # set False if you don’t need it
+                if do_orientation_fix:
+                    rot_x_neg_90 = Matrix.Rotation(-math.pi/2, 4, 'X')
+                    for ob in valid_keepers:
+                        ob.matrix_world = rot_x_neg_90 @ ob.matrix_world
+
+                logging.info(f"Applying final transforms to {len(valid_keepers)} keepers.")
                 _perform_transform_application_phase_module(context, import_scene_temp)
-            elif all_processed_keeper_objects_in_temp:
-                logging.warning("No valid keeper objects selected for final transform or active object could not be set.")
+            elif all_keep_in_temp:
+                logging.warning(
+                    "No valid keeper objects selected for final transform or active object could not be set."
+                )
 
-            # Restore back to main scene
+            # Restore to main scene
             if context.window.scene != original_main_scene:
                 context.window.scene = original_main_scene
 
-            # ─── Transfer from temp_scene to main_scene ────────────────────────────────────
+            # ─── 5) Transfer from temp_scene to main_scene ───────────────────────
+            transferred_count = 0
             if import_scene_temp.objects:
-                keeper_names_set_final = {
-                    obj.name for obj in all_processed_keeper_objects_in_temp
-                    if obj and obj.name in import_scene_temp.objects
-                }
+                # Build a set of names we want to keep
+                keeper_names_final = set()
+                for obj in all_keep_in_temp:
+                    if not obj:
+                        continue
+                    try:
+                        nm = obj.name
+                    except ReferenceError:
+                        continue
+                    if nm in import_scene_temp.objects:
+                        keeper_names_final.add(nm)
 
-                # Remove any extra objects not in keepers
-                objects_to_remove_before_transfer = [
+                # Delete any extras in temp_scene
+                extras = [
                     ob for ob in list(import_scene_temp.objects)
-                    if ob.name not in keeper_names_set_final
+                    if ob.name not in keeper_names_final
                 ]
-                if objects_to_remove_before_transfer:
-                    # Temporarily switch back to temp scene for deletion
+                if extras:
                     if context.window.scene != import_scene_temp:
                         context.window.scene = import_scene_temp
-
-                    for ob_rem in objects_to_remove_before_transfer:
-                        if ob_rem.name in import_scene_temp.objects:
-                            # Unlink from all collections
-                            for coll_s in import_scene_temp.collection.children_recursive:
-                                if ob_rem.name in coll_s.objects:
-                                    coll_s.objects.unlink(ob_rem)
-                            if ob_rem.name in import_scene_temp.collection.objects:
-                                import_scene_temp.collection.objects.unlink(ob_rem)
-                            data_block = ob_rem.data
-                            bpy.data.objects.remove(ob_rem, do_unlink=True)
-                            if data_block and data_block.users == 0:
-                                if isinstance(data_block, bpy.types.Mesh):
-                                    bpy.data.meshes.remove(data_block)
-                                elif isinstance(data_block, bpy.types.Curve):
-                                    bpy.data.curves.remove(data_block)
-
-                    # Switch back to main scene for the transfer
+                    for ob_rem in extras:
+                        for coll_s in list(ob_rem.users_collection):
+                            coll_s.objects.unlink(ob_rem)
+                        if ob_rem.name in import_scene_temp.collection.objects:
+                            import_scene_temp.collection.objects.unlink(ob_rem)
+                        data_blk = ob_rem.data
+                        bpy.data.objects.remove(ob_rem, do_unlink=True)
+                        if data_blk and data_blk.users == 0:
+                            if isinstance(data_blk, bpy.types.Mesh):
+                                bpy.data.meshes.remove(data_blk)
+                            elif isinstance(data_blk, bpy.types.Curve):
+                                bpy.data.curves.remove(data_blk)
                     if context.window.scene != original_main_scene:
                         context.window.scene = original_main_scene
 
-                # Now perform the transfer
-                logging.info(f"Transferring {len(import_scene_temp.objects)} objects from temp to main scene.")
-                transfer_stats = _perform_object_transfer_phase_module(
-                    context,
-                    original_main_scene,
-                    import_scene_temp
-                )
-            else:
-                transfer_stats = {'transferred_count': 0}
-            
-            # ─── Build report message ─────────────────────────────────────────────────────
+                # Link keepers directly into main scene’s root collection
+                target_coll = original_main_scene.collection
+                for obj in import_scene_temp.objects:
+                    if obj.name in keeper_names_final:
+                        target_coll.objects.link(obj)
+                        transferred_count += 1
+
+            # Build report message
             report_parts = [
                 f"Processed {imported_files_count} USD file(s).",
-                f"Kept {len(self._processed_conceptual_asset_bases)} unique conceptual assets ({len(all_processed_keeper_objects_in_temp)} total objects).",
-                f"Transferred {transfer_stats.get('transferred_count', 0)} objects to '{original_main_scene.name}'."
+                f"Kept {len(self._processed_conceptual_asset_bases)} unique conceptual assets ({len(all_keep_in_temp)} total objects).",
+                f"Transferred {transferred_count} objects to '{original_main_scene.name}'."
             ]
-            if addon_prefs_instance and getattr(addon_prefs_instance, 'remix_import_original_textures', False):
+            if getattr(addon_prefs_instance, "remix_import_original_textures", False):
                 if is_blend_file_saved():
-                    report_parts.append(f"Applied textures for {textures_processed_for_count} mesh objects.")
+                    report_parts.append(f"Applied textures for {textures_count} mesh objects.")
                 else:
                     report_parts.append("Texture attachment skipped (blend file not saved).")
 
@@ -2302,12 +2299,12 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             return {'FINISHED'}
 
         except Exception as e:
-            logging.critical(f"Fatal error during import execution (Captures Class V3): {str(e)}", exc_info=True)
-            self.report({'ERROR'}, "Critical import failure (Captures Class V3). Check logs.")
+            logging.critical(f"Fatal error during import execution: {e}", exc_info=True)
+            self.report({'ERROR'}, "Critical import failure. See system console.")
             return {'CANCELLED'}
 
         finally:
-            # Remove temporary scene if it still exists
+            # ─── Clean up temp scene ───────────────────────────────────────────────
             if import_scene_temp and import_scene_temp.name in bpy.data.scenes:
                 logging.info(f"Removing temporary scene: {import_scene_temp.name}")
                 for window in context.window_manager.windows:
@@ -2315,12 +2312,11 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                         window.scene = original_main_scene
                 if context.window.scene == import_scene_temp:
                     context.window.scene = original_main_scene
-
                 bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
 
-            # Re-enable previously disabled addons
-            self._manage_addons(context, addons_for_stability_management, disable_mode=False)
-            logging.info("Addon states restored (Captures Class V3).")
+            # ─── Restore previously disabled addons ─────────────────────────────────
+            self._manage_addons(context, addons_for_stability, disable_mode=False)
+            logging.info("Addon states restored.")
             elapsed = time.perf_counter() - start_time
             print(f"[Import USD Captures] Total time: {elapsed:.2f} seconds")
 
