@@ -1783,96 +1783,124 @@ def _perform_duplicate_cleanup_phase_module(context, scene_to_clean):
     return {'deleted_objects_inst': deleted_objects_count_inst, 'deleted_objects_mesh_pattern': deleted_objects_mesh_pattern}
         
 class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
-    """Import multiple USD files with isolated processing and transform application"""
+    """Import multiple USD files, treating base_name.### as same asset, with per-file texture handling."""
     bl_idname = "object.import_captures"
-    bl_label = "Import USD Captures (Robust)"
+    bl_label = "Import USD Captures (Smart V3)" # Updated label
     bl_options = {'REGISTER', 'UNDO'}
 
-    filename_ext = ".usd,.usda,.usdc,.usdz"
+    filename_ext: StringProperty(default=".usd,.usda,.usdc,.usdz", options={'HIDDEN'}) # type: ignore
 
-    files: bpy.props.CollectionProperty( # type: ignore
+    files: CollectionProperty( # type: ignore
         name="File Path",
         type=bpy.types.OperatorFileListElement,
     )
-    directory: bpy.props.StringProperty( # type: ignore
+    directory: StringProperty( # type: ignore
         subtype='DIR_PATH',
     )
 
-    _addons_original_state = {} 
+    _addons_original_state: dict
+    _processed_conceptual_asset_bases: set
 
-    def _get_base_name_and_suffix_parts(self, obj_name):
-        # Pattern 1: Handles "name_S1.S2" (e.g., inst_62EC3A6022F09C50_0.001)
-        match_custom_extended = re.fullmatch(r'(.+?)_(\d+)\.(\d+)$', obj_name)
-        if match_custom_extended:
-            base, p1_str, p2_str = match_custom_extended.groups()
-            try:
-                return base, (int(p1_str), int(p2_str))
-            except ValueError:
-                pass 
-
-        # Pattern 2: Handles "name.S2" (e.g., inst_Cool.001)
-        match_blender_suffix = re.fullmatch(r'(.+?)\.(\d+)$', obj_name)
-        if match_blender_suffix:
-            base, num_str = match_blender_suffix.groups()
-            try:
-                return base, (int(num_str),)
-            except ValueError:
-                pass
-
-        # Pattern 3: Handles "name_S1" (e.g., inst_62EC3A6022F09C50_0)
-        match_custom_simple = re.fullmatch(r'(.+?)_(\d+)$', obj_name)
-        if match_custom_simple:
-            base, p1_str = match_custom_simple.groups()
-            try:
-                return base, (int(p1_str),)
-            except ValueError:
-                pass
+    def _get_conceptual_asset_base_name(self, obj: bpy.types.Object) -> str:
+        """
+        Determines the conceptual base name for an object.
+        It prioritizes names of ancestors matching an "inst_HEX_ID_NUMBER" pattern.
+        If no such ancestor is found, it falls back to the original logic of stripping
+        Blender's numeric suffixes (.001, _001) from the object's own name.
+        """
+        inst_pattern = r'inst_[0-9a-fA-F]+_\d+'  # e.g., inst_0A794B1C1F19C49B_1
+        topmost_inst_name_candidate = None
         
-        return obj_name, None
+        # Traverse up the object's hierarchy to find the highest ancestor matching the pattern
+        temp_obj = obj
+        while temp_obj:
+            # Get the core name part (before any .001, .002 Blender suffix)
+            core_name = temp_obj.name.split('.')[0] 
+            if re.fullmatch(inst_pattern, core_name):
+                topmost_inst_name_candidate = core_name  # Keep overwriting, the last one found (highest ancestor) will be used
+            temp_obj = temp_obj.parent
+            
+        if topmost_inst_name_candidate:
+            # If an "inst_" type name was found in the hierarchy, use it.
+            # It's already the core name, stripped of .001 like suffixes.
+            return topmost_inst_name_candidate
+        else:
+            # Fallback to the original logic if no "inst_" ancestor was found.
+            # This logic strips Blender's auto-generated suffixes.
+            obj_name = obj.name
+            # Attempt to strip Blender-like .001, .002 suffixes first
+            base_for_versioning = re.sub(r'\.\d+$', '', obj_name)
+            
+            # If no .NNN suffix was stripped (e.g., name was "MyAsset_001" not "MyAsset.001"),
+            # then try stripping _001, _002 suffixes.
+            # Also, ensure that base_for_versioning is not empty after stripping.
+            # This handles cases like "_001" becoming "" which is not desired.
+            # The original logic was: if base_for_versioning == obj_name:
+            # Let's refine to ensure we don't strip the entire name if it's just a suffix.
+            temp_strip = re.sub(r'(_\d+)$', '', base_for_versioning)
+            if temp_strip: # Only apply if stripping _NNN doesn't make it empty
+                base_for_versioning = temp_strip
+            elif base_for_versioning == obj_name: # Fallback to original if temp_strip was empty but .NNN was not stripped
+                 base_for_versioning = re.sub(r'(_\d+)$', '', obj_name)
 
-    def _manage_addons(self, context, addons_to_target, disable_mode=True):
+
+            return base_for_versioning
+
+    def _manage_addons(self, context: bpy.types.Context, addons_to_target: list, disable_mode: bool = True):
+        # (Your existing _manage_addons method - kept for completeness)
         if disable_mode:
             self._addons_original_state = {}
             for addon_name in addons_to_target:
-                if addon_name in bpy.context.preferences.addons:
-                    self._addons_original_state[addon_name] = True 
-                    logging.info(f"Attempting to disable addon for import stability: {addon_name}")
-                    try:
-                        bpy.ops.preferences.addon_disable(module=addon_name)
-                        logging.info(f"Successfully disabled: {addon_name}")
-                    except RuntimeError: 
-                        logging.warning(f"Could not disable addon {addon_name} (possibly already disabled or not truly active).")
-                        self._addons_original_state[addon_name] = False 
-                    except Exception as e_disable:
-                        logging.warning(f"Error disabling addon {addon_name}: {e_disable}")
-                        self._addons_original_state[addon_name] = False
+                if addon_name in context.preferences.addons:
+                    addon = context.preferences.addons[addon_name]
+                    # A more reliable way to check if an addon is enabled is to see if its module is registered
+                    is_enabled = getattr(addon.module, "__BL_REGISTERED__", False) if hasattr(addon, 'module') and addon.module else False
+                    
+                    self._addons_original_state[addon_name] = is_enabled # Store its current state
+                    if is_enabled:
+                        logging.info(f"Attempting to disable addon for import stability: {addon_name}")
+                        try:
+                            bpy.ops.preferences.addon_disable(module=addon_name)
+                            logging.info(f"Successfully disabled: {addon_name}")
+                        except RuntimeError: 
+                            logging.warning(f"Could not disable addon {addon_name} (runtime error).")
+                        except Exception as e_disable:
+                            logging.warning(f"Error disabling addon {addon_name}: {e_disable}")
+                    else:
+                        logging.info(f"Addon {addon_name} was already disabled or not fully registered.")
                 else:
-                    self._addons_original_state[addon_name] = False
-                    logging.info(f"Addon {addon_name} not found/installed. Skipping management for it.")
-        else: # Restore mode
-            for addon_name, should_try_enable in self._addons_original_state.items():
-                if should_try_enable: 
-                    if addon_name in bpy.context.preferences.addons:
+                    self._addons_original_state[addon_name] = None # Mark as not found/installed
+                    logging.info(f"Addon {addon_name} not found/installed.")
+        else: 
+            for addon_name, original_state in self._addons_original_state.items():
+                if original_state is True: # Only try to re-enable if it was originally enabled
+                    if addon_name in context.preferences.addons: 
                         logging.info(f"Attempting to re-enable addon: {addon_name}")
                         try:
                             bpy.ops.preferences.addon_enable(module=addon_name)
                             logging.info(f"Successfully re-enabled: {addon_name}")
                         except Exception as e_enable:
                             logging.error(f"Failed to re-enable addon {addon_name}: {e_enable}")
-                    else:
-                          logging.warning(f"Addon {addon_name} was targeted for re-enabling but is no longer found.")
+                elif original_state is None:
+                     logging.info(f"Addon {addon_name} was not found/installed, no action to restore.")
+                else: # Was originally False (disabled)
+                     logging.info(f"Addon {addon_name} was originally disabled, leaving as is.")
             self._addons_original_state = {}
 
 
-    def execute(self, context):
+    def execute(self, context: bpy.types.Context) -> set[str]:
         try:
-            addon_prefs_instance = context.preferences.addons[__name__].preferences
+            # __name__ should refer to the current module's name.
+            # If this script is part of an addon installed as "my_addon", __name__ could be "my_addon.some_module".
+            # context.preferences.addons usually expects the main addon name.
+            current_addon_name = __name__.split('.')[0]
+            addon_prefs_instance = context.preferences.addons[current_addon_name].preferences 
         except KeyError:
-            self.report({'ERROR'}, f"Could not retrieve preferences for addon '{__name__}'. Import cancelled.")
-            logging.critical(f"KeyError accessing preferences for '{__name__}'. Addon might not be registered or enabled.")
+            self.report({'ERROR'}, f"Could not retrieve addon preferences for '{current_addon_name}'. Import cancelled.")
             return {'CANCELLED'}
-
-        # The is_blend_file_saved() check is now in invoke()
+        except AttributeError: # This can happen if .preferences doesn't exist
+                self.report({'ERROR'}, f"Addon preferences for '{current_addon_name}' not found or addon not structured as expected. Import cancelled.")
+                return {'CANCELLED'}
 
         if not self.files:
             self.report({'WARNING'}, "No files selected for import.")
@@ -1880,742 +1908,409 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
         original_main_scene = context.scene
         import_scene_temp = None
-        
+        # It's good practice to make this configurable or at least clearly documented
         addons_for_stability_management = ['blenderkit'] 
+        
+        self._processed_conceptual_asset_bases = set() 
+        self._addons_original_state = {} 
 
+        all_processed_keeper_objects_in_temp = []
+        imported_files_count = 0
+        textures_processed_for_count = 0
+        
         try:
             self._manage_addons(context, addons_for_stability_management, disable_mode=True)
-
-            import_scene_temp = bpy.data.scenes.new("USD_Import_Captures_Temp_Scene")
+            
+            temp_scene_name = "USD_Import_Temp_V3" 
+            idx = 0
+            # Ensure unique temporary scene name
+            while temp_scene_name in bpy.data.scenes: 
+                idx += 1
+                temp_scene_name = f"USD_Import_Temp_V3_{idx}"
+            import_scene_temp = bpy.data.scenes.new(temp_scene_name)
             logging.info(f"Created temporary scene: {import_scene_temp.name}")
             
-            result = self._safe_execute_import_logic_captures(context, import_scene_temp, addon_prefs_instance, original_main_scene)
-            return result
+            all_processed_keeper_objects_in_temp, imported_files_count, textures_processed_for_count = \
+                self._import_and_process_files_iteratively(context, import_scene_temp, addon_prefs_instance, original_main_scene)
+
+            if not all_processed_keeper_objects_in_temp:
+                self.report({'INFO'}, f"Processed {imported_files_count} files. No new unique assets were kept.")
+                return {'FINISHED'} # Exit early but run finally block
+
+            # --- Apply Final Transforms to all keepers (still in temp scene) ---
+            if all_processed_keeper_objects_in_temp: 
+                original_active_scene_for_final_ops = context.window.scene
+                if context.window.scene != import_scene_temp:
+                    context.window.scene = import_scene_temp
+                
+                # Deselect all objects in the temp scene's view layer
+                if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+                
+                valid_keepers_for_transform = []
+                active_obj_for_transform = None
+                for obj_k in all_processed_keeper_objects_in_temp:
+                    if obj_k and obj_k.name in import_scene_temp.objects and \
+                        obj_k.name in context.view_layer.objects: 
+                        obj_k.select_set(True)
+                        valid_keepers_for_transform.append(obj_k)
+                        if not active_obj_for_transform: active_obj_for_transform = obj_k
+                
+                if valid_keepers_for_transform and active_obj_for_transform: 
+                    context.view_layer.objects.active = active_obj_for_transform
+                    logging.info(f"Applying final transforms to {len(valid_keepers_for_transform)} keepers in temp scene: {import_scene_temp.name}.")
+                    _perform_transform_application_phase_module(context, import_scene_temp) 
+                elif all_processed_keeper_objects_in_temp : # Only log warning if there were keepers but selection failed
+                    logging.warning("No valid keeper objects selected for final transform application or active object could not be set.")
+                
+                if context.window.scene != original_active_scene_for_final_ops: 
+                    context.window.scene = original_active_scene_for_final_ops
+            # ---
+
+            # --- Transfer to Main Scene ---
+            transfer_stats = {'transferred_count': 0} # Initialize
+            if all_processed_keeper_objects_in_temp: 
+                # Ensure objects are valid before trying to access .name
+                keeper_names_set_final = {obj.name for obj in all_processed_keeper_objects_in_temp if obj and obj.name in import_scene_temp.objects}
+                
+                objects_to_remove_before_transfer = [
+                    obj for obj in list(import_scene_temp.objects) if obj.name not in keeper_names_set_final
+                ]
+                if objects_to_remove_before_transfer:
+                    current_scene_for_delete_ops = context.window.scene # Store current scene for delete ops
+                    if context.window.scene != import_scene_temp: context.window.scene = import_scene_temp
+                    
+                    if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT') 
+                    
+                    for obj_rem in objects_to_remove_before_transfer:
+                        # Ensure object is in the current view layer of the temp scene before selecting
+                        if obj_rem.name in context.view_layer.objects: 
+                            obj_rem.select_set(True) 
+                    
+                    selected_to_delete = [obj for obj in context.selected_objects if obj.scene == import_scene_temp] # Re-check selection
+                    if selected_to_delete and bpy.ops.object.delete.poll(): 
+                        bpy.ops.object.delete()
+                    elif selected_to_delete:
+                        logging.warning("Could not poll object.delete for discards. Manual unlinking might be needed if objects remain.")
+
+                    if context.window.scene != current_scene_for_delete_ops: context.window.scene = current_scene_for_delete_ops # Restore
+                
+                # Ensure there are objects to transfer before calling the function
+                if import_scene_temp.objects: # Check if temp scene still has objects (keepers)
+                    logging.info(f"Transferring {len(import_scene_temp.objects)} objects from temp to main scene.")
+                    transfer_stats = _perform_object_transfer_phase_module(context, original_main_scene, import_scene_temp) 
+                else:
+                    logging.info("No objects left in temp scene to transfer.")
+
+            # ---
+
+            report_parts = [
+                f"Processed {imported_files_count} USD file(s).",
+                f"Kept {len(self._processed_conceptual_asset_bases)} unique conceptual assets ({len(all_processed_keeper_objects_in_temp)} total objects).",
+                f"Transferred {transfer_stats.get('transferred_count', 0)} objects to '{original_main_scene.name}'."
+            ]
+            # Ensure addon_prefs_instance is valid and has the attribute
+            if addon_prefs_instance and hasattr(addon_prefs_instance, 'remix_import_original_textures') and addon_prefs_instance.remix_import_original_textures:
+                if is_blend_file_saved(): 
+                    report_parts.append(f"Applied textures for {textures_processed_for_count} mesh objects.")
+                else:
+                    report_parts.append("Texture attachment skipped (blend file not saved).")
+            
+            self.report({'INFO'}, " ".join(report_parts))
+            return {'FINISHED'}
             
         except Exception as e:
-            logging.critical(f"Fatal error during import execution (Captures): {str(e)}", exc_info=True)
-            self.report({'ERROR'}, "Critical import failure (Captures). Check logs.")
+            logging.critical(f"Fatal error during import execution (Captures Class V3): {str(e)}", exc_info=True)
+            self.report({'ERROR'}, "Critical import failure (Captures Class V3). Check logs.")
             return {'CANCELLED'}
         finally:
             if import_scene_temp and import_scene_temp.name in bpy.data.scenes:
                 logging.info(f"Removing temporary scene: {import_scene_temp.name}")
+                # Ensure no window is using the temp scene before removal
                 for window in context.window_manager.windows:
                     if window.scene == import_scene_temp:
-                        window.scene = original_main_scene 
+                        window.scene = original_main_scene
+                
+                # Fallback: if the active window's scene is still the temp_scene, switch it.
+                if context.window.scene == import_scene_temp:
+                    context.window.scene = original_main_scene
+
                 bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
             
             self._manage_addons(context, addons_for_stability_management, disable_mode=False)
-            logging.info("Addon states restored (Captures).")
+            logging.info("Addon states restored (Captures Class V3).")
 
-    def _safe_execute_import_logic_captures(self, context, import_scene, addon_prefs, main_scene):
-        imported_files_details = self._perform_usd_import_phase_captures(context, import_scene, addon_prefs)
+    def _handle_material_duplicates_for_import(self, context: bpy.types.Context, new_objects: list[bpy.types.Object], materials_before_import: set[str]):
+        """
+        Efficiently handles material duplicates for a single import operation.
+        It identifies newly created materials, remaps them on new objects if a 
+        master already existed, and immediately removes the unused duplicates.
+        """
+        all_material_names_after = {m.name for m in bpy.data.materials}
+        newly_created_material_names = all_material_names_after - materials_before_import
 
-        if not imported_files_details or not any(details.get('imported_object_names_in_temp') for details in imported_files_details):
-            self.report({'WARNING'}, "No USD files were successfully imported or no objects resulted (Captures).")
-            return {'CANCELLED'}
+        if not newly_created_material_names:
+            return # No new materials were created, nothing to do.
 
-        transform_stats = _perform_transform_application_phase_module(context, import_scene)
+        remap_dict = {}
+        mats_to_remove = []
+
+        for mat_name in newly_created_material_names:
+            base_name = re.sub(r'\.\d+$', '', mat_name)
+            # If the base name existed before and is not the same as the new name (e.g. "Metal" vs "Metal.001")
+            # then we have a duplicate.
+            if base_name in materials_before_import and base_name != mat_name:
+                master_mat = bpy.data.materials.get(base_name)
+                duplicate_mat = bpy.data.materials.get(mat_name)
+                if master_mat and duplicate_mat:
+                    remap_dict[duplicate_mat] = master_mat
+                    mats_to_remove.append(duplicate_mat)
+
+        if not remap_dict:
+            return # New materials were created, but none were duplicates of existing ones.
+
+        logging.info(f"    Remapping {len(remap_dict)} new duplicate materials for this file.")
         
-        textures_attached_count = 0
-        if addon_prefs.remix_import_original_textures:
-            if not is_blend_file_saved(): 
-                self.report({'WARNING'}, "Blend file not saved. Skipping texture attachment for captures.")
-                logging.warning("Blend file not saved. Skipping texture attachment for captures.")
-            else:
-                logging.info("Starting texture attachment phase for captures.")
-                all_objects_to_texture_in_temp = []
-                
-                for file_detail in imported_files_details:
-                    usd_filepath = file_detail['filepath']
-                    base_dir_for_this_usd = os.path.dirname(usd_filepath)
-                    object_names_in_temp = file_detail['imported_object_names_in_temp']
-                    current_file_objects_in_temp = [import_scene.objects.get(name) for name in object_names_in_temp if import_scene.objects.get(name)]
-                    
-                    if current_file_objects_in_temp:
-                        logging.info(f"Attaching textures for objects from {os.path.basename(usd_filepath)} using base_dir: {base_dir_for_this_usd}")
-                        # Assuming attach_original_textures is defined elsewhere
-                        attach_original_textures(current_file_objects_in_temp, context, base_dir_for_this_usd)
-                        textures_attached_count += len(current_file_objects_in_temp) 
-                    else:
-                         logging.warning(f"No valid objects found in temp scene for names from {os.path.basename(usd_filepath)} for texturing.")
-                logging.info(f"Texture attachment phase for captures completed. Processed objects from {textures_attached_count} source objects.")
+        # Remap materials on the newly imported objects
+        for obj in new_objects:
+            if obj.material_slots:
+                for slot in obj.material_slots:
+                    if slot.material in remap_dict:
+                        slot.material = remap_dict[slot.material]
         
-        transfer_stats = _perform_object_transfer_phase_module(context, main_scene, import_scene)
-        cleanup_stats = _perform_duplicate_cleanup_phase_module(context, main_scene)
+        # Immediately remove the newly created duplicates that are now unused
+        removed_count = 0
+        for mat in mats_to_remove:
+            if mat and mat.users == 0:
+                bpy.data.materials.remove(mat, do_unlink=True)
+                removed_count += 1
         
-        imported_count = len([d for d in imported_files_details if d.get('imported_object_names_in_temp')])
-        report_message = self._format_report_captures(
-            imported_count, 
-            transform_stats, 
-            transfer_stats, 
-            cleanup_stats,
-            textures_attached_count if addon_prefs.remix_import_original_textures and is_blend_file_saved() else 0
-        )
-        self.report({'INFO'}, report_message)
-        return {'FINISHED'}
+        if removed_count > 0:
+            logging.debug(f"    Removed {removed_count} temporary duplicate materials.")
 
-    def _perform_usd_import_phase_captures(self, context, target_scene, addon_prefs_instance): # Corrected parameter name usage
-        imported_files_details_list = []
-        user_selected_forward_axis = addon_prefs_instance.usd_import_forward_axis # Changed addon_prefs to addon_prefs_instance
-
-        all_newly_imported_meshes_for_post_processing = [] # type: list[bpy.types.Object]
+    def _import_and_process_files_iteratively(self, context, temp_scene, addon_prefs, main_scene_ref):
+        all_keeper_objects_for_final_linking = []
+        processed_files_count = 0
+        textures_actually_processed_for_count = 0
 
         original_importer_settings = {}
         usd_importer_addon = context.preferences.addons.get('io_scene_usd')
-        if usd_importer_addon: # type: ignore
-          importer_prefs = usd_importer_addon.preferences
-          attrs_to_backup = [
-            'axis_forward', 'axis_up', 'scale', 'import_meshes', 'import_curves',
-            'import_materials', 'prim_path_mask', 'import_cameras', 'import_lights',
-            'import_blendshapes', 'import_armatures', 'import_skeletal_animation',
-            'import_transform_animation', 'import_payload', 'set_frame_range',
-            'import_subdiv', 'import_visible_only', 'import_guide_prims', 'import_instancers',
-            'read_mesh_uvs', 'read_mesh_colors', 'import_mesh_normals',
-            'api_schema_tmp_assign_materials' # Added in recent Blender versions
-          ]
-          for attr in attrs_to_backup:
-            if hasattr(importer_prefs, attr):
-              original_importer_settings[attr] = getattr(importer_prefs, attr)
-          logging.debug(f"Backed up USD importer settings for Captures: {list(original_importer_settings.keys())}")
-
-        original_window_scene = context.window.scene # type: bpy.types.Scene
-
-        try:
-          if usd_importer_addon: # type: ignore
+        if usd_importer_addon:
             importer_prefs = usd_importer_addon.preferences
-            logging.info(f"Applying custom USD import axis_forward for Captures: {user_selected_forward_axis}")
-            if hasattr(importer_prefs, 'axis_forward'):
-              importer_prefs.axis_forward = user_selected_forward_axis
-            if hasattr(importer_prefs, 'import_materials'): # Ensure materials are imported as preview surface
-              importer_prefs.import_materials = 'USD_PREVIEW_SURFACE' # Or 'BLENDER_SHADERS' if preferred for specific cases
-            if hasattr(importer_prefs, 'import_meshes'):
-              importer_prefs.import_meshes = True
-            if hasattr(importer_prefs, 'scale'): # Use a default scale, addon scale applied later
-              importer_prefs.scale = 1.0
+            attrs_to_backup = [ 
+                'axis_forward', 'axis_up', 'scale', 'import_meshes', 'import_curves',
+                'import_materials', 'prim_path_mask', 'import_cameras', 'import_lights',
+                'import_blendshapes', 'import_armatures', 'import_skeletal_animation',
+                'import_transform_animation', 'import_payload', 'set_frame_range',
+                'import_subdiv', 'import_visible_only', 'import_guide_prims', 'import_instancers',
+                'read_mesh_uvs', 'read_mesh_colors', 'import_mesh_normals', 'api_schema_tmp_assign_materials'
+            ]
+            for attr in attrs_to_backup:
+                if hasattr(importer_prefs, attr): original_importer_settings[attr] = getattr(importer_prefs, attr)
+            
+            # Apply desired settings for this batch import
+            if hasattr(importer_prefs, 'axis_forward') and hasattr(addon_prefs, 'usd_import_forward_axis'): 
+                importer_prefs.axis_forward = addon_prefs.usd_import_forward_axis
+            if hasattr(importer_prefs, 'import_materials'): importer_prefs.import_materials = 'USD_PREVIEW_SURFACE' 
+            if hasattr(importer_prefs, 'import_meshes'): importer_prefs.import_meshes = True
+            if hasattr(importer_prefs, 'scale'): importer_prefs.scale = 1.0 # USD importer scale, not the addon's post-import scale
+            if hasattr(importer_prefs, 'prim_path_mask'): importer_prefs.prim_path_mask = "" 
+            logging.debug(f"USD Importer settings configured for batch import into {temp_scene.name}.")
+        
+        original_active_scene_for_loop = context.window.scene
+        valid_extensions = tuple(ext.strip().lower() for ext in self.filename_ext.split(',')) 
 
-          if context.window.scene != target_scene:
-            context.window.scene = target_scene
-            logging.info(f"Temporarily set active window scene to '{target_scene.name}' for USD import (Captures).")
-
-          valid_extensions = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
-
-          for file_elem in self.files: # type: ignore
-            filepath = os.path.join(self.directory, file_elem.name) # type: ignore
-
+        for file_elem in self.files: 
+            filepath = os.path.join(self.directory, file_elem.name) 
             if not (os.path.exists(filepath) and filepath.lower().endswith(valid_extensions)):
-              logging.warning(f"Skipping invalid or non-existent file (Captures): {filepath}")
-              continue
+                logging.warning(f"Skipping invalid file: {filepath}")
+                continue
+            
+            processed_files_count += 1
+            logging.info(f"Iterative processing of file ({processed_files_count}/{len(self.files)}): {filepath}")
 
-            logging.info(f"Importing (Capture) '{filepath}' into temp scene '{target_scene.name}'")
 
-            objects_before_import_in_temp = set(target_scene.objects)
-            if bpy.ops.object.select_all.poll():
-              bpy.ops.object.select_all(action='DESELECT')
+            if context.window.scene != temp_scene: context.window.scene = temp_scene
+            
+            context.view_layer.update() 
 
-            current_active_obj_before_mode_set = context.view_layer.objects.active
+            objects_in_temp_before_this_import = set(obj.name for obj in temp_scene.objects) # Store names for faster diff
+            # ***MODIFICATION 1: Record material state BEFORE import***
+            materials_before_import = {m.name for m in bpy.data.materials}
 
+            if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT') 
+            
+            newly_added_raw_objects_this_file = []
             try:
-              bpy.ops.wm.usd_import(filepath=filepath)
-         
-              objects_after_import_in_temp = set(target_scene.objects)
-              newly_added_objects_this_file = list(objects_after_import_in_temp - objects_before_import_in_temp) # type: list[bpy.types.Object]
-         
-              if not newly_added_objects_this_file and context.selected_objects:
-                current_selection_in_target_scene = [obj for obj in context.selected_objects if obj.scene == target_scene]
-                newly_added_objects_this_file = [obj for obj in current_selection_in_target_scene if obj not in objects_before_import_in_temp]
-
-              imported_object_names_this_file = [obj.name for obj in newly_added_objects_this_file]
-
-              if newly_added_objects_this_file: # type: ignore
-                logging.info(f" Successfully imported {os.path.basename(filepath)}. New objects in '{target_scene.name}': {imported_object_names_this_file}")
-           
-                for obj in newly_added_objects_this_file: # type: ignore
-                  if obj.type == 'MESH':
-                    all_newly_imported_meshes_for_post_processing.append(obj)
-
-                # Use addon_prefs_instance here
-                import_scale_value = addon_prefs_instance.remix_import_scale # type: ignore
-                if import_scale_value != 1.0:
-                  for obj_to_scale in newly_added_objects_this_file: # type: ignore
-                    if obj_to_scale.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE'}:
-                      obj_to_scale.scale = tuple(s * import_scale_value for s in obj_to_scale.scale)
-                      logging.debug(f"  Applied import scale {import_scale_value} to captured object: {obj_to_scale.name}")
-           
-                imported_files_details_list.append({
-                  'filepath': filepath,
-                  'imported_object_names_in_temp': imported_object_names_this_file
-                })
-              else:
-                logging.warning(f" Imported {os.path.basename(filepath)} but no new objects detected by diff or selection in {target_scene.name}.")
-
-            except RuntimeError as e_imp:
-              logging.error(f" Runtime error importing (Capture) {filepath} into {target_scene.name}: {e_imp}")
-
-            except Exception as ex_gen:
-              logging.error(f" Unexpected error importing (Capture) {filepath}: {ex_gen}", exc_info=True)
-     
-          meshes_for_mirror = [obj for obj in all_newly_imported_meshes_for_post_processing if obj.type == 'MESH' and obj.name in target_scene.objects]
-          # Use addon_prefs_instance here
-          if addon_prefs_instance.mirror_import and meshes_for_mirror: # type: ignore
-            logging.info(f"Calling Batch Mirror for {len(meshes_for_mirror)} meshes (Captures).")
-            batch_mirror_objects_optimized(meshes_for_mirror, context)
-     
-          meshes_for_flip = [obj for obj in all_newly_imported_meshes_for_post_processing if obj.type == 'MESH' and obj.name in target_scene.objects]
-          # Use addon_prefs_instance here
-          if addon_prefs_instance.flip_normals_import and meshes_for_flip: # type: ignore
-            logging.info(f"Efficient Batch BMesh: Flipping normals for {len(meshes_for_flip)} imported meshes (Captures).")
-       
-            active_obj_in_temp_before_flip = context.view_layer.objects.active
-            selected_in_temp_before_flip = list(context.selected_objects)
-
-            edit_mode_entered_for_flip = False
-            try:
-              if context.mode != 'OBJECT':
-                if not context.view_layer.objects.active or context.view_layer.objects.active not in meshes_for_flip:
-                  if meshes_for_flip: context.view_layer.objects.active = meshes_for_flip[0]
-
-                if bpy.ops.object.mode_set.poll():
-                  bpy.ops.object.mode_set(mode='OBJECT')
-                  context.view_layer.update()
-                if context.mode != 'OBJECT':
-                  logging.error("Efficient Batch BMesh Flip: Failed to switch to OBJECT mode. Aborting flip.")
-                  raise RuntimeError("Could not set OBJECT mode for normal flip.")
-
-              if bpy.ops.object.select_all.poll():
-                bpy.ops.object.select_all(action='DESELECT')
-         
-              selected_meshes_for_flip_op = []
-              for mesh_obj in meshes_for_flip:
-                if mesh_obj.name in target_scene.objects and mesh_obj.name in context.view_layer.objects:
-                  mesh_obj.select_set(True)
-                  selected_meshes_for_flip_op.append(mesh_obj)
-                else:
-                  logging.warning(f"Efficient Batch BMesh Flip: Mesh {mesh_obj.name} not found in target scene's current view_layer. Skipping selection.")
-         
-              if not selected_meshes_for_flip_op:
-                logging.info("Efficient Batch BMesh Flip: No valid meshes were selected for flipping. Skipping.")
-                raise StopIteration
-
-              if context.view_layer.objects.active not in selected_meshes_for_flip_op:
-                context.view_layer.objects.active = selected_meshes_for_flip_op[0]
-         
-              if not context.view_layer.objects.active:
-                logging.error("Efficient Batch BMesh Flip: No active object set before attempting EDIT mode. Aborting.")
-                raise RuntimeError("No active object for normal flip.")
-
-              if bpy.ops.object.mode_set.poll():
-                bpy.ops.object.mode_set(mode='EDIT')
-                edit_mode_entered_for_flip = (context.mode == 'EDIT' or context.mode == 'EDIT_MESH')
-                if not edit_mode_entered_for_flip:
-                    logging.warning(f"Efficient Batch BMesh Flip: Attempted EDIT mode, but context.mode is {context.mode}. Normals may not be flipped.")
-              else:
-                logging.error("Efficient Batch BMesh Flip: Cannot poll to switch to EDIT mode. Aborting flip.")
-                raise RuntimeError("Cannot switch to EDIT mode for normal flip.")
-
-              if edit_mode_entered_for_flip:
-                logging.info(f" Efficient Batch BMesh Flip: Entered EDIT mode. Processing {len(bpy.context.selected_editable_objects)} editable objects.")
-                processed_count_flip = 0
-                for obj_in_edit in bpy.context.selected_editable_objects:
-                  if obj_in_edit.type == 'MESH' and obj_in_edit in selected_meshes_for_flip_op:
-                    mesh_data = obj_in_edit.data
-                    bm = bmesh.from_edit_mesh(mesh_data)
-                    for face in bm.faces:
-                      face.normal_flip()
-                    bmesh.update_edit_mesh(mesh_data, loop_triangles=False, destructive=False)
-                    processed_count_flip += 1
-                logging.info(f" Efficient Batch BMesh Flip: Normals flipped for {processed_count_flip} meshes.")
-       
-            except StopIteration:
-              pass
-            except Exception as e_flip_batch:
-              logging.error(f"Error during Efficient Batch BMesh normal flipping (Captures): {e_flip_batch}", exc_info=True)
-            finally:
-              if edit_mode_entered_for_flip and (context.mode == 'EDIT' or context.mode == 'EDIT_MESH'):
-                if bpy.ops.object.mode_set.poll():
-                  bpy.ops.object.mode_set(mode='OBJECT')
-                else:
-                    logging.warning("Efficient Batch BMesh Flip: Could not poll to switch back to OBJECT mode from EDIT.")
-         
-              if bpy.ops.object.select_all.poll():
-                bpy.ops.object.select_all(action='DESELECT')
-         
-              for obj_s in selected_in_temp_before_flip:
-                if obj_s and obj_s.name in target_scene.objects and obj_s.name in context.view_layer.objects:
-                  try: obj_s.select_set(True)
-                  except RuntimeError: pass
-         
-              if active_obj_in_temp_before_flip and \
-               active_obj_in_temp_before_flip.name in target_scene.objects and \
-               active_obj_in_temp_before_flip.name in context.view_layer.objects:
-                context.view_layer.objects.active = active_obj_in_temp_before_flip
-              elif context.selected_objects:
-                context.view_layer.objects.active = context.selected_objects[0]
-              else:
-                context.view_layer.objects.active = None
-              logging.info(f"Efficient Batch BMesh Flip: Finished normal flipping for captures.")
-
-        finally:
-          if usd_importer_addon and original_importer_settings: # type: ignore
-            importer_prefs = usd_importer_addon.preferences # type: ignore
-            logging.info("Restoring original USD importer settings for Captures...")
-            for attr, value in original_importer_settings.items():
-              if hasattr(importer_prefs, attr):
-                try:
-                  setattr(importer_prefs, attr, value)
-                except Exception as e_restore_setting:
-                  logging.warning(f" Failed to restore USD importer setting '{attr}' to '{value}': {e_restore_setting}")
-            logging.info("USD importer settings restoration attempt complete for Captures.")
-
-          if context.window.scene != original_window_scene:
-            try:
-              context.window.scene = original_window_scene
-              logging.info(f"Restored active window scene to '{original_window_scene.name}' after USD import (Captures).")
-            except Exception as e_restore_scene:
-                logging.error(f"Failed to restore original window scene '{original_window_scene.name}' (Captures): {e_restore_scene}", exc_info=True)
-
-        return imported_files_details_list
-
-    def _perform_transform_application_phase(self, context, scene_to_process):
-        processed_count = 0
-        logging.info(f"Starting BATCH transform_apply phase for scene: '{scene_to_process.name if scene_to_process else 'None'}'.")
-        if not scene_to_process:
-          logging.error("Transform phase: scene_to_process is None. Aborting.")
-          return {'transformed': 0}
-   
-        original_window_scene = context.window.scene
-        original_active_object_in_original_scene = context.active_object
-        original_selected_objects_in_original_scene = list(context.selected_objects)
-        original_mode = 'OBJECT'
-        if original_window_scene == context.scene:
-          if context.object and hasattr(context.object, 'mode'):
-            original_mode = context.object.mode
-          else:
-            original_mode = context.mode
-   
-        try:
-          if context.window.scene != scene_to_process:
-            context.window.scene = scene_to_process
-            logging.info(f"Transform phase: Temporarily set active window scene to '{scene_to_process.name}'.")
-     
-          if not scene_to_process.view_layers or not context.view_layer:
-            logging.error(f"Transform phase: Scene '{scene_to_process.name}' has no view layers or no active context view layer. Aborting.")
-            return {'transformed': 0}
-          target_view_layer = context.view_layer
-          logging.info(f"Transform phase: Using view layer '{target_view_layer.name}' for scene '{scene_to_process.name}'.")
-
-          if context.mode != 'OBJECT':
-            current_active = target_view_layer.objects.active
-            if not current_active and scene_to_process.objects:
-              candidate_active = next((obj for obj in scene_to_process.objects if obj.type in {'MESH', 'EMPTY', 'CURVE', 'ARMATURE'}), None)
-              if candidate_active: target_view_layer.objects.active = candidate_active
-       
-            if bpy.ops.object.mode_set.poll():
-              try: bpy.ops.object.mode_set(mode='OBJECT')
-              except RuntimeError as e_mode:
-                logging.error(f"Transform phase: Could not switch to OBJECT mode in '{scene_to_process.name}': {e_mode}. Aborting.", exc_info=False)
-                return {'transformed': 0}
-            else:
-              logging.error(f"Transform phase: Cannot poll mode_set to OBJECT in '{scene_to_process.name}'. Active: {target_view_layer.objects.active}. Aborting.")
-              return {'transformed': 0}
-            if not target_view_layer.objects.active and current_active and current_active.name in target_view_layer.objects:
-              target_view_layer.objects.active = current_active
-
-
-          if bpy.ops.object.select_all.poll():
-            bpy.ops.object.select_all(action='DESELECT')
-
-          objects_to_transform_in_batch = []
-          total_eligible_objects = 0
-          for obj in scene_to_process.objects:
-            if obj.type in {'MESH', 'CURVE', 'FONT', 'SURFACE', 'EMPTY', 'ARMATURE'}:
-              if obj.type == 'EMPTY' or (obj.data is not None):
-                total_eligible_objects += 1
-                if obj.name in target_view_layer.objects:
-                  try:
-                    obj.select_set(True)
-                    objects_to_transform_in_batch.append(obj)
-                  except RuntimeError as e_select_vl:
-                    logging.warning(f"Transform phase: Could not select object '{obj.name}' in view layer '{target_view_layer.name}': {e_select_vl}")
-                else:
-                  logging.warning(f"Transform phase: Object '{obj.name}' in scene '{scene_to_process.name}' but not in its active view layer '{target_view_layer.name}'. Cannot select for transform.")
-     
-          if not objects_to_transform_in_batch:
-            logging.info(f"Transform phase: No objects were selected in '{scene_to_process.name}' for batch transform (Total eligible: {total_eligible_objects}).")
-            return {'transformed': 0}
-
-          logging.info(f"Transform phase: Selected {len(objects_to_transform_in_batch)} objects in '{scene_to_process.name}' for batch transform.")
-     
-          current_active_in_target_vl = target_view_layer.objects.active
-          if not current_active_in_target_vl or current_active_in_target_vl not in objects_to_transform_in_batch:
-            if objects_to_transform_in_batch:
-              target_view_layer.objects.active = objects_to_transform_in_batch[0]
-          logging.info(f"Transform phase: Active object for batch transform in '{scene_to_process.name}': {target_view_layer.objects.active.name if target_view_layer.objects.active else 'None'}")
-
-          if objects_to_transform_in_batch and target_view_layer.objects.active:
-            logging.info(f" BATCH APPLY: Applying Rotation & Scale to {len(context.selected_objects)} selected objects in '{scene_to_process.name}'. Active: {context.active_object.name if context.active_object else 'None'}") # type: ignore
-            bpy.ops.object.transform_apply(location=False, rotation=True, scale=True, properties=False)
-       
-            for obj_verify in objects_to_transform_in_batch:
-              if obj_verify.data and hasattr(obj_verify.data, 'update'): obj_verify.data.update()
-              rotation_applied = all(abs(angle) < 0.0001 for angle in obj_verify.rotation_euler)
-              scale_applied = all(abs(s - 1.0) < 0.0001 for s in obj_verify.scale)
-              if rotation_applied and scale_applied:
-                logging.debug(f"  VERIFIED BATCH: Transforms applied for {obj_verify.name}")
-                processed_count += 1
-              else:
-                logging.warning(f"  VERIFICATION FAILED BATCH for {obj_verify.name}: Rot {obj_verify.rotation_euler}, Scale {obj_verify.scale}")
-          else:
-            logging.warning(f" BATCH APPLY: Skipped due to no selected objects or no active object in '{scene_to_process.name}' for transform_apply.")
-
-          if bpy.ops.object.select_all.poll():
-            bpy.ops.object.select_all(action='DESELECT')
-          logging.info(f" BATCH APPLY: Done. Verified {processed_count} objects successfully transformed in '{scene_to_process.name}'.")
-
-        except Exception as e_transform:
-          logging.error(f"Transform phase: Error during transform application in '{scene_to_process.name}': {e_transform}", exc_info=True)
-        finally:
-          current_scene_name_at_finally_start = context.window.scene.name
-          if context.window.scene != original_window_scene:
-            context.window.scene = original_window_scene
-            logging.info(f"Transform phase: Restored active window scene to '{original_window_scene.name}' (was '{current_scene_name_at_finally_start}').")
-     
-          if bpy.ops.object.select_all.poll():
-            bpy.ops.object.select_all(action='DESELECT')
-     
-          for obj_ref in original_selected_objects_in_original_scene:
-            if obj_ref and obj_ref.name in original_window_scene.objects:
-              scene_obj_to_select = original_window_scene.objects.get(obj_ref.name)
-              if scene_obj_to_select and scene_obj_to_select.name in context.view_layer.objects:
-                try: scene_obj_to_select.select_set(True)
-                except RuntimeError as e_select:
-                  logging.warning(f"Could not re-select object '{scene_obj_to_select.name}' in '{original_window_scene.name}': {e_select}")
-     
-          if original_active_object_in_original_scene and \
-           original_active_object_in_original_scene.name in original_window_scene.objects:
-            scene_obj_to_activate = original_window_scene.objects.get(original_active_object_in_original_scene.name)
-            if scene_obj_to_activate and scene_obj_to_activate.name in context.view_layer.objects:
-              try: context.view_layer.objects.active = scene_obj_to_activate
-              except Exception as e_active:
-                logging.warning(f"Could not restore active object to '{scene_obj_to_activate.name}' in '{original_window_scene.name}': {e_active}")
-          elif context.view_layer.objects.active is not None :
-            context.view_layer.objects.active = None
-            logging.debug(f"Original active object not restored in '{original_window_scene.name}'; active object cleared.")
-
-          current_context_mode_final = context.mode
-          if current_context_mode_final != original_mode:
-            can_set_original_mode = (original_mode == 'OBJECT') or (context.view_layer.objects.active is not None)
-       
-            if can_set_original_mode and bpy.ops.object.mode_set.poll():
-              try: bpy.ops.object.mode_set(mode=original_mode)
-              except RuntimeError as e_mode_restore_final_ctx:
-                logging.warning(f"Transform phase (finally): Could not restore mode in '{original_window_scene.name}' to '{original_mode}': {e_mode_restore_final_ctx}")
-            elif not can_set_original_mode:
-               logging.warning(f"Transform phase (finally): Conditions not met to restore mode to '{original_mode}' in '{original_window_scene.name}'. Mode remains '{current_context_mode_final}'.")
-   
-        logging.info(f"Finished BATCH transform_apply phase. Processed {processed_count} objects in '{scene_to_process.name if scene_to_process else 'None'}'.")
-        return {'transformed': processed_count}
-
-    def _perform_object_transfer_phase(self, context, main_scene, source_scene):
-        """
-        Batch-transfer all objects from source_scene into main_scene.collection.
-        Unlink each object from any collections except the target, then link them all at once.
-        """
-        transferred_count = 0
-
-        # Ensure main scene has a master collection
-        main_collection = main_scene.collection
-        if main_collection is None:
-            logging.error(f"Object transfer: Main scene '{main_scene.name}' has no master collection.")
-            return {'transferred_count': 0}
-
-        # Gather all objects in the source scene
-        objects_to_transfer = list(source_scene.objects)
-        logging.info(f"Object transfer: Preparing to move {len(objects_to_transfer)} objects from '{source_scene.name}' to '{main_scene.name}'.")
-
-        # -- 1. Batch-unlink: for each object, remove it from every collection except the main target
-        for obj in objects_to_transfer:
-            # Copy the list because we're modifying it during iteration
-            for coll in list(obj.users_collection):
-                if coll != main_collection:
-                    try:
-                        coll.objects.unlink(obj)
-                    except Exception as e:
-                        logging.warning(f"Object transfer: could not unlink {obj.name} from {coll.name}: {e}")
-
-        # -- 2. Batch-link: link each object to the main scene collection if not already linked
-        for obj in objects_to_transfer:
-            if obj.name not in main_collection.objects:
-                try:
-                    main_collection.objects.link(obj)
-                    transferred_count += 1
-                except Exception as e:
-                    logging.error(f"Object transfer: could not link {obj.name} to {main_collection.name}: {e}")
-
-        # -- 3. Refresh view layer and scene tags
-        if main_scene.view_layers:
-            # Update the first view layer (or whichever is active)
-            main_scene.view_layers[0].update()
-        main_scene.update_tag()
-
-        logging.info(f"Finished object transfer. Transferred {transferred_count} objects from '{source_scene.name}' to '{main_scene.name}'.")
-        return {'transferred_count': transferred_count}
-
-    def _perform_duplicate_cleanup_phase(self, context, scene_to_clean):
-        logging.info(f"Starting combined cleanup in scene: '{scene_to_clean.name}'")
-    
-        deleted_objects_count_inst = 0 
-        deleted_objects_mesh_pattern = 0 
-
-        original_window_scene = context.window.scene
-        original_active_object_in_original_scene = context.active_object 
-        original_selected_objects_in_original_scene = list(context.selected_objects)
-    
-        original_mode = 'OBJECT' 
-        if original_window_scene == context.scene: 
-            if context.object and hasattr(context.object, 'mode'):
-                original_mode = context.object.mode 
-            elif context.mode: 
-                original_mode = context.mode
-    
-        try: 
-            if context.window.scene != scene_to_clean:
-                context.window.scene = scene_to_clean
-                logging.debug(f"Cleanup phase: Switched active window scene to '{scene_to_clean.name}'.")
-
-            if context.mode != 'OBJECT':
-                active_obj_for_mode_set = context.view_layer.objects.active 
-                if not active_obj_for_mode_set and scene_to_clean.objects:
-                    candidate_active = next((obj for obj in scene_to_clean.objects if obj.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE'}), None)
-                    if candidate_active and candidate_active.name in context.view_layer.objects: 
-                        context.view_layer.objects.active = candidate_active
+                bpy.ops.wm.usd_import(filepath=filepath) 
                 
-                if bpy.ops.object.mode_set.poll(): 
-                    try: 
-                        bpy.ops.object.mode_set(mode='OBJECT')
-                        logging.debug(f"Cleanup phase: Switched to OBJECT mode in '{scene_to_clean.name}'.")
-                    except RuntimeError as e: 
-                        logging.warning(f"Cleanup phase: Could not set OBJECT mode in '{scene_to_clean.name}': {e}")
+                context.view_layer.update()
+                # Diff based on names, then get actual objects
+                newly_added_names = set(obj.name for obj in temp_scene.objects) - objects_in_temp_before_this_import
+                newly_added_raw_objects_this_file = [temp_scene.objects[name] for name in newly_added_names if name in temp_scene.objects]
+
+                # ***MODIFICATION 2: Call the new, efficient cleanup function***
+                if newly_added_raw_objects_this_file:
+                    self._handle_material_duplicates_for_import(context, newly_added_raw_objects_this_file, materials_before_import)
+
+
+                if not newly_added_raw_objects_this_file and context.selected_objects:
+                    # This fallback might be less reliable if selection state is complex
+                    selected_in_temp = [obj for obj in context.selected_objects if obj.scene == temp_scene] 
+                    newly_added_raw_objects_this_file = [obj for obj in selected_in_temp if obj.name not in objects_in_temp_before_this_import]
+                
+                if not newly_added_raw_objects_this_file:
+                    logging.warning(f"No new objects detected from {filepath} in {temp_scene.name}.")
+                    continue
+                
+                current_file_conceptual_keepers_this_usd = []
+                objects_to_discard_from_this_usd = []   
+                unique_meshes_from_this_usd = []
+
+                for obj_raw in newly_added_raw_objects_this_file:
+                    if not obj_raw: continue # Skip if object somehow became None
+                    if obj_raw.type == 'MESH':
+                        base_name = self._get_conceptual_asset_base_name(obj_raw) 
+                        if base_name not in self._processed_conceptual_asset_bases: 
+                            self._processed_conceptual_asset_bases.add(base_name) 
+                            unique_meshes_from_this_usd.append(obj_raw)
+                            logging.info(f"    Keeping new conceptual MESH: '{obj_raw.name}' (base: '{base_name}')")
+                        else:
+                            objects_to_discard_from_this_usd.append(obj_raw)
+                            logging.info(f"    Skipping MESH (conceptual duplicate): '{obj_raw.name}' (base: '{base_name}')")
+                    else: 
+                        pass 
+
+                if not unique_meshes_from_this_usd:
+                    logging.info(f"  No new unique conceptual meshes in {filepath}. Adding its {len(newly_added_raw_objects_this_file)} raw objects to discard list.")
+                    objects_to_discard_from_this_usd.extend(o for o in newly_added_raw_objects_this_file if o not in objects_to_discard_from_this_usd) 
                 else:
-                    logging.warning(f"Cleanup phase: Cannot poll bpy.ops.object.mode_set to OBJECT in '{scene_to_clean.name}'. Mode remains {context.mode}.")
-        
-            logging.info(f"Starting 'inst_' object cleanup in '{scene_to_clean.name}'.")
-            if bpy.ops.object.select_all.poll():
-                bpy.ops.object.select_all(action='DESELECT')
+                    keepers_set_this_usd = set(unique_meshes_from_this_usd)
+                    # OPTIMIZATION: Convert list to set for faster 'in' check during parent traversal
+                    newly_added_raw_objects_this_file_set = set(newly_added_raw_objects_this_file)
+                    for mesh_keeper in unique_meshes_from_this_usd:
+                        parent = mesh_keeper.parent
+                        while parent and parent in newly_added_raw_objects_this_file_set: # Check against the set
+                            keepers_set_this_usd.add(parent)
+                            parent = parent.parent
+                    current_file_conceptual_keepers_this_usd = list(keepers_set_this_usd)
 
-            objects_to_delete_inst_collector = [] 
-            objects_to_keep_inst_collector = []    
-
-            grouped_by_base_inst = collections.defaultdict(list)
-            prefix_to_scan_inst = "inst_"
-            all_inst_objects_in_scene = [obj for obj in scene_to_clean.objects if obj.name.startswith(prefix_to_scan_inst)]
-
-            for obj_inst in all_inst_objects_in_scene: 
-                base_name_part, suffix_key_part = self._get_base_name_and_suffix_parts(obj_inst.name)
-                # logging.debug(f"Parsing inst_ name: '{obj_inst.name}' -> base: '{base_name_part}', suffix_key: {suffix_key_part}") # Reduced verbosity
-                grouped_by_base_inst[base_name_part].append({
-                    'obj': obj_inst, 
-                    'name': obj_inst.name, 
-                    'suffix_key': suffix_key_part
-                })
-
-            for base_name_part, obj_infos_list in grouped_by_base_inst.items():
-                plain_originals = [info for info in obj_infos_list if info['suffix_key'] is None]
-                suffixed_duplicates = [info for info in obj_infos_list if info['suffix_key'] is not None]
-            
-                object_to_keep_info_dict = None 
-                current_group_objects_to_delete = [] 
-
-                if plain_originals:
-                    plain_originals.sort(key=lambda x: x['name']) 
-                    object_to_keep_info_dict = plain_originals[0] 
-                    current_group_objects_to_delete.extend(p_info['obj'] for p_info in plain_originals[1:])
-                    current_group_objects_to_delete.extend(s_info['obj'] for s_info in suffixed_duplicates)
-                elif suffixed_duplicates: 
-                    suffixed_duplicates.sort(key=lambda x: (x['suffix_key'], x['name'])) # type: ignore
-                    object_to_keep_info_dict = suffixed_duplicates[0] 
-                    current_group_objects_to_delete.extend(s_info['obj'] for s_info in suffixed_duplicates[1:])
-                else: 
-                    if obj_infos_list: 
-                          logging.warning(f"'inst_' cleanup for base '{base_name_part}': Group with {len(obj_infos_list)} items had no plain or suffixed. Fallback: keep first by name.")
-                          if len(obj_infos_list) > 0: 
-                            obj_infos_list.sort(key=lambda x: x['name'])
-                            object_to_keep_info_dict = obj_infos_list[0]
-                            current_group_objects_to_delete.extend(info['obj'] for info in obj_infos_list[1:])
-
-                if object_to_keep_info_dict:
-                    objects_to_keep_inst_collector.append(object_to_keep_info_dict['obj'])
-                    # logging.debug(f"'inst_' cleanup for base '{base_name_part}': Keeping '{object_to_keep_info_dict['name']}'...") # Reduced verbosity
-                # else: # Reduced verbosity
-                    # logging.debug(f"'inst_' cleanup for base '{base_name_part}': No object chosen to keep...")
-                objects_to_delete_inst_collector.extend(current_group_objects_to_delete)
-
-            kept_inst_objects_set = set(objects_to_keep_inst_collector) 
-            unique_objects_to_delete_inst_final = list(set(
-                obj for obj in objects_to_delete_inst_collector 
-                if obj and obj.name in scene_to_clean.objects and obj not in kept_inst_objects_set 
-            ))
-        
-            if unique_objects_to_delete_inst_final:
-                logging.info(f"'inst_' cleanup: Identified {len(unique_objects_to_delete_inst_final)} unique 'inst_' objects for deletion.")
-                if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
-                active_obj_inst_del = context.view_layer.objects.active
-                active_obj_inst_del_cleared = False
-                if active_obj_inst_del and active_obj_inst_del in unique_objects_to_delete_inst_final:
-                    context.view_layer.objects.active = None
-                    active_obj_inst_del_cleared = True
-
-                selected_for_deletion_count = 0
-                for obj_to_del in unique_objects_to_delete_inst_final: 
-                    if obj_to_del.name in context.view_layer.objects : 
-                        try:
-                            obj_to_del.select_set(True); selected_for_deletion_count +=1
-                        except RuntimeError as e_select: logging.warning(f"Could not select '{obj_to_del.name}' for inst_ deletion: {e_select}")
-                    else: logging.warning(f"'{obj_to_del.name}' for inst_ deletion not in view layer.")
-            
-                if selected_for_deletion_count > 0: 
-                    bpy.ops.object.delete(); deleted_objects_count_inst = selected_for_deletion_count 
-                    logging.info(f"'inst_' cleanup: Batch deleted {deleted_objects_count_inst} objects.")
-                else: logging.info("'inst_' cleanup: No 'inst_' objects ultimately selected for deletion.")
-            
-                if active_obj_inst_del_cleared: 
-                    if active_obj_inst_del and (active_obj_inst_del.name not in scene_to_clean.objects): 
-                        if scene_to_clean.objects: 
-                            new_active_candidate = next((obj for obj in scene_to_clean.objects if obj.type in {'MESH', 'EMPTY', 'ARMATURE'}), None)
-                            if new_active_candidate and new_active_candidate.name in context.view_layer.objects:
-                                   context.view_layer.objects.active = new_active_candidate
-                    elif active_obj_inst_del and active_obj_inst_del.name in scene_to_clean.objects: 
-                        if active_obj_inst_del.name in context.view_layer.objects :
-                            context.view_layer.objects.active = active_obj_inst_del
-            else: logging.info("'inst_' cleanup: No 'inst_' objects scheduled for deletion.")
-
-            final_kept_inst_objects_set = { obj for obj in objects_to_keep_inst_collector if obj.name in scene_to_clean.objects }
-            logging.info(f"After 'inst_' cleanup, {len(final_kept_inst_objects_set)} 'inst_' objects remain for mesh.#### cleanup reference.")
-        
-            logging.info(f"Starting 'mesh.####' OBJECT cleanup in scene: '{scene_to_clean.name}'.")
-            objects_to_delete_mesh_pattern_collector = []
-            if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
-
-            all_mesh_dot_pattern_objects_in_scene = [ obj for obj in scene_to_clean.objects if obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", obj.name) ]
-
-            if all_mesh_dot_pattern_objects_in_scene:
-                for mesh_obj in all_mesh_dot_pattern_objects_in_scene:
-                    is_used_or_parented_safely = False
-                    if mesh_obj.parent and mesh_obj.parent in final_kept_inst_objects_set:
-                        is_used_or_parented_safely = True; # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: parent is kept inst.")
-                    if not is_used_or_parented_safely:
-                        for inst_obj in final_kept_inst_objects_set: 
-                            if inst_obj.type == 'EMPTY': 
-                                if inst_obj.instance_type == 'OBJECT' and inst_obj.instance_object == mesh_obj: is_used_or_parented_safely = True; break
-                                if inst_obj.instance_type == 'COLLECTION' and inst_obj.instance_collection and mesh_obj.name in inst_obj.instance_collection.all_objects: is_used_or_parented_safely = True; break
-                    if not is_used_or_parented_safely and mesh_obj.parent:
-                        parent_obj = mesh_obj.parent
-                        if parent_obj.name in scene_to_clean.objects: 
-                            is_parent_kept_inst = parent_obj in final_kept_inst_objects_set
-                            is_parent_mesh_dot = parent_obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", parent_obj.name)
-                            if not is_parent_kept_inst and not is_parent_mesh_dot: is_used_or_parented_safely = True; # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: parent is regular.")
-                    if not is_used_or_parented_safely and mesh_obj.data and mesh_obj.data.users > 1:
-                        for user_obj in scene_to_clean.objects: 
-                            if user_obj.data == mesh_obj.data and user_obj != mesh_obj:
-                                is_user_kept_inst = user_obj in final_kept_inst_objects_set
-                                is_user_mesh_dot = user_obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", user_obj.name)
-                                is_user_deleted_inst = user_obj.name.startswith(prefix_to_scan_inst) and not is_user_kept_inst
-                                if not is_user_mesh_dot and not is_user_deleted_inst : is_used_or_parented_safely = True; break # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: data used by other significant obj.")
-                    if not is_used_or_parented_safely:
-                        is_in_root = scene_to_clean.collection and mesh_obj.name in scene_to_clean.collection.objects
-                        if mesh_obj.parent is None and (is_in_root or not any(coll == scene_to_clean.collection for coll in mesh_obj.users_collection)): # If unparented & in root, or unparented & not in any other meaningful collection part of main scene structure (heuristic)
-                            objects_to_delete_mesh_pattern_collector.append(mesh_obj) # logging.info(f"Unused 'mesh.####' object '{mesh_obj.name}' scheduled for deletion.")
-
-                if objects_to_delete_mesh_pattern_collector:
-                    unique_objects_to_delete_mesh_final = list(set( obj for obj in objects_to_delete_mesh_pattern_collector if obj and obj.name in scene_to_clean.objects ))
-                    if unique_objects_to_delete_mesh_final:
-                        logging.info(f"'mesh.####' cleanup: Identified {len(unique_objects_to_delete_mesh_final)} objects for deletion.")
-                        if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
-                        active_obj_mesh_del = context.view_layer.objects.active; active_obj_mesh_del_cleared = False
-                        if active_obj_mesh_del and active_obj_mesh_del in unique_objects_to_delete_mesh_final: context.view_layer.objects.active = None; active_obj_mesh_del_cleared = True
+                    for obj_raw in newly_added_raw_objects_this_file:
+                        if obj_raw not in current_file_conceptual_keepers_this_usd and obj_raw not in objects_to_discard_from_this_usd:
+                            objects_to_discard_from_this_usd.append(obj_raw)
+                    
+                    if current_file_conceptual_keepers_this_usd:
+                        logging.info(f"  From {filepath}, processing {len(current_file_conceptual_keepers_this_usd)} keeper objects.")
                         
-                        selected_for_mesh_del_count = 0
-                        for obj_to_del in unique_objects_to_delete_mesh_final:
-                            if obj_to_del.name in context.view_layer.objects: obj_to_del.select_set(True); selected_for_mesh_del_count +=1
-                            else: logging.warning(f"'{obj_to_del.name}' for mesh.#### deletion not in view layer.")
+                        if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT') 
+                        active_set_for_ops_this_file = False
+                        active_obj_candidate = None
+
+                        for obj_k_sel in current_file_conceptual_keepers_this_usd:
+                            if obj_k_sel and obj_k_sel.name in temp_scene.objects and obj_k_sel.name in context.view_layer.objects: 
+                                obj_k_sel.select_set(True)
+                                if not active_set_for_ops_this_file:
+                                    active_obj_candidate = obj_k_sel 
+                                    active_set_for_ops_this_file = True
                         
-                        if selected_for_mesh_del_count > 0 and context.selected_objects: 
-                            bpy.ops.object.delete(); deleted_objects_mesh_pattern = selected_for_mesh_del_count
-                            logging.info(f"'mesh.####' cleanup: Batch deleted {deleted_objects_mesh_pattern} objects.")
-                            if active_obj_mesh_del_cleared: 
-                                if active_obj_mesh_del and (active_obj_mesh_del.name not in scene_to_clean.objects): 
-                                    if scene_to_clean.objects: 
-                                        new_active = next((o for o in scene_to_clean.objects if o.type in {'MESH', 'EMPTY'}), None)
-                                        if new_active and new_active.name in context.view_layer.objects: context.view_layer.objects.active = new_active
-                                elif active_obj_mesh_del and active_obj_mesh_del.name in scene_to_clean.objects and active_obj_mesh_del.name in context.view_layer.objects:
-                                    context.view_layer.objects.active = active_obj_mesh_del
-                        else: logging.info("'mesh.####' cleanup: No objects ultimately selected for deletion.")
-                    else: logging.info("'mesh.####' cleanup: No objects for deletion after filtering.")
-                else: logging.info("'mesh.####' cleanup: No candidates initially identified.")
+                        if not context.selected_objects or not active_obj_candidate:
+                                logging.warning(f"  No keepers selected or no active object for operations from {filepath}.")
+                        else:
+                            context.view_layer.objects.active = active_obj_candidate 
 
-        except Exception as e_cleanup_main: 
-            logging.error(f"Error during main cleanup phase in '{scene_to_clean.name}': {e_cleanup_main}", exc_info=True)
-        finally: 
-            current_scene_name_at_finally = context.window.scene.name
-            if context.window.scene != original_window_scene: context.window.scene = original_window_scene; # logging.debug(f"Cleanup: Restored window scene to '{original_window_scene.name}'.")
-            if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
-            for obj_ref in original_selected_objects_in_original_scene: 
-                if obj_ref and obj_ref.name in original_window_scene.objects: 
-                    s_obj = original_window_scene.objects.get(obj_ref.name)
-                    if s_obj and s_obj.name in context.view_layer.objects: 
-                        try: s_obj.select_set(True)
-                        except RuntimeError: pass
-            o_active_name = original_active_object_in_original_scene.name if original_active_object_in_original_scene else None
-            if o_active_name and o_active_name in original_window_scene.objects:
-                s_active = original_window_scene.objects.get(o_active_name)
-                if s_active and s_active.name in context.view_layer.objects: 
-                    try: context.view_layer.objects.active = s_active
-                    except Exception: pass
-            elif context.view_layer.objects.active is not None: context.view_layer.objects.active = None 
-            
-            final_mode = context.mode 
-            if final_mode != original_mode:
-                can_set_orig = (original_mode == 'OBJECT') or (context.view_layer.objects.active is not None) 
-                if can_set_orig and bpy.ops.object.mode_set.poll():
-                    try: bpy.ops.object.mode_set(mode=original_mode)
-                    except RuntimeError : pass # logging.warning(f"Cleanup (finally): Could not restore mode to '{original_mode}'.")
-    
-        logging.info(f"Finished cleanup for scene '{scene_to_clean.name}'. Deleted {deleted_objects_count_inst} 'inst_', {deleted_objects_mesh_pattern} 'mesh.####'.")
-        return {'deleted_objects_inst': deleted_objects_count_inst, 'deleted_objects_mesh_pattern': deleted_objects_mesh_pattern}
+                            import_scale_val = 1.0 
+                            if hasattr(addon_prefs, 'remix_import_scale'):
+                                import_scale_val = addon_prefs.remix_import_scale
 
-    def _format_report_captures(self, imported_count, transforms_info, transfer_info, cleanup_info, textures_processed_count):
-        transformed_objects = transforms_info.get('transformed', 0)
-        transferred_objects = transfer_info.get('transferred_count', 0)
-        deleted_inst = cleanup_info.get('deleted_objects_inst', 0)
-        deleted_mesh_pattern = cleanup_info.get('deleted_objects_mesh_pattern', 0)
-        
-        report_parts = [
-            f"Imported {imported_count} USD file(s) (Captures).",
-            f"Applied transforms to {transformed_objects} objects.",
-            f"Transferred {transferred_objects} objects to main scene.",
-            f"Cleaned {deleted_inst} 'inst_' and {deleted_mesh_pattern} 'mesh.####' objects."
-        ]
-        
-        addon_prefs = bpy.context.preferences.addons[__name__].preferences 
-        if addon_prefs.remix_import_original_textures:
-            if is_blend_file_saved(): 
-                if textures_processed_count > 0:
-                    report_parts.append(f"Processed textures for {textures_processed_count} objects/groups.")
-                else:
-                    report_parts.append("Texture processing: No objects processed for textures (check logs).") # Slightly rephrased
-            else:
-                report_parts.append("Texture processing skipped (blend file not saved).")
-        else:
-             report_parts.append("Texture processing skipped (option disabled).")
-        
-        return " ".join(report_parts)
+                            if abs(import_scale_val - 1.0) > 1e-6:
+                                for obj_k in current_file_conceptual_keepers_this_usd: 
+                                    if obj_k and obj_k.name in temp_scene.objects and obj_k.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'}: 
+                                        if not obj_k.parent or obj_k.parent not in current_file_conceptual_keepers_this_usd:
+                                            obj_k.scale = tuple(s * import_scale_val for s in obj_k.scale)
+                            
+                            meshes_to_mirror = [obj_k for obj_k in current_file_conceptual_keepers_this_usd if obj_k and obj_k.type == 'MESH' and obj_k.name in temp_scene.objects and obj_k.select_get()]
+                            if hasattr(addon_prefs, 'mirror_import') and addon_prefs.mirror_import and meshes_to_mirror:
+                                logging.debug(f"    Mirroring {len(meshes_to_mirror)} selected meshes from {filepath}.")
+                                batch_mirror_objects_optimized(meshes_to_mirror, context)
 
-    def invoke(self, context, event): 
+                            meshes_to_flip = [obj_k for obj_k in current_file_conceptual_keepers_this_usd if obj_k and obj_k.type == 'MESH' and obj_k.name in temp_scene.objects and obj_k.select_get()]
+                            if hasattr(addon_prefs, 'flip_normals_import') and addon_prefs.flip_normals_import and meshes_to_flip:
+                                logging.debug(f"    Flipping normals for {len(meshes_to_flip)} selected meshes from {filepath}.")
+                                batch_flip_normals_optimized(meshes_to_flip, context)
+                            
+                            if hasattr(addon_prefs, 'remix_import_original_textures') and addon_prefs.remix_import_original_textures and is_blend_file_saved():
+                                mesh_objects_for_texture = [obj_k for obj_k in current_file_conceptual_keepers_this_usd if obj_k and obj_k.type == 'MESH' and obj_k.name in temp_scene.objects]
+                                if mesh_objects_for_texture:
+                                    logging.info(f"    Attaching textures for {len(mesh_objects_for_texture)} meshes from {filepath}")
+                                    attach_original_textures(mesh_objects_for_texture, context, os.path.dirname(filepath))
+                                    textures_actually_processed_for_count += len(mesh_objects_for_texture)
+                            
+                        all_keeper_objects_for_final_linking.extend(obj for obj in current_file_conceptual_keepers_this_usd if obj) # Ensure no None objects are added
+
+                if objects_to_discard_from_this_usd:
+                    if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT') 
+                    num_selected_for_discard = 0
+                    for obj_del in objects_to_discard_from_this_usd:
+                        if obj_del and obj_del.name in temp_scene.objects and obj_del.name in context.view_layer.objects: 
+                            obj_del.select_set(True)
+                            num_selected_for_discard+=1
+                    
+                    if num_selected_for_discard > 0 and bpy.ops.object.delete.poll():
+                        logging.debug(f"    Discarding {num_selected_for_discard} non-keeper objects from {filepath} in {temp_scene.name}.")
+                        bpy.ops.object.delete(use_global=False) # Operate on selection in active view layer
+                    elif num_selected_for_discard > 0 : 
+                        logging.warning(f"    bpy.ops.object.delete could not be polled for {num_selected_for_discard} discards. Manual unlinking and removal attempt.")
+                        for obj_del in objects_to_discard_from_this_usd: # Iterate over original list
+                            if obj_del and obj_del.name in temp_scene.objects and obj_del.select_get(): # Check if it's still selected and valid
+                                obj_data = obj_del.data
+                                # Unlink from all scene collections
+                                for coll_s in bpy.data.scenes[temp_scene.name].collection.children_recursive: # Check all collections in the scene
+                                        if obj_del.name in coll_s.objects:
+                                            coll_s.objects.unlink(obj_del)
+                                if obj_del.name in temp_scene.collection.objects: # Check master collection too
+                                    temp_scene.collection.objects.unlink(obj_del)
+
+                                if obj_del.users == 0: bpy.data.objects.remove(obj_del, do_unlink=True)
+                                if obj_data and obj_data.users == 0: 
+                                    if isinstance(obj_data, bpy.types.Mesh): bpy.data.meshes.remove(obj_data)
+                                    elif isinstance(obj_data, bpy.types.Curve): bpy.data.curves.remove(obj_data)
+                                    # Add other data types if necessary
+
+            except RuntimeError as e_usd_import_loop:
+                logging.error(f"  Runtime error during import of {filepath}: {e_usd_import_loop}", exc_info=True)
+            except Exception as e_gen_loop:
+                logging.error(f"  General error processing file {filepath}: {e_gen_loop}", exc_info=True)
+        # --- End loop over self.files ---
+
+        if context.window.scene != original_active_scene_for_loop:
+            context.window.scene = original_active_scene_for_loop
+        
+        if usd_importer_addon and original_importer_settings:
+            importer_prefs = usd_importer_addon.preferences 
+            for attr, value in original_importer_settings.items():
+                if hasattr(importer_prefs, attr):
+                    try: setattr(importer_prefs, attr, value)
+                    except Exception as e_restore_final : logging.warning(f"Could not restore final USD importer setting {attr}: {e_restore_final}")
+            logging.info("Original USD importer settings restored after loop.")
+        
+        # Final filter for unique and valid objects
+        seen_names = set()
+        unique_keepers = []
+        for obj in all_keeper_objects_for_final_linking:
+            if obj and obj.name not in seen_names : # Check if object is not None
+                unique_keepers.append(obj)
+                seen_names.add(obj.name)
+        all_keeper_objects_for_final_linking = unique_keepers
+
+
+        return all_keeper_objects_for_final_linking, processed_files_count, textures_actually_processed_for_count
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
         if not is_blend_file_saved():
-            bpy.ops.object.show_popup('INVOKE_DEFAULT', message="Please save your Blender file before importing USD captures.", success=False)
-            logging.warning("USD Captures import cancelled: Blender file not saved.")
+            self.report({'WARNING'}, "Please save your Blender file before importing USD captures.")
             return {'CANCELLED'}
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
 
 class OBJECT_OT_import_usd_from_remix(Operator):
     bl_idname = "object.import_usd_from_remix"
