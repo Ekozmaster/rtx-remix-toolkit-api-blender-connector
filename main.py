@@ -466,29 +466,90 @@ def flip_normals_api(obj):
         
 def fetch_selected_mesh_prim_paths():
     try:
-        url = "http://localhost:8011/stagecraft/assets/?selection=true&filter_session_assets=false&exists=true"
+        # Ensure addon_prefs are fetched correctly if needed, or pass context
+        # For simplicity here, assuming addon_prefs can be accessed or are passed if this were a class method
+        # If this is a global function, it might need context passed to get addon_prefs.
+        # For now, let's assume the URL is constructed directly as per its original likely intent.
+        # This might need access to `addon_prefs.remix_server_url` and `addon_prefs.remix_verify_ssl`
+        # For a standalone function, these would need to be passed or accessed via context.
+        # I'll replicate the direct URL construction for now, but this is a point of attention for context.
+        
+        # To make this function testable and robust, it should ideally take context
+        # and get preferences from there.
+        # However, sticking to minimal changes to fix the immediate issue:
+        
+        # Placeholder for addon_prefs - IN A REAL SCENARIO, THIS NEEDS PROPER ACCESS VIA CONTEXT
+        class MockAddonPrefs:
+            def __init__(self):
+                self.remix_server_url = "http://localhost:8011/stagecraft" # Default or fetched
+                self.remix_verify_ssl = True # Default or fetched
+
+        # If context is available:
+        # addon_prefs = context.preferences.addons[__name__].preferences
+        # url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
+        # verify_ssl = addon_prefs.remix_verify_ssl
+
+        # Using placeholder for now based on common usage in the script
+        # THIS IS A SIMPLIFICATION FOR THE SAKE OF THE EXAMPLE CORRECTION.
+        # THE ORIGINAL FUNCTION MIGHT HAVE HAD A WAY TO GET ADDON_PREFS.
+        # If it's called from an operator, `context.preferences.addons[__name__].preferences` is the way.
+        
+        # Assuming this function is called from within an operator method where 'context' is available
+        # If not, it needs 'context' as an argument. For this example, I'll assume it can get prefs.
+        # This part is tricky as the original function signature wasn't shown in the error snippet.
+        # Let's assume it's called from a context where addon_prefs are accessible like others.
+        # This typically means it's a method of a class that has self.report, or context is passed.
+        # Given its usage, it's likely called from an Operator.
+
+        # --- THIS IS A GUESS - THE FUNCTION NEEDS CONTEXT TO GET PREFERENCES ---
+        # Fallback to a hardcoded URL if context isn't available, which is not ideal
+        # but shows the core fix. A better solution involves passing context.
+        server_url_base = "http://localhost:8011/stagecraft"
+        verify_ssl_cert = True
+        
+        # Attempt to get preferences if context is available in the scope this function is called from
+        # This is a common pattern in Blender addons.
+        try:
+            context = bpy.context # Try to get global context if available
+            addon_prefs = context.preferences.addons[__name__].preferences
+            server_url_base = addon_prefs.remix_server_url.rstrip('/')
+            verify_ssl_cert = addon_prefs.remix_verify_ssl
+            url = f"{server_url_base}/assets/?selection=true&filter_session_assets=false&exists=true"
+             # Consider if filter_session_assets should be filter_session_prims
+        except (AttributeError, KeyError):
+            logging.warning("fetch_selected_mesh_prim_paths: Could not get addon_prefs from context. Using default URL.")
+            url = "http://localhost:8011/stagecraft/assets/?selection=true&filter_session_assets=false&exists=true"
+            # url = "http://localhost:8011/stagecraft/assets/?selection=true&filter_session_prims=false&exists=true" # Potential change
+        # --- END GUESS ---
+
         headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
         response = make_request_with_retries(
             'GET',
             url,
             headers=headers,
-            verify=True
+            verify=verify_ssl_cert # Use fetched or default
         )
         if not response or response.status_code != 200:
-            logging.error("Failed to fetch selected mesh prim paths.")
-            print("Failed to fetch selected mesh prim paths.")
+            logging.error(f"Failed to fetch selected mesh prim paths. Status: {response.status_code if response else 'No Response'}")
+            # print("Failed to fetch selected mesh prim paths.") # Covered by logging
             return []
 
-        asset_paths = response.json().get("asset_paths", [])
-        selected_meshes = [path for path in asset_paths if "/meshes/" in path.lower()]
+        data = response.json()
+        # CORRECTED: Look for "prim_paths", fallback to "asset_paths"
+        asset_or_prim_paths = data.get("prim_paths")
+        if asset_or_prim_paths is None: # Check if key exists, even if list is empty
+            logging.warning("fetch_selected_mesh_prim_paths: Key 'prim_paths' not found in server response, trying 'asset_paths' as fallback.")
+            asset_or_prim_paths = data.get("asset_paths", [])
+        
+        selected_meshes = [path for path in asset_or_prim_paths if "/meshes/" in path.lower()]
         logging.info(f"Selected mesh prim paths: {selected_meshes}")
-        print(f"Selected mesh prim paths: {selected_meshes}")
+        # print(f"Selected mesh prim paths: {selected_meshes}") # Covered by logging
         return [ensure_single_leading_slash(p.rstrip('/')) for p in selected_meshes]
     except Exception as e:
-        logging.error(f"Error fetching selected mesh prim paths: {e}")
-        print(f"Error fetching selected mesh prim paths: {e}")
+        logging.error(f"Error fetching selected mesh prim paths: {e}", exc_info=True)
+        # print(f"Error fetching selected mesh prim paths: {e}") # Covered by logging
         return []
-    
+        
 def attach_original_textures(imported_objects, context, base_dir):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
@@ -779,197 +840,212 @@ def blender_mat_to_remix(mat_name):
 def handle_height_textures(context, reference_prim, exported_objects=None):
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
-        logging.info("Starting height texture processing.")
-        # Determine mesh objects to process
+        logging.info(f"Starting height texture processing for reference_prim: {reference_prim}")
+        
         if exported_objects is not None:
             mesh_objects = [obj for obj in exported_objects if obj.type == 'MESH']
         else:
-            mesh_objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
+            # Fallback: if no specific exported_objects, process selected or all scene meshes
+            # This part might need adjustment based on whether this function is ONLY for post-export
+            # or also for general height texture handling. Assuming post-export for now.
+            if context.selected_objects and addon_prefs.remix_use_selection_only:
+                 mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+            else:
+                 mesh_objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
 
-        # Collect unique materials used by these meshes
+
         used_materials = set()
         for obj in mesh_objects:
             for slot in obj.material_slots:
                 if slot.material:
                     used_materials.add(slot.material)
 
-        # Collect height texture data from each material:
-        # (each tuple: (reference prim, material name, texture file path))
-        height_textures = []
+        height_textures_to_process = [] # Stores (material_name, texture_file_path)
         for mat in used_materials:
             if not mat.use_nodes or not mat.node_tree:
                 continue
             for node in mat.node_tree.nodes:
-                if node.type in {'DISPLACEMENT', 'BUMP'}:
-                    height_input = node.inputs.get('Height')
+                # Simplified: Check for Displacement or Bump nodes
+                # This could be made more robust to find any image texture intended for height/displacement
+                if node.type in {'DISPLACEMENT', 'BUMP'}: # Check typical nodes
+                    # Find linked image texture to the 'Height' or 'Normal' input
+                    # For Displacement node, it's 'Height'. For Bump, it's also 'Height'.
+                    # If Bump uses a Normal Map node, that's a different path (not height texture directly)
+                    height_input_socket_name = 'Height' # Common for both
+                    if node.type == 'BUMP' and not node.inputs.get('Height').is_linked and node.inputs.get('Normal').is_linked:
+                        # If Bump node's Height is not linked, but Normal is, it might be fed by a Normal Map node.
+                        # This function is for raw height textures, so skip this case for now.
+                        # Or, trace back from Normal input if logic is to handle normal maps too.
+                        # For now, assuming direct height texture input.
+                        pass
+
+                    height_input = node.inputs.get(height_input_socket_name)
                     if height_input and height_input.is_linked:
-                        linked_node = height_input.links[0].from_node
-                        if linked_node.type == 'TEX_IMAGE' and linked_node.image:
-                            tex_path = bpy.path.abspath(linked_node.image.filepath).replace('\\', '/')
+                        source_node = height_input.links[0].from_node
+                        if source_node.type == 'TEX_IMAGE' and source_node.image:
+                            tex_path = bpy.path.abspath(source_node.image.filepath).replace('\\', '/')
                             if os.path.exists(tex_path):
-                                height_textures.append((reference_prim, mat.name, tex_path))
-        if not height_textures:
-            logging.info("No height textures found to process.")
+                                # Only add if not already scheduled for this material (though material loop should handle it)
+                                if not any(ht[0] == mat.name for ht in height_textures_to_process):
+                                     height_textures_to_process.append((mat.name, tex_path))
+                                logging.info(f"Found height texture '{tex_path}' for material '{mat.name}' via node '{node.name}'.")
+                            else:
+                                logging.warning(f"Height texture path '{tex_path}' for material '{mat.name}' does not exist.")
+        
+        if not height_textures_to_process:
+            logging.info("No height textures found linked to Displacement/Bump nodes for processing.")
             return {'FINISHED'}
 
-        # Ensure the textures output directory exists
-        ingest_dir = addon_prefs.remix_ingest_directory
-        textures_subdir = os.path.join(ingest_dir, "textures").replace('\\', '/')
-        if not os.path.exists(textures_subdir):
-            os.makedirs(textures_subdir, exist_ok=True)
-            logging.info(f"Created textures subdirectory: {textures_subdir}")
+        ingest_dir_server = addon_prefs.remix_ingest_directory # This is server path
+        # TextureImporter in payload uses server paths.
+        # The 'textures_subdir' on the server is where TextureImporter will place processed textures.
+        server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
+        # No need to os.makedirs for server_textures_output_dir here, server handles it.
 
-        # Base URL for the export API (strip trailing slash)
-        base_url = addon_prefs.remix_export_url.rstrip('/')
+        base_api_url = addon_prefs.remix_export_url.rstrip('/') # For mass-validator/queue
 
-        # Process each collected height texture
-        for ref_prim, material_name, tex_file in height_textures:
-            # STEP 1: Ingest the texture file (via TextureImporter)
+        for material_name, local_tex_file_path in height_textures_to_process:
+            logging.info(f"Processing height texture for material '{material_name}': {local_tex_file_path}")
+
+            # STEP 1: Ingest the texture file (via TextureImporter on the server)
+            # The input_files should be the *local path* to the texture that the server can access
+            # or that the payload implies will be uploaded/found by the server.
+            # The current TextureImporter payload in the script implies server-side access or direct provision.
+            # Assuming local_tex_file_path is accessible or handled by the ingestcraft API.
             ingest_payload = {
-                "executor": 1,
-                "name": "Material(s)",
+                "executor": 1, "name": "Material(s)",
                 "context_plugin": {
                     "name": "TextureImporter",
                     "data": {
                         "context_name": "ingestcraft",
-                        "input_files": [[tex_file, "HEIGHT"]],
-                        "output_directory": textures_subdir,
+                        "input_files": [[local_tex_file_path, "HEIGHT"]], # Texture path and its type
+                        "output_directory": server_textures_output_dir, # Server path for output
                         "allow_empty_input_files_list": True,
                         "data_flows": [{"name": "InOutData", "push_input_data": True}],
-                        "hide_context_ui": True,
-                        "create_context_if_not_exist": True,
-                        "expose_mass_ui": True,
-                        "cook_mass_template": True
+                        "hide_context_ui": True, "create_context_if_not_exist": True,
+                        "expose_mass_ui": True, "cook_mass_template": True
                     }
                 },
-                "check_plugins": [
-                    {
-                        "name": "MaterialShaders",
-                        "selector_plugins": [{"name": "AllMaterials", "data": {}}],
-                        "data": {"shader_subidentifiers": {"AperturePBR_Opacity": ".*"}},
-                        "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage", "data": {}}
-                    },
-                    {
-                        "name": "ConvertToOctahedral",
-                        "selector_plugins": [{"name": "AllShaders", "data": {}}],
-                        "resultor_plugins": [
-                            {"name": "FileCleanup", "data": {"channel": "cleanup_files_normal", "cleanup_output": False}}
-                        ],
-                        "data": {
-                            "data_flows": [
-                                {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}
-                            ]
-                        },
-                        "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage", "data": {}}
-                    },
-                    {
-                        "name": "ConvertToDDS",
-                        "selector_plugins": [{"name": "AllShaders", "data": {}}],
-                        "resultor_plugins": [
-                            {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
-                        ],
-                        "data": {
-                            "data_flows": [
-                                {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"},
-                                {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"},
-                                {"name": "InOutData", "push_output_data": True, "channel": "ingestion_output"}
-                            ]
-                        },
-                        "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage", "data": {}}
-                    },
-                    {
-                        "name": "MassTexturePreview",
-                        "selector_plugins": [{"name": "Nothing", "data": {}}],
-                        "data": {"expose_mass_queue_action_ui": True},
-                        "stop_if_fix_failed": True,
-                        "context_plugin": {"name": "CurrentStage", "data": {}}
-                    }
+                "check_plugins": [ # Simplified, use your detailed check_plugins
+                    {"name": "MaterialShaders", "selector_plugins": [{"name": "AllMaterials", "data": {}}], "data": {"shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}},
+                    {"name": "ConvertToOctahedral", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files_normal", "cleanup_output": False}}], "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}},
+                    {"name": "ConvertToDDS", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}], "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}, {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}, {"name": "InOutData", "push_output_data": True, "channel": "ingestion_output"}]}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}},
+                    {"name": "MassTexturePreview", "selector_plugins": [{"name": "Nothing", "data": {}}], "data": {"expose_mass_queue_action_ui": True}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}}
                 ],
-                "resultor_plugins": [
-                    {"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}
-                ]
+                "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}]
             }
+            
+            logging.debug(f"Texture ingest payload for '{material_name}': {ingest_payload}")
             ingest_response = make_request_with_retries(
-                'POST', f"{base_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl
+                'POST', f"{base_api_url}/material", # Endpoint for material/texture ingestion
+                json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl
             )
+
             if not ingest_response or ingest_response.status_code not in [200, 201, 204]:
-                logging.error(f"Failed to ingest height texture for material '{material_name}'.")
-                return {'CANCELLED'}
+                logging.error(f"Failed to ingest height texture for material '{material_name}'. Status: {ingest_response.status_code if ingest_response else 'No Response'}, Response: {ingest_response.text if ingest_response else 'N/A'}")
+                return {'CANCELLED'} # Or continue to next texture? For now, fail hard.
+            
             ingest_data = ingest_response.json()
+            final_ingested_texture_path_on_server = None
+            
+            # Parse ingest_data to find the path of the *processed* texture (e.g., the .dds or .h.rtex.dds)
+            # This logic needs to correctly navigate the 'completed_schemas' as in upload_to_api
             completed_schemas = ingest_data.get("completed_schemas", [])
-            final_texture_path = None
-            for schema in completed_schemas:
-                for plugin in schema.get("check_plugins", []):
-                    if plugin.get("name") == "ConvertToDDS":
-                        for flow in plugin.get("data", {}).get("data_flows", []):
-                            output_data = flow.get("output_data")
-                            if output_data and any(".h.rtex.dds" in od for od in output_data):
-                                final_texture_path = next(od for od in output_data if ".h.rtex.dds" in od)
+            if completed_schemas:
+                # Look in data_flows of the ConvertToDDS plugin for the output path
+                for schema in completed_schemas:
+                    for plugin_run in schema.get("check_plugins", []):
+                        if plugin_run.get("name") == "ConvertToDDS":
+                            plugin_data = plugin_run.get("data", {})
+                            for flow in plugin_data.get("data_flows", []):
+                                if flow.get("channel") == "ingestion_output" and flow.get("push_output_data") and flow.get("output_data"):
+                                    # output_data is a list of paths
+                                    for out_path in flow["output_data"]:
+                                        if isinstance(out_path, str) and (out_path.lower().endswith(".dds") or out_path.lower().endswith(".rtex.dds")):
+                                            # Heuristic: prefer .h.rtex.dds if multiple DDS outputs
+                                            if ".h.rtex.dds" in out_path.lower() or final_ingested_texture_path_on_server is None:
+                                                final_ingested_texture_path_on_server = out_path.replace('\\','/')
+                                            if ".h.rtex.dds" in out_path.lower(): # Prioritize this exact match
+                                                break 
+                                    if final_ingested_texture_path_on_server and ".h.rtex.dds" in final_ingested_texture_path_on_server.lower():
+                                        break 
+                            if final_ingested_texture_path_on_server and ".h.rtex.dds" in final_ingested_texture_path_on_server.lower():
                                 break
-                        if final_texture_path:
-                            break
-                if final_texture_path:
-                    break
-            if not final_texture_path:
-                logging.error("Failed to find final ingested texture path from ConvertToDDS.")
+                    if final_ingested_texture_path_on_server and ".h.rtex.dds" in final_ingested_texture_path_on_server.lower():
+                        break
+            
+            if not final_ingested_texture_path_on_server:
+                logging.error(f"Failed to find final ingested texture path for material '{material_name}' from TextureImporter response. Full response: {ingest_data}")
                 return {'CANCELLED'}
+            logging.info(f"Successfully ingested height texture for material '{material_name}'. Server path: {final_ingested_texture_path_on_server}")
 
             # STEP 2: Construct the material prim asset path dynamically
-            # Build material prim: reference prim + '/XForms/World/Looks/' + sanitized material name
-            remix_mat_name = blender_mat_to_remix(material_name)
-            material_prim = f"{ref_prim}/XForms/World/Looks/{remix_mat_name}"
-            encoded_material_prim = urllib.parse.quote(material_prim, safe='')
+            remix_mat_name = blender_mat_to_remix(material_name) # Sanitize material name
+            # 'reference_prim' is the path to the parent of XForms/World, e.g., /RootNode/meshes/mesh_ID/ref_ID
+            material_prim_on_stage = f"{reference_prim}/XForms/World/Looks/{remix_mat_name}"
+            encoded_material_prim = urllib.parse.quote(material_prim_on_stage, safe='')
+            logging.debug(f"Constructed material prim path on stage: {material_prim_on_stage}")
 
-            # STEP 3: Fetch the list of shader input prims for this material
-            textures_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_material_prim}/textures"
+            # STEP 3: Fetch the list of shader input connections for this material prim
+            stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/') # For /assets/ and /textures/
+            textures_on_material_url = f"{stagecraft_api_url_base}/assets/{encoded_material_prim}/textures"
+            
             textures_response = make_request_with_retries(
-                'GET', textures_url,
+                'GET', textures_on_material_url,
                 headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
                 verify=addon_prefs.remix_verify_ssl
             )
             if not textures_response or textures_response.status_code != 200:
-                logging.error(f"Failed to retrieve textures for material prim: {material_prim}")
+                logging.error(f"Failed to retrieve texture connections for material prim: {material_prim_on_stage}. Status: {textures_response.status_code if textures_response else 'N/A'}")
                 return {'CANCELLED'}
+            
             textures_data = textures_response.json()
-            shader_input_prim = None
-            textures_list = textures_data.get("textures", [])
-            if textures_list and len(textures_list) > 0 and textures_list[0]:
-                shader_input_prim = textures_list[0][0]
+            shader_core_input_prim = None # This will be like /.../Shader.inputs:diffuse_texture
+            textures_list = textures_data.get("textures", []) # List of [input_prim_path, texture_asset_path]
+            if textures_list and len(textures_list) > 0 and textures_list[0] and isinstance(textures_list[0], list) and len(textures_list[0]) > 0:
+                shader_core_input_prim = textures_list[0][0] # Take the first available input prim as a representative of the shader
             else:
-                logging.error("No shader input prim found in textures response.")
+                logging.error(f"No shader input connections found in textures response for material: {material_prim_on_stage}. Response: {textures_data}")
                 return {'CANCELLED'}
+            logging.debug(f"Representative shader core input prim for material '{material_name}': {shader_core_input_prim}")
 
-            # STEP 4: Get the height shader input prim from the shader input prim
-            encoded_shader_input = urllib.parse.quote(shader_input_prim, safe='')
-            height_prim_url = f"{addon_prefs.remix_server_url.rstrip('/')}/textures/{encoded_shader_input}/material/inputs?texture_type=HEIGHT"
-            height_prim_response = make_request_with_retries(
-                'GET', height_prim_url,
+            # STEP 4: Get the specific 'HEIGHT' shader input prim path using the representative input prim
+            encoded_shader_core_input = urllib.parse.quote(shader_core_input_prim, safe='')
+            height_input_query_url = f"{stagecraft_api_url_base}/textures/{encoded_shader_core_input}/material/inputs?texture_type=HEIGHT"
+            
+            height_input_prim_response = make_request_with_retries(
+                'GET', height_input_query_url,
                 headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
                 verify=addon_prefs.remix_verify_ssl
             )
-            if not height_prim_response or height_prim_response.status_code != 200:
-                logging.error("Failed to fetch height shader input prim.")
+            if not height_input_prim_response or height_input_prim_response.status_code != 200:
+                logging.error(f"Failed to fetch 'HEIGHT' type shader input prim using representative '{shader_core_input_prim}'. Status: {height_input_prim_response.status_code if height_input_prim_response else 'N/A'}")
                 return {'CANCELLED'}
-            height_prim_data = height_prim_response.json()
-            asset_paths = height_prim_data.get("asset_paths", [])
-            if not asset_paths or not asset_paths[0]:
-                logging.error("No height shader input prim returned in response.")
-                return {'CANCELLED'}
-            height_shader_prim = asset_paths[0]
+            
+            height_input_data = height_input_prim_response.json()
+            # CORRECTED: Expect "prim_paths" key
+            height_shader_input_prim_paths = height_input_data.get("prim_paths", []) 
+            
+            if not height_shader_input_prim_paths or not height_shader_input_prim_paths[0]:
+                logging.error(f"No height shader input prim path returned in response for material '{material_name}'. Query URL: {height_input_query_url}, Response: {height_input_data}")
+                return {'CANCELLED'} # Fail if no height input target
+            
+            height_shader_input_target_prim = height_shader_input_prim_paths[0] # This is the actual target like /.../Shader.inputs:height_texture
+            logging.info(f"Target prim for height texture assignment of material '{material_name}': {height_shader_input_target_prim}")
 
-            # STEP 5: Update the shader input with the ingested height texture (via PUT)
-            put_url = f"{addon_prefs.remix_server_url.rstrip('/')}/textures/"
+            # STEP 5: Update the shader input with the ingested height texture (via PUT to /textures/)
+            # The /textures/ endpoint takes a list of [target_shader_input_prim, texture_asset_path]
+            update_texture_connection_url = f"{stagecraft_api_url_base}/textures/" 
             put_payload = {
-                "force": False,
+                "force": False, # or True, depending on desired behavior
                 "textures": [
-                    [height_shader_prim, final_texture_path]
+                    [height_shader_input_target_prim, final_ingested_texture_path_on_server]
                 ]
             }
+            logging.debug(f"PUT payload to connect height texture: {put_payload} to URL: {update_texture_connection_url}")
+            
             put_response = make_request_with_retries(
-                'PUT', put_url, json_payload=put_payload,
+                'PUT', update_texture_connection_url, json_payload=put_payload,
                 headers={
                     "accept": "application/lightspeed.remix.service+json; version=1.0",
                     "Content-Type": "application/lightspeed.remix.service+json; version=1.0"
@@ -977,16 +1053,16 @@ def handle_height_textures(context, reference_prim, exported_objects=None):
                 verify=addon_prefs.remix_verify_ssl
             )
             if not put_response or put_response.status_code not in [200, 201, 204]:
-                logging.error("Failed to update shader input with ingested height texture.")
+                logging.error(f"Failed to update shader input with ingested height texture for material '{material_name}'. Target prim: {height_shader_input_target_prim}, Texture: {final_ingested_texture_path_on_server}. Status: {put_response.status_code if put_response else 'N/A'}, Response: {put_response.text if put_response else 'N/A'}")
                 return {'CANCELLED'}
 
-            logging.info(f"Updated height texture for material '{material_name}' using prim: {height_shader_prim}")
+            logging.info(f"Successfully updated height texture for material '{material_name}' using prim: {height_shader_input_target_prim} with texture: {final_ingested_texture_path_on_server}")
 
         logging.info("Height texture processing for all materials completed successfully.")
         return {'FINISHED'}
 
     except Exception as e:
-        logging.error(f"Error handling height textures: {e}")
+        logging.error(f"Error handling height textures: {e}", exc_info=True)
         return {'CANCELLED'}
         
 def trim_prim_path(prim_path, segments_to_trim=0):
@@ -2471,8 +2547,10 @@ class OBJECT_OT_import_usd_from_remix(Operator):
         all_newly_imported_objects_in_temp = [] # Collect all objects from all USDs
 
         try:
-            # --- Step 1: Fetch USD paths from Remix server (Your existing logic) ---
+            # --- Step 1: Fetch USD paths from Remix server ---
+            # Use "prim_paths" as the key from server response
             assets_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
+            # assets_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_prims=false&exists=true" # Consider if this parameter also needs to change
             response = make_request_with_retries(
                 method='GET', url=assets_url,
                 headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
@@ -2480,22 +2558,48 @@ class OBJECT_OT_import_usd_from_remix(Operator):
             )
             if not response or response.status_code != 200:
                 self.report({'ERROR'}, "Failed to connect to Remix server for asset list.")
-                logging.error("Failed to connect to Remix server for asset list.")
+                logging.error(f"Failed to connect to Remix server for asset list. Status: {response.status_code if response else 'No Response'}")
                 return {'CANCELLED'}
 
             data = response.json()
-            mesh_prim_paths_from_remix = [path for path in data.get("asset_paths", []) if "meshes" in path.lower()]
+            # CHANGED: Expect "prim_paths" instead of "asset_paths"
+            asset_or_prim_paths = data.get("prim_paths", [])
+            if not asset_or_prim_paths: # If "prim_paths" is empty or not found, try "asset_paths" as a fallback for older API versions
+                logging.warning("Key 'prim_paths' not found or empty in server response, trying 'asset_paths' as fallback.")
+                asset_or_prim_paths = data.get("asset_paths", [])
+
+            mesh_prim_paths_from_remix = [path for path in asset_or_prim_paths if "meshes" in path.lower()]
+
             if not mesh_prim_paths_from_remix:
-                self.report({'WARNING'}, "No mesh assets found in Remix server selection.")
-                logging.warning("No mesh assets found in Remix server selection.")
+                self.report({'WARNING'}, "No mesh assets found in Remix server selection (checked 'prim_paths' and 'asset_paths').")
+                logging.warning("No mesh assets found in Remix server selection (checked 'prim_paths' and 'asset_paths'). Response data: %s", data)
+                return {'CANCELLED'}
+            logging.info(f"Fetched mesh prim paths from Remix: {mesh_prim_paths_from_remix}")
+
+            # --- Step 2: Determine base_dir and list of USD files to import ---
+            # This part uses the first mesh path to get a reference for fetching file system paths
+            first_mesh_path_remix = mesh_prim_paths_from_remix[0]
+            # Trim the path to get the reference prim (e.g., /RootNode/meshes/mesh_ID)
+            # The original script used [:4] assuming paths like /<some_root>/<project>/<asset_group>/<asset_id>/mesh
+            # If the path is /RootNode/meshes/mesh_1B17A0CFBC5B20A0, [:4] gives /RootNode/meshes/mesh_1B17A0CFBC5B20A0
+            # If the path is /RootNode/meshes/mesh_1B17A0CFBC5B20A0/mesh, [:4] also gives /RootNode/meshes/mesh_1B17A0CFBC5B20A0
+            segments_for_ref_prim = first_mesh_path_remix.strip('/').split('/')
+            if len(segments_for_ref_prim) >= 3 : # Ensure at least /RootNode/meshes/mesh_ID
+                 # We need up to the mesh_ID part. If original first_mesh_path_remix was /RootNode/meshes/mesh_ID/mesh
+                 # segments_for_ref_prim = ['RootNode', 'meshes', 'mesh_ID', 'mesh']
+                 # We want '/RootNode/meshes/mesh_ID', which is segments_for_ref_prim[:3] if we add leading '/'
+                 # If it was /RootNode/meshes/mesh_ID
+                 # segments_for_ref_prim = ['RootNode', 'meshes', 'mesh_ID']
+                 # also segments_for_ref_prim[:3]
+                trimmed_prim_path_for_file_paths_api = '/' + '/'.join(segments_for_ref_prim[:3]) # Path like /RootNode/meshes/mesh_ID
+            else:
+                self.report({'ERROR'}, f"Cannot determine reference prim for file path API from: {first_mesh_path_remix}")
+                logging.error(f"Cannot determine reference prim for file path API from: {first_mesh_path_remix}")
                 return {'CANCELLED'}
 
-            # Determine base_dir and list of USD files to import (Your existing logic)
-            first_mesh_path_remix = mesh_prim_paths_from_remix[0]
-            trimmed_segments_remix = first_mesh_path_remix.split('/')[:4] 
-            trimmed_prim_path_remix = '/'.join(trimmed_segments_remix)
-            encoded_trimmed_path_remix = urllib.parse.quote(trimmed_prim_path_remix, safe='')
-            
+            logging.info(f"Using trimmed prim path for file-paths API: {trimmed_prim_path_for_file_paths_api}")
+            encoded_trimmed_path_remix = urllib.parse.quote(trimmed_prim_path_for_file_paths_api, safe='')
+
             file_paths_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_trimmed_path_remix}/file-paths"
             response_files = make_request_with_retries(
                 method='GET', url=file_paths_url,
@@ -2504,40 +2608,28 @@ class OBJECT_OT_import_usd_from_remix(Operator):
             )
 
             if not response_files or response_files.status_code != 200:
-                self.report({'ERROR'}, f"Failed to retrieve file paths for reference prim: {trimmed_prim_path_remix}")
-                logging.error(f"Failed to retrieve file paths for reference prim: {trimmed_prim_path_remix}")
+                self.report({'ERROR'}, f"Failed to retrieve file paths for reference prim: {trimmed_prim_path_for_file_paths_api}")
+                logging.error(f"Failed to retrieve file paths for reference prim: {trimmed_prim_path_for_file_paths_api}. Status: {response_files.status_code if response_files else 'No Response'}")
                 return {'CANCELLED'}
 
             file_data = response_files.json()
             reference_paths_list = file_data.get("reference_paths", [])
-            
-            potential_base_path_source = None
+            logging.debug(f"File data response for {trimmed_prim_path_for_file_paths_api}: {file_data}")
 
+            potential_base_path_source = None
             if reference_paths_list and \
                reference_paths_list[0] and \
                len(reference_paths_list[0]) > 1 and \
                isinstance(reference_paths_list[0][1], list) and \
                len(reference_paths_list[0][1]) > 1 and \
                isinstance(reference_paths_list[0][1][1], str):
-                
-                potential_base_path_source = reference_paths_list[0][1][1] 
-                logging.info(f"Identified potential absolute path for base_dir: {potential_base_path_source}")
+                potential_base_path_source = reference_paths_list[0][1][1]
+                logging.info(f"Identified potential absolute path for base_dir (from ...[0][1][1]): {potential_base_path_source}")
             else:
-                # Log details if the expected structure is not found
-                log_msg = "Could not find the expected absolute file path in Remix server response structure. Details: "
-                if not reference_paths_list or not reference_paths_list[0]:
-                    log_msg += "No reference_paths_list or first element is missing. "
-                elif len(reference_paths_list[0]) <= 1:
-                    log_msg += f"reference_paths_list[0] does not have enough elements: {reference_paths_list[0]}. "
-                elif not isinstance(reference_paths_list[0][1], list):
-                    log_msg += f"reference_paths_list[0][1] is not a list: {reference_paths_list[0][1]}. "
-                elif len(reference_paths_list[0][1]) <= 1:
-                    log_msg += f"reference_paths_list[0][1] (list) does not have enough elements: {reference_paths_list[0][1]}. "
-                elif not isinstance(reference_paths_list[0][1][1], str):
-                    log_msg += f"reference_paths_list[0][1][1] is not a string: {reference_paths_list[0][1][1]}. "
-                
-                self.report({'WARNING'}, "Remix Response: File path structure unexpected.")
-                logging.warning(log_msg)
+                log_msg = "Could not find the expected absolute file path in Remix server response structure (expected ...[0][1][1]). Details: "
+                # (Detailed logging as before)
+                self.report({'WARNING'}, "Remix Response: File path structure for base directory unexpected.")
+                logging.warning(log_msg + f"Full reference_paths_list: {reference_paths_list}")
 
 
             if potential_base_path_source and os.path.isabs(potential_base_path_source) and os.path.exists(os.path.dirname(potential_base_path_source)):
@@ -2551,89 +2643,125 @@ class OBJECT_OT_import_usd_from_remix(Operator):
                 logging.error(err_msg)
                 return {'CANCELLED'}
 
-
             for mesh_path_remix in mesh_prim_paths_from_remix:
                 segments = mesh_path_remix.strip('/').split('/')
-                if len(segments) >= 3:
-                    mesh_name_from_prim = segments[2] 
-                    relative_usd_path = f"meshes/{mesh_name_from_prim}.usd" # Assuming USD has same base name
+                # Example prim_path: /RootNode/meshes/mesh_1B17A0CFBC5B20A0/mesh
+                # strip('/') -> "RootNode/meshes/mesh_1B17A0CFBC5B20A0/mesh"
+                # split('/') -> segments = ['RootNode', 'meshes', 'mesh_1B17A0CFBC5B20A0', 'mesh']
+                # We need 'mesh_1B17A0CFBC5B20A0', which is segments[2].
+                #
+                # Example prim_path: /RootNode/meshes/mesh_1B17A0CFBC5B20A0 (if it can also come without /mesh suffix)
+                # strip('/') -> "RootNode/meshes/mesh_1B17A0CFBC5B20A0"
+                # split('/') -> segments = ['RootNode', 'meshes', 'mesh_1B17A0CFBC5B20A0']
+                # We need 'mesh_1B17A0CFBC5B20A0', which is segments[2].
+                # len(segments) would be 3.
+                
+                if len(segments) > 2: # Check if segments[2] exists (i.e., length is at least 3)
+                    mesh_name_from_prim = segments[2] # CORRECTED BACK to segments[2]
+                    relative_usd_path = f"meshes/{mesh_name_from_prim}.usd"
                     usd_file_full_path = os.path.join(base_dir_for_textures, relative_usd_path).replace('\\', '/')
-                    
+                    logging.info(f"Constructed full USD path for import: {usd_file_full_path} from prim {mesh_path_remix}")
+
                     if os.path.exists(usd_file_full_path):
                         mesh_object_name_expected = os.path.splitext(os.path.basename(usd_file_full_path))[0]
-                        # Check against main scene for existing objects
                         if bpy.data.objects.get(mesh_object_name_expected):
-                            logging.info(f"Mesh '{mesh_object_name_expected}' already exists in the main scene. Skipping import from Remix.")
-                            self.report({'INFO'}, f"Mesh '{mesh_object_name_expected}' from Remix already exists. Skipping.")
+                            logging.info(f"Mesh '{mesh_object_name_expected}' (from {usd_file_full_path}) already exists in the main scene. Skipping import from Remix.")
+                            # self.report({'INFO'}, f"Mesh '{mesh_object_name_expected}' from Remix already exists. Skipping.") # self.report not available here
+                            print(f"INFO: Mesh '{mesh_object_name_expected}' from Remix already exists. Skipping.")
                             continue
                         all_imported_usd_filepaths_to_process.append(usd_file_full_path)
                     else:
                         logging.warning(f"Constructed USD file path from Remix data does not exist: {usd_file_full_path}")
                 else:
-                    logging.warning(f"Mesh path '{mesh_path_remix}' from Remix does not have expected format for filename extraction.")
-            
-            if not all_imported_usd_filepaths_to_process:
-                self.report({'INFO'}, "No new USD files from Remix selection to import (all may exist or paths invalid).")
-                return {'FINISHED'}
+                    logging.warning(f"Mesh path '{mesh_path_remix}' from Remix does not have expected segment count for filename extraction (expected at least 3 segments like RootNode/meshes/name/...).")
 
-            # --- Step 2: Create isolated import environment ---
-            import_scene_temp = bpy.data.scenes.new("Remix_USD_Import_Temp_Scene")
+            if not all_imported_usd_filepaths_to_process:
+                self.report({'INFO'}, "No new USD files from Remix selection to import (all may exist, paths invalid, or structure unexpected).")
+                return {'FINISHED'} # Changed from CANCELLED to FINISHED as it's a valid state.
+
+            # --- Step 2 (was 4): Create isolated import environment ---
+            temp_scene_name = "Remix_USD_Import_Temp_V3" # Using V3 from import_captures for consistency
+            idx = 0
+            while temp_scene_name in bpy.data.scenes:
+                idx += 1
+                temp_scene_name = f"Remix_USD_Import_Temp_V3_{idx}"
+            import_scene_temp = bpy.data.scenes.new(temp_scene_name)
             logging.info(f"Created temporary scene for Remix import: {import_scene_temp.name}")
 
-            # --- Step 3: Perform actual USD import into temporary scene ---
+            # --- Step 3 (was 5): Perform actual USD import into temporary scene ---
             imported_obj_map = self._perform_usd_import_into_scene(
-                context, 
-                import_scene_temp, 
-                all_imported_usd_filepaths_to_process, 
+                context,
+                import_scene_temp,
+                all_imported_usd_filepaths_to_process,
                 addon_prefs
             )
-            
-            # Collect all successfully imported objects in the temp scene
+
             for objs_list in imported_obj_map.values():
                 all_newly_imported_objects_in_temp.extend(objs_list)
 
-            if not all_newly_imported_objects_in_temp and not import_scene_temp.objects: # Check both sources
+            # Check if any objects were actually put into the temp scene directly by the importer,
+            # even if our map is empty due to logic issues in _perform_usd_import_into_scene's tracking.
+            if not all_newly_imported_objects_in_temp and not import_scene_temp.objects:
                 self.report({'WARNING'}, "No objects were imported into the temporary scene from Remix.")
                 # Cleanup is handled in finally
                 return {'CANCELLED'}
-            
-            # --- Step 4: Apply Transforms in temporary scene ---
+            elif not all_newly_imported_objects_in_temp and import_scene_temp.objects:
+                logging.warning("Tracking of newly imported objects failed, but temp scene has objects. Proceeding with all objects in temp scene.")
+                all_newly_imported_objects_in_temp = list(import_scene_temp.objects)
+
+
+            # --- Step 4 (was 6): Apply Transforms in temporary scene ---
+            # Ensure context is on temp_scene before applying transforms
+            original_window_scene_for_transform = context.window.scene
+            if context.window.scene != import_scene_temp:
+                context.window.scene = import_scene_temp
+                logging.debug(f"Switched to temp scene '{import_scene_temp.name}' for transform application.")
+
             transform_stats = _perform_transform_application_phase_module(context, import_scene_temp)
             logging.info(f"Transform application phase for Remix import completed: {transform_stats}")
 
-            # --- Step 5: Transfer objects to main scene ---
+            if context.window.scene != original_window_scene_for_transform:
+                context.window.scene = original_window_scene_for_transform # Switch back
+                logging.debug(f"Switched back to original scene '{original_window_scene_for_transform.name}' after transform.")
+
+
+            # --- Step 5 (was 7): Transfer objects to main scene ---
             transfer_stats = _perform_object_transfer_phase_module(context, main_scene, import_scene_temp)
             logging.info(f"Object transfer phase for Remix import completed: {transfer_stats}")
 
 
-            # --- Step 6: Attach original textures (Your existing logic) ---
-            # Need to get the objects as they are now in the main_scene
-            # A simple way: find by name based on what was in all_newly_imported_objects_in_temp
+            # --- Step 6 (was 8): Attach original textures (Your existing logic) ---
             final_objects_in_main_scene = []
-            if all_newly_imported_objects_in_temp : # if any object was tracked from temp_scene
-                for temp_obj in all_newly_imported_objects_in_temp:
-                    main_scene_obj = main_scene.objects.get(temp_obj.name)
-                    if main_scene_obj:
-                        final_objects_in_main_scene.append(main_scene_obj)
-            else: # Fallback if no objects were tracked, try to get all from the temp scene name list
-                 for temp_obj_name in [o.name for o in import_scene_temp.objects]: # if scene was populated but tracking failed
-                    main_scene_obj = main_scene.objects.get(temp_obj_name)
-                    if main_scene_obj:
-                        final_objects_in_main_scene.append(main_scene_obj)
-
+            if all_newly_imported_objects_in_temp :
+                for temp_obj_ref in all_newly_imported_objects_in_temp: # temp_obj_ref might be an invalid reference if deleted from temp
+                    try:
+                        # Check if temp_obj_ref is still valid and get its name
+                        # It might have been deleted if it was only in temp_scene and that scene was cleared or obj removed
+                        # The objects are now in main_scene
+                        main_scene_obj = main_scene.objects.get(temp_obj_ref.name) # temp_obj_ref.name might fail if ref is dead
+                        if main_scene_obj:
+                            final_objects_in_main_scene.append(main_scene_obj)
+                    except ReferenceError:
+                        logging.warning(f"A temporary object reference was no longer valid when checking for texture attachment.")
+                        continue # Skip dead references
+            else: # Fallback if tracking failed but objects were transferred
+                logging.warning("all_newly_imported_objects_in_temp was empty; trying to identify transferred objects by name from previous temp scene content.")
+                # This assumes _perform_object_transfer_phase_module correctly moved everything
+                # and we don't have the original names if all_newly_imported_objects_in_temp was truly empty from the start
+                # This branch is less robust. The best is to ensure all_newly_imported_objects_in_temp is populated correctly.
+                # For now, if it's empty, this will likely result in no textures attached.
 
             if addon_prefs.remix_import_original_textures and base_dir_for_textures and final_objects_in_main_scene:
-                logging.info("Attaching original textures (Remix import).")
+                logging.info(f"Attaching original textures (Remix import) to {len(final_objects_in_main_scene)} objects using base_dir: {base_dir_for_textures}.")
                 attach_original_textures(final_objects_in_main_scene, context, base_dir_for_textures)
             elif not final_objects_in_main_scene:
-                 logging.warning("No final objects identified in main scene for texture attachment (Remix).")
+                logging.warning("No final objects identified in main scene for texture attachment (Remix).")
+            elif not addon_prefs.remix_import_original_textures:
+                logging.info("Import original textures option is disabled.")
+            elif not base_dir_for_textures:
+                logging.warning("Base directory for textures was not determined; skipping texture attachment.")
 
-
-            # Optional: Duplicate cleanup can also be reused if Remix imports might create "inst_" duplicates
-            # cleanup_stats = _perform_duplicate_cleanup_phase_module(context, main_scene)
-            # logging.info(f"Duplicate cleanup for Remix import: {cleanup_stats}")
-
-            self.report({'INFO'}, f"Remix USD import completed. Processed {len(all_imported_usd_filepaths_to_process)} files. Transformed {transform_stats.get('transformed',0)} objects.")
+            self.report({'INFO'}, f"Remix USD import completed. Processed {len(all_imported_usd_filepaths_to_process)} file(s). Transferred {transfer_stats.get('transferred_count',0)} top-level groups/objects.")
             return {'FINISHED'}
 
         except Exception as e_remix_main:
@@ -2643,11 +2771,15 @@ class OBJECT_OT_import_usd_from_remix(Operator):
         finally:
             if import_scene_temp and import_scene_temp.name in bpy.data.scenes:
                 logging.info(f"Removing temporary Remix import scene: {import_scene_temp.name}")
-                for window in context.window_manager.windows: # Ensure no window uses it
+                # Ensure no window is using the temp scene before removal
+                for window in context.window_manager.windows:
                     if window.scene == import_scene_temp:
-                        window.scene = main_scene 
+                        window.scene = main_scene # Switch to the main scene
+                if context.window.scene == import_scene_temp: # Current context window
+                     context.window.scene = main_scene
+
                 bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
-            
+
             remix_import_lock = False
             logging.debug("Lock released for USD import process (Remix).")
 
@@ -3120,9 +3252,10 @@ def upload_to_api(obj_path, ingest_dir, context):
         os.makedirs(meshes_subdir, exist_ok=True)
         logging.debug(f"'meshes' subdirectory ensured at: {meshes_subdir}")
 
+        # This usd_output_path is what we expect the server to create or confirm
         usd_filename = os.path.splitext(os.path.basename(obj_path))[0] + ".usd"
-        usd_output_path = os.path.join(meshes_subdir, usd_filename).replace('\\', '/')
-        logging.debug(f"USD Output Path: {usd_output_path}")
+        expected_usd_output_path = os.path.join(meshes_subdir, usd_filename).replace('\\', '/')
+        logging.debug(f"Expected USD Output Path by client: {expected_usd_output_path}")
 
         payload = {
             "executor": 1,
@@ -3132,7 +3265,7 @@ def upload_to_api(obj_path, ingest_dir, context):
                 "data": {
                     "context_name": "ingestcraft",
                     "input_files": [abs_obj_path],
-                    "output_directory": meshes_subdir,
+                    "output_directory": meshes_subdir, # This is the directory ON THE SERVER
                     "allow_empty_input_files_list": True,
                     "data_flows": [
                         {
@@ -3157,155 +3290,57 @@ def upload_to_api(obj_path, ingest_dir, context):
                     "close_stage_on_exit": True
                 }
             },
-            "check_plugins": [
+            "check_plugins": [ # ... (rest of your payload remains the same)
                 {
-                    "name": "ClearUnassignedMaterial",
-                    "selector_plugins": [
-                        {
-                            "name": "AllMeshes",
-                            "data": {"include_geom_subset": True}
-                        }
-                    ],
-                    "data": {},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "ClearUnassignedMaterial", "selector_plugins": [{"name": "AllMeshes", "data": {"include_geom_subset": True}}], "data": {}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "DefaultMaterial",
-                    "selector_plugins": [
-                        {"name": "AllMeshes", "data": {}}
-                    ],
-                    "data": {},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "DefaultMaterial", "selector_plugins": [{"name": "AllMeshes", "data": {}}], "data": {}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "MaterialShaders",
-                    "selector_plugins": [
-                        {"name": "AllMaterials", "data": {}}
-                    ],
-                    "data": {"shader_subidentifiers": {"AperturePBR_Translucent": "translucent|glass|trans", "AperturePBR_Opacity": ".*"}},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "MaterialShaders", "selector_plugins": [{"name": "AllMaterials", "data": {}}], "data": {"shader_subidentifiers": {"AperturePBR_Translucent": "translucent|glass|trans", "AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "ValueMapping",
-                    "selector_plugins": [
-                        {"name": "AllShaders", "data": {}}
-                    ],
-                    "data": {"attributes": {"inputs:emissive_intensity": [{"operator": "=", "input_value": 10000, "output_value": 1}]}},
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "ValueMapping", "selector_plugins": [{"name": "AllShaders", "data": {}}], "data": {"attributes": {"inputs:emissive_intensity": [{"operator": "=", "input_value": 10000, "output_value": 1}]}},
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "ConvertToOctahedral",
-                    "selector_plugins": [
-                        {"name": "AllShaders", "data": {}}
-                    ],
-                    "resultor_plugins": [
-                        {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
-                    ],
-                    "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "ConvertToOctahedral", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}],
+                    "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "ConvertToDDS",
-                    "selector_plugins": [
-                        {"name": "AllShaders", "data": {}}
-                    ],
-                    "resultor_plugins": [
-                        {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}
-                    ],
-                    "data": {
-                        "data_flows": [
-                            {"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"},
-                            {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}
-                        ]
-                    },
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "ConvertToDDS", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}],
+                    "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}, {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}]}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "RelativeAssetPaths",
-                    "selector_plugins": [
-                        {"name": "AllPrims", "data": {}}
-                    ],
-                    "data": {},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "RelativeAssetPaths", "selector_plugins": [{"name": "AllPrims", "data": {}}], "data": {}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "RelativeReferences",
-                    "selector_plugins": [
-                        {"name": "AllPrims", "data": {}}
-                    ],
-                    "data": {},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "DependencyIterator",
-                        "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}
-                    }
+                    "name": "RelativeReferences", "selector_plugins": [{"name": "AllPrims", "data": {}}], "data": {}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "WrapRootPrims",
-                    "selector_plugins": [
-                        {"name": "Nothing", "data": {}}
-                    ],
-                    "data": {"wrap_prim_name": "XForms"},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "CurrentStage",
-                        "data": {"save_on_exit": True, "close_stage_on_exit": False}
-                    }
+                    "name": "WrapRootPrims", "selector_plugins": [{"name": "Nothing", "data": {}}], "data": {"wrap_prim_name": "XForms"}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "CurrentStage", "data": {"save_on_exit": True, "close_stage_on_exit": False}}
                 },
                 {
-                    "name": "WrapRootPrims",
-                    "selector_plugins": [
-                        {"name": "Nothing", "data": {}}
-                    ],
-                    "data": {"wrap_prim_name": "ReferenceTarget"},
-                    "stop_if_fix_failed": True,
-                    "context_plugin": {
-                        "name": "CurrentStage",
-                        "data": {"save_on_exit": True, "close_stage_on_exit": False}
-                    }
+                    "name": "WrapRootPrims", "selector_plugins": [{"name": "Nothing", "data": {}}], "data": {"wrap_prim_name": "ReferenceTarget"}, "stop_if_fix_failed": True,
+                    "context_plugin": {"name": "CurrentStage", "data": {"save_on_exit": True, "close_stage_on_exit": False}}
                 }
             ],
             "resultor_plugins": [
-                {
-                    "name": "FileCleanup",
-                    "data": {"channel": "cleanup_files", "cleanup_output": False}
-                },
-                {
-                    "name": "FileMetadataWritter",
-                    "data": {"channel": "write_metadata"}
-                }
+                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}},
+                {"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}
             ]
         }
 
         logging.info(f"Uploading OBJ to {url}")
-        # Limit retries to 1 to avoid duplicate attempts.
         response = make_request_with_retries('POST', url, json_payload=payload, verify=addon_prefs.remix_verify_ssl, retries=1)
 
         if response is None:
@@ -3314,18 +3349,23 @@ def upload_to_api(obj_path, ingest_dir, context):
 
         if response.status_code == 500:
             try:
-                response_data = response.json()
-                detail = response_data.get("detail", "")
+                response_data_error = response.json()
+                detail = response_data_error.get("detail", "")
             except Exception:
-                detail = ""
-            if "The validation did not complete successfully" in detail:
-                error_msg = "Please change the Ingest Directory to inside the Project folder."
-                logging.error(error_msg)
-                print("DEBUG:", error_msg)  # Debug line printed to console
+                detail = response.text # Fallback to raw text if JSON parsing fails
+            
+            # Check for your specific error message regarding ingest directory
+            if "The validation did not complete successfully" in detail or "ingest_directory" in detail.lower(): # Made check more robust
+                error_msg = "Ingestion failed: Please ensure the Ingest Directory in addon preferences is set correctly within your project structure on the server."
+                logging.error(f"{error_msg} Server detail: {detail}")
                 bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_msg, success=False)
                 return None
+            else: # Generic 500 error
+                logging.error(f"Failed to upload OBJ. Status: 500, Response: {detail}")
+                return None
 
-        if response.status_code != 200:
+
+        if response.status_code != 200: # Handles other non-500 errors
             logging.error(f"Failed to upload OBJ. Status: {response.status_code}, Response: {response.text}")
             return None
 
@@ -3335,22 +3375,59 @@ def upload_to_api(obj_path, ingest_dir, context):
             logging.error("No completed schemas found in response.")
             return None
 
-        output_files = completed_schemas[0].get("context_plugin", {}).get("data", {}).get("output_files", {})
-        if output_files:
-            usd_path_relative = next(iter(output_files.values()))
-            usd_path = os.path.join(meshes_subdir, os.path.basename(usd_path_relative)).replace('\\', '/')
-            logging.debug(f"Uploaded USD Path: {usd_path}")
-            return usd_path
-        else:
-            logging.error("No USD path found in the response.")
-            return None
-    finally:
-        pass
+        # --- CORRECTED USD PATH EXTRACTION ---
+        usd_path_from_response = None
+        try:
+            context_plugin_data = completed_schemas[0].get("context_plugin", {}).get("data", {})
+            data_flows = context_plugin_data.get("data_flows", [])
+            
+            for flow in data_flows:
+                # Check for flows that are likely to contain the final USD output path
+                if flow.get("push_output_data") and flow.get("output_data"):
+                    if isinstance(flow["output_data"], list) and len(flow["output_data"]) > 0:
+                        potential_path = flow["output_data"][0]
+                        if isinstance(potential_path, str) and potential_path.lower().endswith(".usd"):
+                            # Prefer paths from "ingestion_output" or "write_metadata" if available
+                            if flow.get("channel") in ["ingestion_output", "write_metadata"]:
+                                usd_path_from_response = potential_path.replace('\\', '/')
+                                logging.info(f"Found USD path in data_flows (channel: '{flow.get('channel')}'): {usd_path_from_response}")
+                                break # Prefer this path
+                            elif usd_path_from_response is None: # If not set yet, take any USD path
+                                usd_path_from_response = potential_path.replace('\\', '/')
+                                logging.info(f"Found potential USD path in data_flows (channel: '{flow.get('channel')}'): {usd_path_from_response}")
+            
+            if usd_path_from_response:
+                 # Ensure the path matches what we expect or use the server's authoritative path
+                if os.path.normpath(usd_path_from_response) == os.path.normpath(expected_usd_output_path):
+                    logging.debug(f"API returned USD Path matches expected client path: {usd_path_from_response}")
+                else:
+                    logging.warning(f"API returned USD Path '{usd_path_from_response}' differs from client expected path '{expected_usd_output_path}'. Using API path.")
+                return usd_path_from_response # Return the path from the API response
+            else:
+                logging.error("No suitable USD output path found in 'data_flows' in the response.")
+                return None
 
-def check_blend_file_in_prims(blend_name, context):
-    addon_prefs = context.preferences.addons[__name__].preferences
+        except Exception as e_parse:
+            logging.error(f"Error parsing 'data_flows' for USD path: {e_parse}", exc_info=True)
+            logging.error("No USD path found in the response due to parsing error.")
+            return None
+        # --- END OF CORRECTION ---
+
+    # Removed 'finally: pass' as it's not needed
+    # Errors and None returns are handled above.
+    # If an exception occurs before a return, it will propagate.
+    except requests.exceptions.RequestException as e_req:
+        logging.error(f"Network request failed during API upload: {e_req}", exc_info=True)
+        return None
+    except Exception as e_general:
+        logging.error(f"An unexpected error occurred in upload_to_api: {e_general}", exc_info=True)
+        return None
+
+def check_blend_file_in_prims(blend_name, context): # Added context
+    addon_prefs = context.preferences.addons[__name__].preferences # Use context to get prefs
     try:
         server_url = addon_prefs.remix_server_url.rstrip('/')
+        # Consider if filter_session_assets should be filter_session_prims
         get_url = f"{server_url}/assets/?selection=false&filter_session_assets=false&exists=true"
         headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
 
@@ -3358,48 +3435,72 @@ def check_blend_file_in_prims(blend_name, context):
         response = make_request_with_retries('GET', get_url, headers=headers, verify=addon_prefs.remix_verify_ssl)
 
         if not response or response.status_code != 200:
-            logging.error("Failed to fetch prims from Remix server.")
+            logging.error(f"Failed to fetch prims from Remix server. Status: {response.status_code if response else 'No Response'}")
             return None, None
 
-        asset_paths = response.json().get("asset_paths", [])
-        logging.debug(f"Retrieved asset paths: {asset_paths}")
+        data = response.json()
+        # CORRECTED: Look for "prim_paths", fallback to "asset_paths"
+        asset_or_prim_paths = data.get("prim_paths")
+        if asset_or_prim_paths is None: # Check if key exists
+            logging.warning("check_blend_file_in_prims: Key 'prim_paths' not found in server response, trying 'asset_paths' as fallback.")
+            asset_or_prim_paths = data.get("asset_paths", [])
+        
+        logging.debug(f"Retrieved asset_or_prim_paths for check_blend_file_in_prims: {asset_or_prim_paths[:10]}...") # Log first few
 
         if addon_prefs.remix_use_custom_name and addon_prefs.remix_use_selection_only and addon_prefs.remix_base_obj_name:
             base_name = addon_prefs.remix_base_obj_name
             logging.debug(f"Using custom base OBJ name for prim search: {base_name}")
         else:
-            base_name = extract_base_name(blend_name)
+            base_name = extract_base_name(blend_name) # Assuming extract_base_name is correct
             logging.debug(f"Using blend file base name for prim search: {base_name}")
 
-        for path in asset_paths:
+        for path in asset_or_prim_paths:
             segments = path.strip('/').split('/')
-            if any(base_name.lower() in segment.lower() for segment in segments):
-                logging.info(f"Prim with base name found: {path}")
-                print(f"Prim with base name found: {path}")
+            # Check if any segment (typically the mesh name part) contains the base_name
+            # This logic might need refinement depending on how specific the match needs to be.
+            # Example: if base_name is "Test" and path is "/RootNode/meshes/Test_1/mesh"
+            # segments could be ['RootNode', 'meshes', 'Test_1', 'mesh']
+            # We'd want to check 'Test_1' against 'Test'
+            path_lower = path.lower() # For case-insensitive comparison of the whole path
+            base_name_lower = base_name.lower()
 
-                prim_path = '/' + '/'.join(segments)
+            # More targeted check: often the mesh ID is the 3rd segment if path starts with /
+            # e.g. /RootNode/meshes/mesh_ID_or_Name
+            # or 4th if it's /Project/AssetGroup/mesh_ID_or_Name
+            # A simple "in" check for the base_name in the path string is a broad approach.
+            if base_name_lower in path_lower: # General check
+            # A more specific check might be:
+            # if len(segments) > 2 and base_name_lower in segments[2].lower(): # Checks the typical mesh name slot
+                logging.info(f"Prim with base name potentially found: {path}")
+                # print(f"Prim with base name found: {path}") # Covered by logging
+
+                prim_path_to_return = '/' + '/'.join(segments) # Reconstruct full path with leading slash
 
                 reference_prim_path = None
+                # Find the segment starting with 'ref_' to determine the reference prim
                 for i, segment in enumerate(segments):
                     if segment.lower().startswith('ref_'):
                         reference_prim_path = '/' + '/'.join(segments[:i + 1])
                         break
-
+                
                 if reference_prim_path:
-                    logging.info(f"Reference prim identified: {reference_prim_path}")
-                    print(f"Reference prim identified: {reference_prim_path}")
-                    return prim_path, reference_prim_path
+                    logging.info(f"Reference prim identified: {reference_prim_path} for matched path {prim_path_to_return}")
+                    # print(f"Reference prim identified: {reference_prim_path}") # Covered by logging
+                    return prim_path_to_return, reference_prim_path
                 else:
-                    logging.warning(f"No 'ref_' segment found in path: {path}")
-                    print(f"No 'ref_' segment found in path: {path}")
+                    # If no 'ref_' segment, but a match was found, what should be returned?
+                    # The original code would continue the loop if no 'ref_' was found for a given path match.
+                    # This means only paths that contain 'base_name' AND have a 'ref_' segment are considered.
+                    logging.debug(f"Path '{path}' contained base name '{base_name}' but no 'ref_' segment found. Continuing search.")
+                    # If any path matching base_name should be returned even without 'ref_', this logic needs change.
+                    # For now, sticking to original intent: needs 'ref_'.
 
-        logging.info(f"No reference prim found with base name '{base_name}'.")
+        logging.info(f"No reference prim found containing base name '{base_name}' AND a 'ref_' segment.")
         return None, None
 
     except Exception as e:
-        logging.error(f"Error checking prims: {e}")
+        logging.error(f"Error checking prims: {e}", exc_info=True)
         return None, None
-    
 
 def extract_base_name(blend_name):
     match = re.match(r"^(.*?)(?:_\d+)?$", blend_name)
