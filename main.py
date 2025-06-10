@@ -1967,137 +1967,151 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
     def _import_and_process_files_iteratively(self, context, temp_scene, addon_prefs, main_scene_ref):
         """
-        1) Optionally override USD importer’s axis prefs so meshes aren’t “all facing upward.”
-        2) Import each USD into `temp_scene` (no per‐file redraws).
-        3) Detect newly created objects via a “marker” property.
-        4) Keep only unique meshes by conceptual base name.
-        5) Collapse transforms, optionally attach textures, then prune any dead references.
-        6) Return a final list of still‐alive keeper objects, plus counts of processed files/textures.
+        Optimized USD import loop:
+          - Switch once to temp_scene
+          - Use set-difference to detect new objects
+          - Progress bar via window_manager.progress_*
+          - Set cursor to WAIT via window.cursor_set, then restore
+          - Integrate existing logic: conceptual-base filtering, transform application, texture attach, cleanup
+        Returns: (all_keep_objs, processed_files_count, textures_processed_for_count)
         """
+        import bpy
+        import os
+        import logging
+        from mathutils import Matrix
 
-        # 1) Override USD importer preferences ONCE at the start of this batch
-        original_importer_settings = {}
-        usd_importer_addon = context.preferences.addons.get('io_scene_usd')
-        if usd_importer_addon:
-            importer_prefs = usd_importer_addon.preferences
-            # Back up the axis settings and scale
-            for attr in ("axis_forward", "axis_up"):
-                if hasattr(importer_prefs, attr):
-                    original_importer_settings[attr] = getattr(importer_prefs, attr)
+        wm = context.window_manager
+        win = context.window
 
-            # Pull from addon_prefs: assume “usd_import_forward_axis” and “usd_import_up_axis” exist
-            forward_axis = getattr(addon_prefs, "usd_import_forward_axis", "-Z")
-            up_axis = getattr(addon_prefs, "usd_import_up_axis", "Y")
-            if hasattr(importer_prefs, "axis_forward"):
-                importer_prefs.axis_forward = forward_axis
-            if hasattr(importer_prefs, "axis_up"):
-                importer_prefs.axis_up = up_axis
+        total_files = len(self.files)
+        # Begin progress
+        try:
+            wm.progress_begin(0, total_files)
+        except Exception:
+            pass
 
-            logging.debug(f"USD Importer axes set to Forward={forward_axis}, Up={up_axis}.")
+        # Attempt to set wait cursor, if supported
+        try:
+            win.cursor_set('WAIT')
+        except Exception:
+            pass
 
-        # Local aliases for speed
-        data_materials = bpy.data.materials
-        data_objects = bpy.data.objects
-        materials_seen = set(data_materials.keys())
-        processed_bases = self._processed_conceptual_asset_bases
-
-        # 2) Cache transform/texture flags once
-        remix_scale = getattr(addon_prefs, "remix_import_scale", 1.0)
-        scale_needed = abs(remix_scale - 1.0) > 1e-6
-        mirror_flag = bool(getattr(addon_prefs, "mirror_import", False))
-        flip_flag = bool(getattr(addon_prefs, "flip_normals_import", False))
-        attach_textures_flag = bool(getattr(addon_prefs, "remix_import_original_textures", False))
-
-        if scale_needed:
-            scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
-        if mirror_flag:
-            mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
-
-        valid_exts = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
+        # Switch once to temp_scene
+        original_scene = context.window.scene
+        context.window.scene = temp_scene
 
         all_keep_objs = []
         processed_files_count = 0
         textures_processed_for_count = 0
 
-        # 3) Switch to temp_scene once (avoiding repeated context switches)
-        original_scene_for_loop = context.window.scene
-        context.window.scene = temp_scene
+        # Prepare USD importer prefs backup if needed
+        usd_importer_addon = context.preferences.addons.get('io_scene_usd')
+        original_importer_settings = {}
+        if usd_importer_addon:
+            importer_prefs = usd_importer_addon.preferences
+            # Backup relevant settings; adjust as needed
+            for attr in ("axis_forward", "axis_up"):
+                if hasattr(importer_prefs, attr):
+                    original_importer_settings[attr] = getattr(importer_prefs, attr)
+            # Apply from addon_prefs if desired; this matches your original logic
+            forward_axis = getattr(addon_prefs, "usd_import_forward_axis", None)
+            up_axis = getattr(addon_prefs, "usd_import_up_axis", None)
+            if forward_axis and hasattr(importer_prefs, "axis_forward"):
+                importer_prefs.axis_forward = forward_axis
+            if up_axis and hasattr(importer_prefs, "axis_up"):
+                importer_prefs.axis_up = up_axis
+            logging.debug(f"USD Importer axes set to Forward={forward_axis}, Up={up_axis}.")
 
-        for file_elem in self.files:
+        # Prepare for transform flags once
+        remix_scale = getattr(addon_prefs, "remix_import_scale", 1.0)
+        scale_needed = abs(remix_scale - 1.0) > 1e-6
+        if scale_needed:
+            scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
+        mirror_flag = bool(getattr(addon_prefs, "mirror_import", False))
+        flip_flag = bool(getattr(addon_prefs, "flip_normals_import", False))
+        attach_textures_flag = bool(getattr(addon_prefs, "remix_import_original_textures", False))
+
+        # If mirror_flag needs a matrix:
+        if mirror_flag:
+            mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
+
+        # For material dedupe
+        data_materials = bpy.data.materials
+        materials_seen = set(data_materials.keys())
+
+        # Process each file
+        for idx, file_elem in enumerate(self.files):
+            # Update progress early if skipping
+            try:
+                wm.progress_update(idx)
+            except Exception:
+                pass
+
             filepath = os.path.join(self.directory, file_elem.name)
+            # Only proceed if file exists and extension matches
+            valid_exts = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
             if not (os.path.exists(filepath) and filepath.lower().endswith(valid_exts)):
-                logging.warning(f"Skipping invalid file: {filepath}")
                 continue
 
             processed_files_count += 1
-            if getattr(bpy.app, "debug", False):
-                logging.debug(f"[{processed_files_count}/{len(self.files)}] Importing: {filepath}")
 
-            # Tag all existing objects in temp_scene with a “pre‐import marker”
-            for obj in temp_scene.objects:
-                obj["_pre_import_marker"] = True
+            # Detect pre-import objects
+            before_objs = set(temp_scene.objects)
 
-            # Import WITHOUT calling view_layer.update() each time
+            # Import USD
             try:
                 bpy.ops.wm.usd_import(filepath=filepath)
             except Exception as e_import:
                 logging.error(f"Error importing {filepath}: {e_import}", exc_info=True)
-                # Clean up markers
-                for obj in temp_scene.objects:
-                    obj.pop("_pre_import_marker", None)
+                # skip to next
                 continue
 
-            # 4) Collect newly created objects: those missing the marker
-            newly_added_raw_objects = [
-                obj for obj in temp_scene.objects
-                if "_pre_import_marker" not in obj
-            ]
+            # Detect newly added objects
+            after_objs = set(temp_scene.objects)
+            new_objs = [o for o in after_objs if o not in before_objs]
 
-            # Remove markers from all
-            for obj in temp_scene.objects:
-                obj.pop("_pre_import_marker", None)
+            if not new_objs:
+                logging.warning(f"No new objects detected in import of {filepath}")
+                # maybe fallback to selected?
+                if context.selected_objects:
+                    new_objs = list(context.selected_objects)
+                else:
+                    continue
 
-            if not newly_added_raw_objects:
-                logging.warning(f"No new objects detected in {filepath}")
-                continue
-
-            # 5) Classify “unique meshes” vs “discards” in one pass
+            # 1) Classify unique meshes vs discards
             unique_meshes = []
             discards = []
             get_base = self._get_conceptual_asset_base_name
-
-            for obj_raw in newly_added_raw_objects:
+            for obj_raw in new_objs:
                 if obj_raw.type != 'MESH':
                     discards.append(obj_raw)
                     continue
-
                 base_name = get_base(obj_raw)
-                if base_name not in processed_bases:
-                    processed_bases.add(base_name)
+                if base_name not in self._processed_conceptual_asset_bases:
+                    self._processed_conceptual_asset_bases.add(base_name)
                     unique_meshes.append(obj_raw)
                 else:
                     discards.append(obj_raw)
 
             if not unique_meshes:
-                # No unique meshes ⇒ discard everything
-                discards = newly_added_raw_objects.copy()
+                # nothing unique; discard all
+                discards = new_objs.copy()
             else:
-                # Also keep any parents of each unique mesh (if they live in the newly‐added set)
-                newly_set = set(newly_added_raw_objects)
+                # keep parents of unique meshes if in new_objs
+                newly_set = set(new_objs)
                 keepers_set = set(unique_meshes)
                 for mesh in unique_meshes:
                     parent = mesh.parent
                     while parent and parent in newly_set:
                         keepers_set.add(parent)
                         parent = parent.parent
-
-                for obj_raw in newly_added_raw_objects:
+                # anything not in keepers_set goes to discards if not already
+                for obj_raw in new_objs:
                     if obj_raw not in keepers_set and obj_raw not in discards:
                         discards.append(obj_raw)
-
                 unique_meshes = list(keepers_set)
 
-            # 6) Material dedupe: “one‐pass” replacement of duplicate materials
+            # 2) Material dedupe on unique_meshes
             mats_before = materials_seen.copy()
             for obj in unique_meshes:
                 for slot in obj.material_slots:
@@ -2109,6 +2123,7 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                         master_mat = data_materials.get(base_mat_name)
                         if master_mat:
                             slot.material = master_mat
+                            # remove old if unused
                             if mat.users == 0:
                                 try:
                                     data_materials.remove(mat, do_unlink=True)
@@ -2118,95 +2133,106 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                         mats_before.add(mat.name)
             materials_seen = mats_before
 
-            # 7) Apply transforms (scale, mirror, flip), collect meshes_for_texture
+            # 3) Apply transforms & collect for texture
             meshes_for_texture = []
-            for keeper_obj in unique_meshes:
-                # Scale (only top‐level objects)
-                if scale_needed and keeper_obj.type in {
-                    'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'
-                }:
-                    if not keeper_obj.parent or keeper_obj.parent not in unique_meshes:
-                        keeper_obj.matrix_world = scale_matrix @ keeper_obj.matrix_world
-
-                # Mirror (only selected meshes)
-                if mirror_flag and keeper_obj.type == 'MESH' and keeper_obj.select_get():
-                    keeper_obj.matrix_world = mirror_matrix @ keeper_obj.matrix_world
-
-                # Flip normals
-                if flip_flag and keeper_obj.type == 'MESH':
-                    mesh_data = keeper_obj.data
+            for keeper in unique_meshes:
+                # scale
+                if scale_needed and keeper.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'}:
+                    if not keeper.parent or keeper.parent not in unique_meshes:
+                        keeper.matrix_world = scale_matrix @ keeper.matrix_world
+                # mirror
+                if mirror_flag and keeper.type == 'MESH' and keeper.select_get():
+                    keeper.matrix_world = mirror_matrix @ keeper.matrix_world
+                # flip normals
+                if flip_flag and keeper.type == 'MESH':
+                    mesh_data = keeper.data
                     if hasattr(mesh_data, "flip_normals"):
                         mesh_data.flip_normals()
+                # mark for texture attach
+                if attach_textures_flag and keeper.type == 'MESH':
+                    meshes_for_texture.append(keeper)
 
-                # Mark for texture attachment
-                if attach_textures_flag and keeper_obj.type == 'MESH':
-                    meshes_for_texture.append(keeper_obj)
+            # 4) Attach textures if requested and blend saved
+            if meshes_for_texture and bpy.data.filepath:
+                try:
+                    attach_original_textures(meshes_for_texture, context, os.path.dirname(filepath))
+                    textures_processed_for_count += len(meshes_for_texture)
+                except Exception as e_tex:
+                    logging.error(f"Error attaching textures for {filepath}: {e_tex}", exc_info=True)
 
-            # 8) Attach textures if requested (ONLY on still‐alive meshes)
-            if meshes_for_texture and is_blend_file_saved():
-                attach_original_textures(meshes_for_texture, context, os.path.dirname(filepath))
-                textures_processed_for_count += len(meshes_for_texture)
-
-            # 9) Delete/discard “discards” if still present
+            # 5) Delete discards
             for obj_del in discards:
                 if obj_del.name in temp_scene.objects:
-                    # Unlink from only those collections that reference it
+                    # unlink from collections
                     for coll in list(obj_del.users_collection):
-                        coll.objects.unlink(obj_del)
+                        try:
+                            coll.objects.unlink(obj_del)
+                        except Exception:
+                            pass
+                    # unlink from scene.collection
                     if obj_del.name in temp_scene.collection.objects:
                         temp_scene.collection.objects.unlink(obj_del)
+                    # remove object data-block
                     data_blk = obj_del.data
-                    data_objects.remove(obj_del, do_unlink=True)
+                    try:
+                        bpy.data.objects.remove(obj_del, do_unlink=True)
+                    except Exception:
+                        pass
+                    # remove mesh data if orphaned
                     if data_blk and data_blk.users == 0:
-                        if isinstance(data_blk, bpy.types.Mesh):
-                            bpy.data.meshes.remove(data_blk)
-                        elif isinstance(data_blk, bpy.types.Curve):
-                            bpy.data.curves.remove(data_blk)
+                        try:
+                            if isinstance(data_blk, bpy.types.Mesh):
+                                bpy.data.meshes.remove(data_blk)
+                            elif isinstance(data_blk, bpy.types.Curve):
+                                bpy.data.curves.remove(data_blk)
+                        except Exception:
+                            pass
 
-            # 10) CRASH‐FIXED FILTER: prune any dead references from unique_meshes
+            # 6) Prune dead references from unique_meshes
             pruned = []
             for o in unique_meshes:
                 try:
-                    nm = o.name
+                    if o.name in temp_scene.objects:
+                        pruned.append(o)
                 except ReferenceError:
                     continue
-                if nm in temp_scene.objects:
-                    pruned.append(o)
-            unique_meshes[:] = pruned
+            unique_meshes = pruned
 
+            # 7) Accumulate keepers
             all_keep_objs.extend(unique_meshes)
 
-        # end for file_elem
-
-        # Restore original scene
-        context.window.scene = original_scene_for_loop
-
-        # 11) FINAL DEDUPLICATION (only still‐alive objects)
-        keepers_by_name = {}
-        all_keep_objs_valid = []
-        for obj in all_keep_objs:
-            if not obj:
-                continue
+            # Update progress
             try:
-                nm = obj.name
-            except ReferenceError:
-                continue
-            if nm in bpy.data.objects and nm not in keepers_by_name:
-                keepers_by_name[nm] = obj
-                all_keep_objs_valid.append(obj)
+                wm.progress_update(idx + 1)
+            except Exception:
+                pass
 
-        all_keep_objs = all_keep_objs_valid
+        # end for files
 
-        # 12) Restore USD importer prefs back to what they were
+        # Restore USD importer prefs
         if usd_importer_addon and original_importer_settings:
             importer_prefs = usd_importer_addon.preferences
             for attr, val in original_importer_settings.items():
                 if hasattr(importer_prefs, attr):
                     try:
                         setattr(importer_prefs, attr, val)
-                    except Exception as e_restore:
-                        logging.warning(f"Could not restore USD importer setting {attr}: {e_restore}")
+                    except Exception:
+                        pass
             logging.debug("USD importer axis settings restored.")
+
+        # Restore scene
+        context.window.scene = original_scene
+
+        # Restore cursor
+        try:
+            win.cursor_set('DEFAULT')
+        except Exception:
+            pass
+        # End progress
+        try:
+            wm.progress_end()
+        except Exception:
+            pass
 
         return all_keep_objs, processed_files_count, textures_processed_for_count
 
