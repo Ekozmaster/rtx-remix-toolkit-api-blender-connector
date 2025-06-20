@@ -3536,13 +3536,19 @@ class OBJECT_OT_export_and_ingest(Operator):
             exported_obj_path = os.path.join(temp_dir, obj_filename)
             self._export_data["temp_files_to_clean"].add(exported_obj_path)
 
+            # This block is now configured to match the old addon's export style.
             bpy.ops.wm.obj_export(
                 filepath=exported_obj_path, check_existing=True,
                 forward_axis=addon_prefs.obj_export_forward_axis, up_axis=addon_prefs.obj_export_up_axis,
                 global_scale=addon_prefs.remix_export_scale, apply_modifiers=addon_prefs.apply_modifiers,
                 export_selected_objects=addon_prefs.remix_use_selection_only,
-                export_materials=True, path_mode='COPY'
+                export_materials=True, 
+                # 1. Set to ABSOLUTE to get full texture paths in the MTL file.
+                path_mode='ABSOLUTE',
+                # 2. Set to True to include PBR keywords (Pm, Pc, map_Pr, etc.).
+                export_pbr_extensions=True
             )
+
             self._export_data["temp_files_to_clean"].add(exported_obj_path.replace('.obj', '.mtl'))
             logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
 
@@ -3553,18 +3559,14 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             final_reference_prim = self._replace_or_append_on_server(context, ingested_usd)
             if not final_reference_prim: raise RuntimeError("Server replace/append operation failed.")
-
-            # --- CRITICAL FIX ---
-            # Pass the _export_data dictionary, which contains the path
-            # to the baked height map, to the handler function.
+        
             handle_height_textures(context, final_reference_prim, export_data=self._export_data)
 
         except Exception as e:
             logging.error(f"Export finalization failed: {e}", exc_info=True)
             self.report({'ERROR'}, f"Finalization failed: {e}")
             self._restore_original_materials()
-
-          
+        
     def _find_udim_source_node_recursive(self, start_socket):
         """
         Recursively traces back from a socket to find the ultimate source node,
