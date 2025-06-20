@@ -2,9 +2,9 @@ bl_info = {
     "name": "Remix Asset Ingestion",
     "blender": (4, 2, 0),
     "category": "Helper",
-    "version": (3, 3, 0),
-    "author": "Frisser :)",
-    "description": "Export mesh assets as OBJ, ingest into Remix with versioning, and handle multiple textures.",
+    "version": (3, 4, 0), # Incremented version
+    "author": "Frisser :) (Integrated Baking by Gemini)",
+    "description": "Export mesh assets as OBJ, with parallel texture baking, ingest into Remix with versioning, and handle multiple textures.",
     "location": "View3D > Remix Ingestor",
     "warning": "",
     "wiki_url": "",
@@ -24,57 +24,66 @@ import logging
 import bmesh
 import collections
 from pxr import Usd, Sdf
-from bpy.props import BoolProperty, StringProperty, CollectionProperty, IntProperty, EnumProperty, FloatProperty
+from bpy.props import BoolProperty, StringProperty, CollectionProperty, IntProperty, EnumProperty, FloatProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
 import bpy_extras.io_utils
 import urllib.parse
 import subprocess
 from pathlib import Path
-from mathutils import Matrix
+from mathutils import Vector, Matrix
 import math
+from threading import Lock
+from datetime import datetime
+from subprocess import Popen, PIPE
+import json
+import sys
+import uuid
+import textwrap
+from queue import Queue, Empty
+from collections import defaultdict
+from bpy.path import abspath
+import traceback
+from collections import defaultdict, deque 
 
-# Initialize global variables
+# --- Globals & Configuration ---
 log_file_path = ""
-export_lock = False
-remix_import_lock = False
+export_lock = Lock() # Use a real lock for thread safety
+remix_import_lock = Lock()
 conversion_count = 0
 is_applying_preset = False
 
-class RemixIngestorPreferences(AddonPreferences):
-    bl_idname = __name__
+# Baking Worker Configuration
+BAKE_WORKER_PY = None 
+MAX_CONCURRENT_BAKE_WORKERS = max(1, os.cpu_count() // 2)
+BAKE_BATCH_SIZE_PER_WORKER = 5
 
+class RemixIngestorPreferences(AddonPreferences):
+    bl_idname = __name__ # <--- THIS IS THE CORRECT LINE
+
+    # --- Global Settings ---
     apply_modifiers: BoolProperty(
         name="Apply Modifiers",
         description="Apply modifiers before exporting OBJ files",
         default=True
     )
-
+    
+    # --- Server Settings ---
     remix_server_url: StringProperty(
         name="Server URL",
         description="URL of the Remix server (e.g., http://localhost:8011/stagecraft).",
         default="http://localhost:8011/stagecraft",
-        subtype='NONE'
+        subtype='NONE' # Use 'NONE' to avoid registration errors
     )
     remix_export_url: StringProperty(
         name="Export API URL",
         description="URL of the Export API (e.g., http://localhost:8011/ingestcraft/mass-validator/queue).",
         default="http://localhost:8011/ingestcraft/mass-validator/queue",
-        subtype='NONE'
+        subtype='NONE' # Use 'NONE' to avoid registration errors
     )
     remix_verify_ssl: BoolProperty(
         name="Verify SSL",
         description="Verify SSL certificates when connecting to the server",
         default=True
-    )
-    remix_use_selection_only: BoolProperty(
-        name="Export Selected Objects Only",
-        description="Export only selected objects",
-        default=False
-    )
-    flip_normals_import: BoolProperty(
-        name="Flip Normals During Import",
-        description="When checked, normals will be flipped during import.",
-        default=False
     )
     remix_ingest_directory: StringProperty(
         name="Ingest Directory",
@@ -82,36 +91,32 @@ class RemixIngestorPreferences(AddonPreferences):
         default="/ProjectFolder/Assets",
         subtype='DIR_PATH'
     )
+
+    # --- Export Settings ---
+    remix_use_selection_only: BoolProperty(
+        name="Export Selected Objects Only",
+        description="Export only selected objects",
+        default=False
+    )
     flip_faces_export: BoolProperty(
         name="Flip Normals During Export",
         description="When checked, normals will be flipped during export.",
         default=False
     )
-    obj_export_forward_axis: EnumProperty(
-        name="Forward Axis",
-        description="Choose the forward axis for OBJ export",
-        items=[
-            ('X', 'X', "Forward along X-axis"),
-            ('NEGATIVE_X', 'Negative X', "Forward along negative X-axis"),
-            ('Y', 'Y', "Forward along Y-axis"),
-            ('NEGATIVE_Y', 'Negative Y', "Forward along negative Y-axis"),
-            ('Z', 'Z', "Forward along Z-axis"),
-            ('NEGATIVE_Z', 'Negative Z', "Forward along negative Z-axis"),
-        ],
-        default='NEGATIVE_Z'
+    remix_use_custom_name: BoolProperty(
+        name="Use Custom Name",
+        description="Use a custom base name for exported OBJ files",
+        default=False
     )
-    obj_export_up_axis: EnumProperty(
-        name="Up Axis",
-        description="Choose the up axis for OBJ export",
-        items=[
-            ('X', 'X', "Up along X-axis"),
-            ('NEGATIVE_X', 'Negative X', "Up along negative X-axis"),
-            ('Y', 'Y', "Up along Y-axis"),
-            ('NEGATIVE_Y', 'Negative Y', "Up along negative Y-axis"),
-            ('Z', 'Z', "Up along Z-axis"),
-            ('NEGATIVE_Z', 'Negative Z', "Up along negative Z-axis"),
-        ],
-        default='Y'
+    remix_base_obj_name: StringProperty(
+        name="Base OBJ Name",
+        description="Base name for the exported OBJ files",
+        default="exported_object"
+    )
+    remix_replace_stock_mesh: BoolProperty(
+        name="Replace Stock Mesh",
+        description="Replace the selected stock mesh in Remix",
+        default=False
     )
     remix_export_scale: FloatProperty(
         name="Export Scale",
@@ -120,20 +125,29 @@ class RemixIngestorPreferences(AddonPreferences):
         min=-10000.0,
         max=10000.0
     )
-    remix_preset: EnumProperty(
-        name="Presets",
-        description="Select preset configurations for export and import settings",
-        items=[
-            ('CUSTOM', "Custom", "Use custom settings"),
-            ('UNREAL_ENGINE', "Unreal Engine", "Apply settings optimized for Unreal Engine")
-        ],
-        default='CUSTOM'
+    obj_export_forward_axis: EnumProperty(
+        name="Forward Axis",
+        description="Choose the forward axis for OBJ export",
+        items=[('X','X',''),('NEGATIVE_X','-X',''),('Y','Y',''),('NEGATIVE_Y','-Y',''),('Z','Z',''),('NEGATIVE_Z','-Z','')],
+        default='NEGATIVE_Z'
     )
-    remix_base_obj_name: StringProperty(
-        name="Base OBJ Name",
-        description="Base name for the exported OBJ files",
-        default="exported_object",
-        subtype='NONE'
+    obj_export_up_axis: EnumProperty(
+        name="Up Axis",
+        description="Choose the up axis for OBJ export",
+        items=[('X','X',''),('Y','Y',''),('NEGATIVE_X','-X',''),('NEGATIVE_Y','-Y',''),('Z','Z',''),('NEGATIVE_Z','-Z','')],
+        default='Y'
+    )
+
+    # --- Import Settings ---
+    flip_normals_import: BoolProperty(
+        name="Flip Normals During Import",
+        description="When checked, normals will be flipped during import.",
+        default=False
+    )
+    mirror_import: BoolProperty(
+        name="Mirror on Import",
+        description="Mirror objects along the X-axis during import",
+        default=False
     )
     remix_import_scale: FloatProperty(
         name="Import Scale",
@@ -147,52 +161,33 @@ class RemixIngestorPreferences(AddonPreferences):
         description="Attach original textures to imported USD meshes",
         default=False
     )
-    remix_use_custom_name: BoolProperty(
-        name="Use Custom Name",
-        description="Use a custom base name for exported OBJ files",
-        default=False
+    usd_import_forward_axis: EnumProperty(
+        name="USD Import Forward Axis",
+        description="Choose the forward axis for USD import",
+        items=[('X','X',''),('Y','Y',''),('Z','Z',''),('NEGATIVE_X','-X',''),('NEGATIVE_Y','-Y',''),('NEGATIVE_Z','-Z','')],
+        default='Y'
     )
-    remix_replace_stock_mesh: BoolProperty(
-        name="Replace Stock Mesh",
-        description="Replace the selected stock mesh in Remix",
-        default=False
+    usd_import_up_axis: EnumProperty(
+        name="USD Up Axis",
+        description="Choose the up axis for USD import",
+        items=[('X','X',''),('Y','Y',''),('Z','Z',''),('-X','-X',''),('-Y','-Y',''),('-Z','-Z','')],
+        default='Z',
+    )
+    
+    # --- Other/UI Settings ---
+    remix_preset: EnumProperty(
+        name="Presets",
+        description="Select preset configurations for export and import settings",
+        items=[('CUSTOM', "Custom", ""), ('UNREAL_ENGINE', "Unreal Engine", "")],
+        default='CUSTOM'
     )
     remix_show_info: BoolProperty(
         name="Show Information",
         description="Show additional information in the panel",
         default=False
     )
-    mirror_import: BoolProperty(
-        name="Mirror on Import",
-        description="Mirror objects along the X-axis during import",
-        default=False
-    )
 
-    # CORRECTED: Default value for usd_import_up_axis changed to 'Z' to have a valid default pair.
-    # A common setup is Z-Up, Y-Forward.
-    usd_import_forward_axis: EnumProperty( # New Property
-        name="USD Import Forward Axis",
-        description="Choose the forward axis for USD import. This tells Blender how to interpret the source USD's forward direction.",
-        items=[
-            ('X', 'X Positive', "Interpret source Forward as X Positive"),
-            ('Y', 'Y Positive', "Interpret source Forward as Y Positive"),
-            ('Z', 'Z Positive', "Interpret source Forward as Z Positive"),
-            ('NEGATIVE_X', 'X Negative', "Interpret source Forward as X Negative"),
-            ('NEGATIVE_Y', 'Y Negative', "Interpret source Forward as Y Negative"),
-            ('NEGATIVE_Z', 'Z Negative', "Interpret source Forward as Z Negative"),
-        ],
-        default='Y' 
-    )
-    usd_import_up_axis: EnumProperty(
-        name="USD Up Axis",
-        description="Choose the up axis for USD import. This tells Blender how to interpret the source USD's up direction.",
-        items=[('X','X Positive',''),('Y','Y Positive',''),('Z','Z Positive',''),('-X','X Negative',''),('-Y','Y Negative',''),('-Z','Z Negative','')],
-        default='Z', # CORRECTED: Changed default from 'Y' to 'Z'
-    )
-
-    # ------------------------------------------------------------------
-    # Added for Substance-Painter workflow
-    # ------------------------------------------------------------------
+    # --- Substance Painter Settings ---
     spp_exe: StringProperty(
         name="Substance Painter Executable Path",
         subtype='FILE_PATH',
@@ -207,69 +202,27 @@ class RemixIngestorPreferences(AddonPreferences):
     def draw(self, context):
         layout = self.layout
         layout.label(text="Global Preferences:")
-        layout.prop(self, "apply_modifiers", text="Apply Modifiers")
+        # You can add any settings you want to appear in the main Add-on Preferences window here.
+        layout.prop(self, "apply_modifiers")
+        layout.prop(self, "remix_server_url")
+        layout.prop(self, "remix_export_url")
+        layout.prop(self, "spp_exe")
+        layout.prop(self, "export_folder")
 
 class AssetNumberItem(PropertyGroup):
     blend_name: StringProperty(name="Blend File Name")
     asset_number: IntProperty(name="Asset Number", default=1)
 
-
 class CustomSettingsBackup(PropertyGroup):
-    obj_export_forward_axis: EnumProperty(
-        name="Forward Axis",
-        items=[
-            ('X', 'X', "Forward along X-axis"),
-            ('NEGATIVE_X', 'Negative X', "Forward along negative X-axis"),
-            ('Y', 'Y', "Forward along Y-axis"),
-            ('NEGATIVE_Y', 'Negative Y', "Forward along negative Y-axis"),
-            ('Z', 'Z', "Forward along Z-axis"),
-            ('NEGATIVE_Z', 'Negative Z', "Forward along negative Z-axis"),
-        ],
-        default='NEGATIVE_Z',
-    )
-    obj_export_up_axis: EnumProperty(
-        name="Up Axis",
-        items=[
-            ('X', 'X', "Up along X-axis"),
-            ('NEGATIVE_X', 'Negative X', "Up along negative X-axis"),
-            ('Y', 'Y', "Up along Y-axis"),
-            ('NEGATIVE_Y', 'Negative Y', "Up along negative Y-axis"),
-            ('Z', 'Z', "Up along Z-axis"),
-            ('NEGATIVE_Z', 'Negative Z', "Up along negative Z-axis"),
-        ],
-        default='Y',
-    )
-    flip_faces_export: BoolProperty(
-        name="Flip Normals During Export",
-        default=False,
-    )
-    mirror_import: BoolProperty(
-        name="Mirror on Import",
-        default=False,
-    )
-    remix_export_scale: FloatProperty(
-        name="Export Scale",
-        default=1.0,
-        min=-10000.0,
-        max=10000.0
-    )
-    remix_use_selection_only: BoolProperty(
-        name="Export Selected Objects Only",
-        default=False,
-    )
-    remix_ingest_directory: StringProperty(
-        name="Ingest Directory",
-        default="/ProjectFolder/Assets",
-        subtype='DIR_PATH'
-    )
-    remix_verify_ssl: BoolProperty(
-        name="Verify SSL",
-        default=True
-    )
-    remix_import_original_textures: BoolProperty(
-        name="Import Original Textures",
-        default=False
-    )
+    obj_export_forward_axis: StringProperty()
+    obj_export_up_axis: StringProperty()
+    flip_faces_export: BoolProperty()
+    mirror_import: BoolProperty()
+    remix_export_scale: FloatProperty()
+    remix_use_selection_only: BoolProperty()
+    remix_ingest_directory: StringProperty()
+    remix_verify_ssl: BoolProperty()
+    remix_import_original_textures: BoolProperty()
 
 
 def setup_logger():
@@ -304,12 +257,444 @@ def setup_logger():
 def is_blend_file_saved():
     return bool(bpy.data.filepath)
 
+def convert_exr_textures_to_png(context):
+    global conversion_count
+    try:
+        bpy.ops.file.unpack_all(method="USE_LOCAL")
+        logging.info("Starting conversion of EXR textures to PNG.")
+        node_trees = list(bpy.data.node_groups) + \
+                     [mat.node_tree for mat in bpy.data.materials if mat.use_nodes] + \
+                     [scene.node_tree for scene in bpy.data.scenes if scene.use_nodes]
+
+        replaced_textures = []
+        conversion_count = 0
+
+        for node_tree in node_trees:
+            success, textures = process_nodes_recursively(node_tree.nodes, node_tree)
+            if not success:
+                return False, []
+            replaced_textures.extend(textures)
+
+        logging.info(f"Converted {conversion_count} EXR textures to PNG.")
+        return True, replaced_textures
+
+    except Exception as e:
+        logging.error(f"Error during EXR to PNG conversion: {e}")
+        return False, []
+    
+def process_nodes_recursively(nodes, node_tree):
+    global conversion_count
+    replaced_textures = []
+    try:
+        for node in nodes:
+            if node.type == 'GROUP' and node.node_tree:
+                success, textures = process_nodes_recursively(node.node_tree.nodes, node.node_tree)
+                if not success:
+                    return False, []
+                replaced_textures.extend(textures)
+            elif node.type == 'TEX_IMAGE' and node.image and node.image.source == 'FILE':
+                ext = os.path.splitext(node.image.filepath)[1].lower()
+                if ext in ['.exr', '.exr_multi_layer']:
+                    exr_path = bpy.path.abspath(node.image.filepath)
+                    if not os.path.exists(exr_path):
+                        logging.warning(f"EXR file does not exist: {exr_path}")
+                        continue
+
+                    png_path = os.path.splitext(exr_path)[0] + ".png"
+                    if os.path.exists(png_path):
+                        logging.warning(f"PNG already exists and will be overwritten: {png_path}")
+
+                    image = node.image
+                    image.reload()
+                    new_image = bpy.data.images.new(name=os.path.basename(png_path), width=image.size[0], height=image.size[1], alpha=(image.channels == 4))
+                    new_image.pixels = image.pixels[:]
+                    new_image.file_format = 'PNG'
+                    new_image.filepath_raw = png_path
+                    new_image.save()
+
+                    node.image = new_image
+                    os.remove(exr_path)
+                    conversion_count += 1
+
+                    material_name = get_material_name_from_node_tree(node_tree)
+                    if material_name:
+                        replaced_textures.append((material_name, exr_path, png_path))
+        return True, replaced_textures
+    except Exception as e:
+        logging.error(f"Error during node processing: {e}")
+        return False, []
+
+def get_material_name_from_node_tree(node_tree):
+    for mat in bpy.data.materials:
+        if mat.node_tree == node_tree:
+            return mat.name
+    return None
+
+def check_and_report_gpu_settings(context):
+    """
+    Checks Cycles preferences for available backends and device status.
+    Returns a formatted string for display.
+    """
+    report_lines = ["--- GPU Compute Settings ---"]
+    prefs = context.preferences
+    cycles_prefs_addon = prefs.addons.get('cycles')
+
+    if not cycles_prefs_addon:
+        report_lines.append("Cycles render addon is not enabled.")
+        return "\n".join(report_lines)
+
+    cycles_prefs = cycles_prefs_addon.preferences
+    
+    # Get all possible backend APIs available in this Blender build
+    # This function call IS correct and requires the context.
+    available_backends = cycles_prefs.get_device_types(context)
+    backend_names = [backend[1] for backend in available_backends]
+    report_lines.append(f"Available Backends: {', '.join(backend_names) if backend_names else 'None'}")
+    
+    # Get the currently selected backend
+    current_backend = cycles_prefs.compute_device_type
+    report_lines.append(f"Active Backend: {current_backend}")
+    report_lines.append("-" * 20)
+
+    # Get devices for the active backend
+    try:
+        # THIS IS THE CORRECTED LINE: The 'context' argument has been removed.
+        devices = cycles_prefs.get_devices_for_type(current_backend)
+        
+        if not devices:
+            report_lines.append(f"No {current_backend} devices found.")
+        else:
+            report_lines.append(f"Detected {current_backend} Devices:")
+            for device in devices:
+                status = "ENABLED" if device.use else "DISABLED"
+                device_info = f"  - {device.name} ({device.type}): {status}"
+                report_lines.append(device_info)
+    except Exception as e:
+        report_lines.append(f"Could not query devices for {current_backend}: {e}")
+
+    return "\n".join(report_lines)
+
+class SYSTEM_OT_show_gpu_report(bpy.types.Operator):
+    """Shows a popup with the GPU settings report."""
+    bl_idname = "system.show_gpu_report"
+    bl_label = "GPU Settings Report"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    report_message: bpy.props.StringProperty(
+        name="Report Message",
+        description="The report message to display",
+        default="No report generated."
+    )
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=450)
+
+    def draw(self, context):
+        layout = self.layout
+        # Use a box for better visual separation
+        box = layout.box()
+        # Split the message into lines and draw each as a label
+        for line in self.report_message.split('\n'):
+            box.label(text=line)
+
+
+class SYSTEM_OT_check_gpu_settings(bpy.types.Operator):
+    """Checks GPU settings and displays them in a popup dialog."""
+    bl_idname = "system.check_gpu_settings"
+    bl_label = "Check GPU Settings"
+    bl_description = "Check available and active GPU rendering devices for Cycles"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Generate the report string
+        report = check_and_report_gpu_settings(context)
+        
+        # Log the full report to the system console for debugging
+        print("\n" + report + "\n")
+
+        # Call the popup operator to display the report to the user
+        bpy.ops.system.show_gpu_report('INVOKE_DEFAULT', report_message=report)
+        
+        return {'FINISHED'}
+
+def _get_base_name_and_suffix_parts(obj_name):
+    # Pattern 1: Handles "name_S1.S2" (e.g., inst_62EC3A6022F09C50_0.001)
+    match_custom_extended = re.fullmatch(r'(.+?)_(\d+)\.(\d+)$', obj_name)
+    if match_custom_extended:
+        base, p1_str, p2_str = match_custom_extended.groups()
+        try:
+            return base, (int(p1_str), int(p2_str))
+        except ValueError:
+            pass 
+
+    # Pattern 2: Handles "name.S2" (e.g., inst_Cool.001)
+    match_blender_suffix = re.fullmatch(r'(.+?)\.(\d+)$', obj_name)
+    if match_blender_suffix:
+        base, num_str = match_blender_suffix.groups()
+        try:
+            return base, (int(num_str),)
+        except ValueError:
+            pass
+
+    # Pattern 3: Handles "name_S1" (e.g., inst_62EC3A6022F09C50_0)
+    match_custom_simple = re.fullmatch(r'(.+?)_(\d+)$', obj_name)
+    if match_custom_simple:
+        base, p1_str = match_custom_simple.groups()
+        try:
+            return base, (int(p1_str),)
+        except ValueError:
+            pass
+    
+    return obj_name, None
+
+
+def _perform_duplicate_cleanup_phase_module(context, scene_to_clean):
+    logging.info(f"Starting combined cleanup in scene: '{scene_to_clean.name}'")
+
+    deleted_objects_count_inst = 0 
+    deleted_objects_mesh_pattern = 0 
+
+    original_window_scene = context.window.scene
+    original_active_object_in_original_scene = context.active_object 
+    original_selected_objects_in_original_scene = list(context.selected_objects)
+
+    original_mode = 'OBJECT' 
+    if original_window_scene == context.scene: 
+        if context.object and hasattr(context.object, 'mode'):
+            original_mode = context.object.mode 
+        elif context.mode: 
+            original_mode = context.mode
+
+    try: 
+        if context.window.scene != scene_to_clean:
+            context.window.scene = scene_to_clean
+            logging.debug(f"Cleanup phase: Switched active window scene to '{scene_to_clean.name}'.")
+
+        if context.mode != 'OBJECT':
+            active_obj_for_mode_set = context.view_layer.objects.active 
+            if not active_obj_for_mode_set and scene_to_clean.objects:
+                candidate_active = next((obj for obj in scene_to_clean.objects if obj.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE'}), None)
+                if candidate_active and candidate_active.name in context.view_layer.objects: 
+                    context.view_layer.objects.active = candidate_active
+            
+            if bpy.ops.object.mode_set.poll(): 
+                try: 
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    logging.debug(f"Cleanup phase: Switched to OBJECT mode in '{scene_to_clean.name}'.")
+                except RuntimeError as e: 
+                    logging.warning(f"Cleanup phase: Could not set OBJECT mode in '{scene_to_clean.name}': {e}")
+            else:
+                logging.warning(f"Cleanup phase: Cannot poll bpy.ops.object.mode_set to OBJECT in '{scene_to_clean.name}'. Mode remains {context.mode}.")
+    
+        logging.info(f"Starting 'inst_' object cleanup in '{scene_to_clean.name}'.")
+        if bpy.ops.object.select_all.poll():
+            bpy.ops.object.select_all(action='DESELECT')
+
+        objects_to_delete_inst_collector = [] 
+        objects_to_keep_inst_collector = []    
+
+        grouped_by_base_inst = collections.defaultdict(list)
+        prefix_to_scan_inst = "inst_"
+        all_inst_objects_in_scene = [obj for obj in scene_to_clean.objects if obj.name.startswith(prefix_to_scan_inst)]
+
+        for obj_inst in all_inst_objects_in_scene: 
+            base_name_part, suffix_key_part = _get_base_name_and_suffix_parts(obj_inst.name)
+            # logging.debug(f"Parsing inst_ name: '{obj_inst.name}' -> base: '{base_name_part}', suffix_key: {suffix_key_part}") # Reduced verbosity
+            grouped_by_base_inst[base_name_part].append({
+                'obj': obj_inst, 
+                'name': obj_inst.name, 
+                'suffix_key': suffix_key_part
+            })
+
+        for base_name_part, obj_infos_list in grouped_by_base_inst.items():
+            plain_originals = [info for info in obj_infos_list if info['suffix_key'] is None]
+            suffixed_duplicates = [info for info in obj_infos_list if info['suffix_key'] is not None]
+        
+            object_to_keep_info_dict = None 
+            current_group_objects_to_delete = [] 
+
+            if plain_originals:
+                plain_originals.sort(key=lambda x: x['name']) 
+                object_to_keep_info_dict = plain_originals[0] 
+                current_group_objects_to_delete.extend(p_info['obj'] for p_info in plain_originals[1:])
+                current_group_objects_to_delete.extend(s_info['obj'] for s_info in suffixed_duplicates)
+            elif suffixed_duplicates: 
+                suffixed_duplicates.sort(key=lambda x: (x['suffix_key'], x['name'])) # type: ignore
+                object_to_keep_info_dict = suffixed_duplicates[0] 
+                current_group_objects_to_delete.extend(s_info['obj'] for s_info in suffixed_duplicates[1:])
+            else: 
+                if obj_infos_list: 
+                        logging.warning(f"'inst_' cleanup for base '{base_name_part}': Group with {len(obj_infos_list)} items had no plain or suffixed. Fallback: keep first by name.")
+                        if len(obj_infos_list) > 0: 
+                            obj_infos_list.sort(key=lambda x: x['name'])
+                            object_to_keep_info_dict = obj_infos_list[0]
+                            current_group_objects_to_delete.extend(info['obj'] for info in obj_infos_list[1:])
+
+            if object_to_keep_info_dict:
+                objects_to_keep_inst_collector.append(object_to_keep_info_dict['obj'])
+                # logging.debug(f"'inst_' cleanup for base '{base_name_part}': Keeping '{object_to_keep_info_dict['name']}'...") # Reduced verbosity
+            # else: # Reduced verbosity
+                # logging.debug(f"'inst_' cleanup for base '{base_name_part}': No object chosen to keep...")
+            objects_to_delete_inst_collector.extend(current_group_objects_to_delete)
+
+        kept_inst_objects_set = set(objects_to_keep_inst_collector) 
+        unique_objects_to_delete_inst_final = list(set(
+            obj for obj in objects_to_delete_inst_collector 
+            if obj and obj.name in scene_to_clean.objects and obj not in kept_inst_objects_set 
+        ))
+    
+        if unique_objects_to_delete_inst_final:
+            logging.info(f"'inst_' cleanup: Identified {len(unique_objects_to_delete_inst_final)} unique 'inst_' objects for deletion.")
+            if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+            active_obj_inst_del = context.view_layer.objects.active
+            active_obj_inst_del_cleared = False
+            if active_obj_inst_del and active_obj_inst_del in unique_objects_to_delete_inst_final:
+                context.view_layer.objects.active = None
+                active_obj_inst_del_cleared = True
+
+            selected_for_deletion_count = 0
+            for obj_to_del in unique_objects_to_delete_inst_final: 
+                if obj_to_del.name in context.view_layer.objects : 
+                    try:
+                        obj_to_del.select_set(True); selected_for_deletion_count +=1
+                    except RuntimeError as e_select: logging.warning(f"Could not select '{obj_to_del.name}' for inst_ deletion: {e_select}")
+                else: logging.warning(f"'{obj_to_del.name}' for inst_ deletion not in view layer.")
+        
+            if selected_for_deletion_count > 0: 
+                bpy.ops.object.delete(); deleted_objects_count_inst = selected_for_deletion_count 
+                logging.info(f"'inst_' cleanup: Batch deleted {deleted_objects_count_inst} objects.")
+            else: logging.info("'inst_' cleanup: No 'inst_' objects ultimately selected for deletion.")
+        
+            if active_obj_inst_del_cleared: 
+                if active_obj_inst_del and (active_obj_inst_del.name not in scene_to_clean.objects): 
+                    if scene_to_clean.objects: 
+                        new_active_candidate = next((obj for obj in scene_to_clean.objects if obj.type in {'MESH', 'EMPTY', 'ARMATURE'}), None)
+                        if new_active_candidate and new_active_candidate.name in context.view_layer.objects:
+                                context.view_layer.objects.active = new_active_candidate
+                elif active_obj_inst_del and active_obj_inst_del.name in scene_to_clean.objects: 
+                    if active_obj_inst_del.name in context.view_layer.objects :
+                        context.view_layer.objects.active = active_obj_inst_del
+        else: logging.info("'inst_' cleanup: No 'inst_' objects scheduled for deletion.")
+
+        final_kept_inst_objects_set = { obj for obj in objects_to_keep_inst_collector if obj.name in scene_to_clean.objects }
+        logging.info(f"After 'inst_' cleanup, {len(final_kept_inst_objects_set)} 'inst_' objects remain for mesh.#### cleanup reference.")
+    
+        logging.info(f"Starting 'mesh.####' OBJECT cleanup in scene: '{scene_to_clean.name}'.")
+        objects_to_delete_mesh_pattern_collector = []
+        if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+
+        all_mesh_dot_pattern_objects_in_scene = [ obj for obj in scene_to_clean.objects if obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", obj.name) ]
+
+        if all_mesh_dot_pattern_objects_in_scene:
+            for mesh_obj in all_mesh_dot_pattern_objects_in_scene:
+                is_used_or_parented_safely = False
+                if mesh_obj.parent and mesh_obj.parent in final_kept_inst_objects_set:
+                    is_used_or_parented_safely = True; # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: parent is kept inst.")
+                if not is_used_or_parented_safely:
+                    for inst_obj in final_kept_inst_objects_set: 
+                        if inst_obj.type == 'EMPTY': 
+                            if inst_obj.instance_type == 'OBJECT' and inst_obj.instance_object == mesh_obj: is_used_or_parented_safely = True; break
+                            if inst_obj.instance_type == 'COLLECTION' and inst_obj.instance_collection and mesh_obj.name in inst_obj.instance_collection.all_objects: is_used_or_parented_safely = True; break
+                if not is_used_or_parented_safely and mesh_obj.parent:
+                    parent_obj = mesh_obj.parent
+                    if parent_obj.name in scene_to_clean.objects: 
+                        is_parent_kept_inst = parent_obj in final_kept_inst_objects_set
+                        is_parent_mesh_dot = parent_obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", parent_obj.name)
+                        if not is_parent_kept_inst and not is_parent_mesh_dot: is_used_or_parented_safely = True; # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: parent is regular.")
+                if not is_used_or_parented_safely and mesh_obj.data and mesh_obj.data.users > 1:
+                    for user_obj in scene_to_clean.objects: 
+                        if user_obj.data == mesh_obj.data and user_obj != mesh_obj:
+                            is_user_kept_inst = user_obj in final_kept_inst_objects_set
+                            is_user_mesh_dot = user_obj.type == 'MESH' and re.fullmatch(r"mesh\.(\d+)", user_obj.name)
+                            is_user_deleted_inst = user_obj.name.startswith(prefix_to_scan_inst) and not is_user_kept_inst
+                            if not is_user_mesh_dot and not is_user_deleted_inst : is_used_or_parented_safely = True; break # logging.debug(f"Mesh '{mesh_obj.name}' KEPT: data used by other significant obj.")
+                if not is_used_or_parented_safely:
+                    is_in_root = scene_to_clean.collection and mesh_obj.name in scene_to_clean.collection.objects
+                    if mesh_obj.parent is None and (is_in_root or not any(coll == scene_to_clean.collection for coll in mesh_obj.users_collection)): # If unparented & in root, or unparented & not in any other meaningful collection part of main scene structure (heuristic)
+                        objects_to_delete_mesh_pattern_collector.append(mesh_obj) # logging.info(f"Unused 'mesh.####' object '{mesh_obj.name}' scheduled for deletion.")
+
+            if objects_to_delete_mesh_pattern_collector:
+                unique_objects_to_delete_mesh_final = list(set( obj for obj in objects_to_delete_mesh_pattern_collector if obj and obj.name in scene_to_clean.objects ))
+                if unique_objects_to_delete_mesh_final:
+                    logging.info(f"'mesh.####' cleanup: Identified {len(unique_objects_to_delete_mesh_final)} objects for deletion.")
+                    if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+                    active_obj_mesh_del = context.view_layer.objects.active; active_obj_mesh_del_cleared = False
+                    if active_obj_mesh_del and active_obj_mesh_del in unique_objects_to_delete_mesh_final: context.view_layer.objects.active = None; active_obj_mesh_del_cleared = True
+                    
+                    selected_for_mesh_del_count = 0
+                    for obj_to_del in unique_objects_to_delete_mesh_final:
+                        if obj_to_del.name in context.view_layer.objects: obj_to_del.select_set(True); selected_for_mesh_del_count +=1
+                        else: logging.warning(f"'{obj_to_del.name}' for mesh.#### deletion not in view layer.")
+                    
+                    if selected_for_mesh_del_count > 0 and context.selected_objects: 
+                        bpy.ops.object.delete(); deleted_objects_mesh_pattern = selected_for_mesh_del_count
+                        logging.info(f"'mesh.####' cleanup: Batch deleted {deleted_objects_mesh_pattern} objects.")
+                        if active_obj_mesh_del_cleared: 
+                            if active_obj_mesh_del and (active_obj_mesh_del.name not in scene_to_clean.objects): 
+                                if scene_to_clean.objects: 
+                                    new_active = next((o for o in scene_to_clean.objects if o.type in {'MESH', 'EMPTY'}), None)
+                                    if new_active and new_active.name in context.view_layer.objects: context.view_layer.objects.active = new_active
+                            elif active_obj_mesh_del and active_obj_mesh_del.name in scene_to_clean.objects and active_obj_mesh_del.name in context.view_layer.objects:
+                                context.view_layer.objects.active = active_obj_mesh_del
+                    else: logging.info("'mesh.####' cleanup: No objects ultimately selected for deletion.")
+                else: logging.info("'mesh.####' cleanup: No objects for deletion after filtering.")
+            else: logging.info("'mesh.####' cleanup: No candidates initially identified.")
+
+    except Exception as e_cleanup_main: 
+        logging.error(f"Error during main cleanup phase in '{scene_to_clean.name}': {e_cleanup_main}", exc_info=True)
+    finally: 
+        current_scene_name_at_finally = context.window.scene.name
+        if context.window.scene != original_window_scene: context.window.scene = original_window_scene; # logging.debug(f"Cleanup: Restored window scene to '{original_window_scene.name}'.")
+        if bpy.ops.object.select_all.poll(): bpy.ops.object.select_all(action='DESELECT')
+        for obj_ref in original_selected_objects_in_original_scene: 
+            if obj_ref and obj_ref.name in original_window_scene.objects: 
+                s_obj = original_window_scene.objects.get(obj_ref.name)
+                if s_obj and s_obj.name in context.view_layer.objects: 
+                    try: s_obj.select_set(True)
+                    except RuntimeError: pass
+        o_active_name = original_active_object_in_original_scene.name if original_active_object_in_original_scene else None
+        if o_active_name and o_active_name in original_window_scene.objects:
+            s_active = original_window_scene.objects.get(o_active_name)
+            if s_active and s_active.name in context.view_layer.objects: 
+                try: context.view_layer.objects.active = s_active
+                except Exception: pass
+        elif context.view_layer.objects.active is not None: context.view_layer.objects.active = None 
+        
+        final_mode = context.mode 
+        if final_mode != original_mode:
+            can_set_orig = (original_mode == 'OBJECT') or (context.view_layer.objects.active is not None) 
+            if can_set_orig and bpy.ops.object.mode_set.poll():
+                try: bpy.ops.object.mode_set(mode=original_mode)
+                except RuntimeError : pass # logging.warning(f"Cleanup (finally): Could not restore mode to '{original_mode}'.")
+
+    logging.info(f"Finished cleanup for scene '{scene_to_clean.name}'. Deleted {deleted_objects_count_inst} 'inst_', {deleted_objects_mesh_pattern} 'mesh.####'.")
+    return {'deleted_objects_inst': deleted_objects_count_inst, 'deleted_objects_mesh_pattern': deleted_objects_mesh_pattern}
+
+def copy_exported_files(obj_path, mtl_path, destination):
+    try:
+        os.makedirs(destination, exist_ok=True)
+        shutil.copy2(obj_path, destination)
+        if os.path.exists(mtl_path):
+            shutil.copy2(mtl_path, destination)
+        else:
+            logging.warning(f"MTL file does not exist: {mtl_path}")
+            return False
+        logging.info(f"Copied exported files to {destination}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to copy exported files: {e}")
+        return False
 
 def make_request_with_retries(method, url, headers=None, json_payload=None, retries=3, delay=5, **kwargs):
+    last_response = None
     for attempt in range(1, retries + 1):
         try:
             logging.debug(f"Attempt {attempt}: {method} {url}")
             response = requests.request(method, url, headers=headers, json=json_payload, timeout=60, **kwargs)
+            last_response = response
             logging.debug(f"Response: {response.status_code} - {response.text}")
             if response.status_code in [200, 201, 204]:
                 return response
@@ -317,11 +702,14 @@ def make_request_with_retries(method, url, headers=None, json_payload=None, retr
                 logging.warning(f"Attempt {attempt} failed with status {response.status_code}")
         except requests.exceptions.RequestException as e:
             logging.warning(f"Attempt {attempt} encountered exception: {e}")
-        if attempt < retries:
-            time.sleep(delay)
-    logging.error(f"All {retries} attempts failed for {method} {url}")
-    return None
+            # For network errors, last_response remains None or the last http error response
+    
+    if last_response is not None:
+         logging.error(f"All {retries} attempts failed for {method} {url}. Last status: {last_response.status_code}")
+    else:
+         logging.error(f"All {retries} attempts failed for {method} {url}. No response from server (network error).")
 
+    return last_response # Return the last response object, even if it's an error
 
 def verify_texture_files_exist(context):
     return True, []
@@ -465,89 +853,62 @@ def flip_normals_api(obj):
         print(f"Error flipping normals for object '{obj.name}': {e}")
         
 def fetch_selected_mesh_prim_paths():
+    """
+    Fetches the list of currently-selected mesh prim paths from the Remix server.
+    Returns a list of paths (each with a single leading slash) under "/meshes/".
+    Falls back to a default server URL if addon preferences are unavailable.
+    """
     try:
-        # Ensure addon_prefs are fetched correctly if needed, or pass context
-        # For simplicity here, assuming addon_prefs can be accessed or are passed if this were a class method
-        # If this is a global function, it might need context passed to get addon_prefs.
-        # For now, let's assume the URL is constructed directly as per its original likely intent.
-        # This might need access to `addon_prefs.remix_server_url` and `addon_prefs.remix_verify_ssl`
-        # For a standalone function, these would need to be passed or accessed via context.
-        # I'll replicate the direct URL construction for now, but this is a point of attention for context.
-        
-        # To make this function testable and robust, it should ideally take context
-        # and get preferences from there.
-        # However, sticking to minimal changes to fix the immediate issue:
-        
-        # Placeholder for addon_prefs - IN A REAL SCENARIO, THIS NEEDS PROPER ACCESS VIA CONTEXT
-        class MockAddonPrefs:
-            def __init__(self):
-                self.remix_server_url = "http://localhost:8011/stagecraft" # Default or fetched
-                self.remix_verify_ssl = True # Default or fetched
-
-        # If context is available:
-        # addon_prefs = context.preferences.addons[__name__].preferences
-        # url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
-        # verify_ssl = addon_prefs.remix_verify_ssl
-
-        # Using placeholder for now based on common usage in the script
-        # THIS IS A SIMPLIFICATION FOR THE SAKE OF THE EXAMPLE CORRECTION.
-        # THE ORIGINAL FUNCTION MIGHT HAVE HAD A WAY TO GET ADDON_PREFS.
-        # If it's called from an operator, `context.preferences.addons[__name__].preferences` is the way.
-        
-        # Assuming this function is called from within an operator method where 'context' is available
-        # If not, it needs 'context' as an argument. For this example, I'll assume it can get prefs.
-        # This part is tricky as the original function signature wasn't shown in the error snippet.
-        # Let's assume it's called from a context where addon_prefs are accessible like others.
-        # This typically means it's a method of a class that has self.report, or context is passed.
-        # Given its usage, it's likely called from an Operator.
-
-        # --- THIS IS A GUESS - THE FUNCTION NEEDS CONTEXT TO GET PREFERENCES ---
-        # Fallback to a hardcoded URL if context isn't available, which is not ideal
-        # but shows the core fix. A better solution involves passing context.
+        # Default in case preferences aren't accessible
         server_url_base = "http://localhost:8011/stagecraft"
         verify_ssl_cert = True
-        
-        # Attempt to get preferences if context is available in the scope this function is called from
-        # This is a common pattern in Blender addons.
+
+        # Attempt to read the user’s configured server URL and SSL setting
         try:
-            context = bpy.context # Try to get global context if available
+            context = bpy.context
             addon_prefs = context.preferences.addons[__name__].preferences
             server_url_base = addon_prefs.remix_server_url.rstrip('/')
             verify_ssl_cert = addon_prefs.remix_verify_ssl
             url = f"{server_url_base}/assets/?selection=true&filter_session_assets=false&exists=true"
-             # Consider if filter_session_assets should be filter_session_prims
         except (AttributeError, KeyError):
-            logging.warning("fetch_selected_mesh_prim_paths: Could not get addon_prefs from context. Using default URL.")
-            url = "http://localhost:8011/stagecraft/assets/?selection=true&filter_session_assets=false&exists=true"
-            # url = "http://localhost:8011/stagecraft/assets/?selection=true&filter_session_prims=false&exists=true" # Potential change
-        # --- END GUESS ---
+            logging.warning(
+                "fetch_selected_mesh_prim_paths: Could not get addon_prefs from context. Using default URL."
+            )
+            url = f"{server_url_base}/assets/?selection=true&filter_session_assets=false&exists=true"
 
         headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
-        response = make_request_with_retries(
-            'GET',
-            url,
-            headers=headers,
-            verify=verify_ssl_cert # Use fetched or default
-        )
+        response = make_request_with_retries('GET', url, headers=headers, verify=verify_ssl_cert)
+
         if not response or response.status_code != 200:
-            logging.error(f"Failed to fetch selected mesh prim paths. Status: {response.status_code if response else 'No Response'}")
-            # print("Failed to fetch selected mesh prim paths.") # Covered by logging
+            logging.error(
+                f"Failed to fetch selected mesh prim paths. Status: "
+                f"{response.status_code if response else 'No Response'}"
+            )
             return []
 
         data = response.json()
-        # CORRECTED: Look for "prim_paths", fallback to "asset_paths"
+
+        # First, look for the modern "prim_paths" key; fall back to "asset_paths"
         asset_or_prim_paths = data.get("prim_paths")
-        if asset_or_prim_paths is None: # Check if key exists, even if list is empty
-            logging.warning("fetch_selected_mesh_prim_paths: Key 'prim_paths' not found in server response, trying 'asset_paths' as fallback.")
+        if asset_or_prim_paths is None:
+            logging.warning(
+                "fetch_selected_mesh_prim_paths: Key 'prim_paths' not found in server response, "
+                "trying 'asset_paths' as fallback."
+            )
             asset_or_prim_paths = data.get("asset_paths", [])
-        
-        selected_meshes = [path for path in asset_or_prim_paths if "/meshes/" in path.lower()]
+
+        # Filter to only those under "/meshes/"
+        selected_meshes = [
+            path for path in asset_or_prim_paths
+            if "/meshes/" in path.lower()
+        ]
+
         logging.info(f"Selected mesh prim paths: {selected_meshes}")
-        # print(f"Selected mesh prim paths: {selected_meshes}") # Covered by logging
+        # Ensure each has exactly one leading slash and no trailing slash
         return [ensure_single_leading_slash(p.rstrip('/')) for p in selected_meshes]
+
     except Exception as e:
         logging.error(f"Error fetching selected mesh prim paths: {e}", exc_info=True)
-        # print(f"Error fetching selected mesh prim paths: {e}") # Covered by logging
         return []
         
 def attach_original_textures(imported_objects, context, base_dir):
@@ -837,228 +1198,232 @@ def blender_mat_to_remix(mat_name):
     """
     return mat_name.replace(" ", "_").replace(".", "_")
     
-def handle_height_textures(context, reference_prim, exported_objects=None):
+def collect_bake_tasks(context, mesh_objects):
+    """
+    Analyzes materials to generate a list of required bake tasks.
+    This is now the single source of truth for what needs baking.
+    It returns tasks for procedural textures AND identifies the final height map path.
+    """
+    tasks = []
+    material_map = {}
+    height_map_info = {} # NEW: {mat_name: path_to_height_map}
+    unique_mats_processed = set()
+    
+    if not is_blend_file_saved():
+        raise RuntimeError("Blend file must be saved to create a bake directory.")
+        
+    blend_fp = abspath(bpy.data.filepath)
+    bake_dir = os.path.join(os.path.dirname(blend_fp), "remix_baked_textures")
+    
+    if os.path.isdir(bake_dir):
+        shutil.rmtree(bake_dir, ignore_errors=True)
+    os.makedirs(bake_dir, exist_ok=True)
+
+    def _find_ultimate_source_node(inp):
+        """
+        Robustly traces back through node groups and reroutes to find the true source.
+        Returns the source node and a boolean indicating if the path was complex.
+        """
+        if not inp.is_linked:
+            return None, False
+
+        link = inp.links[0]
+        node = link.from_node
+        socket = link.from_socket
+        path_is_complex = False
+        visited_groups = set()
+
+        # Keep tracing back as long as we hit utility nodes
+        while node.type in {'REROUTE', 'GROUP'} and node.name not in visited_groups:
+            if node.type == 'GROUP':
+                visited_groups.add(node.name)
+                internal_out_socket = next((s for n in node.node_tree.nodes if n.type == 'GROUP_OUTPUT' for s in n.inputs if s.identifier == socket.identifier), None)
+                if not internal_out_socket or not internal_out_socket.is_linked:
+                    path_is_complex = True # Group setup is too complex to be considered "direct"
+                    return node, path_is_complex
+                link = internal_out_socket.links[0]
+                node, socket = link.from_node, link.from_socket
+            else:  # Reroute node
+                if not node.inputs[0].is_linked:
+                    return node, path_is_complex # Dead end
+                link = node.inputs[0].links[0]
+                node, socket = link.from_node, link.from_socket
+        
+        # If the final source is not an image texture, the path is complex.
+        if node.type != 'TEX_IMAGE':
+            path_is_complex = True
+
+        return node, path_is_complex
+
+    # Sockets to check on the Principled BSDF and their corresponding bake types
+    SOCKET_TABLE = {
+        "Base Color": ("EMIT", False), "Metallic": ("EMIT", True), "Roughness": ("ROUGHNESS", True),
+        "Emission": ("EMIT", False), "Normal": ("NORMAL", False), "Alpha": ("EMIT", True),
+    }
+
+    for obj in mesh_objects:
+        if obj.type != 'MESH' or not obj.data.uv_layers: continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not (mat and mat.use_nodes) or mat.name in unique_mats_processed: continue
+            
+            unique_mats_processed.add(mat.name)
+            mat_uuid = mat.get("uuid") or str(uuid.uuid4())
+            mat["uuid"] = mat_uuid
+            material_map[mat_uuid] = mat
+
+            bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+            if not bsdf: continue
+
+            # --- Bake BSDF Inputs ---
+            for sock_name, (bake_type, is_value) in SOCKET_TABLE.items():
+                bsdf_in = bsdf.inputs.get(sock_name)
+                if not bsdf_in or not bsdf_in.is_linked: continue
+                
+                source_node = bsdf_in.links[0].from_node
+                is_complex = False
+
+                # For Normal maps, look past the Normal Map node.
+                if sock_name == "Normal" and source_node and source_node.type == 'NORMAL_MAP':
+                    normal_map_input_socket = source_node.inputs.get('Color')
+                    source_node, is_complex = _find_ultimate_source_node(normal_map_input_socket)
+                else:
+                    source_node, is_complex = _find_ultimate_source_node(bsdf_in)
+
+                # If the setup is complex/procedural, it needs baking.
+                if is_complex and source_node:
+                    logging.info(f"'{mat.name}':'{sock_name}' requires baking (source: {source_node.type} '{source_node.name}').")
+                    W, H = (2048, 2048)
+                    tasks.append({
+                        "blend_file": blend_fp, "object_name": obj.name, "material_uuid": mat_uuid,
+                        "bake_type": bake_type, "output_path": os.path.join(bake_dir, f"{mat_uuid}_{sock_name.replace(' ', '_')}.png"),
+                        "resolution_x": W, "resolution_y": H, "is_value_bake": is_value,
+                        "target_socket_name": sock_name
+                    })
+            
+            # --- Handle Height/Displacement ---
+            output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+            if not output_node: continue
+            
+            disp_socket = output_node.inputs.get("Displacement")
+            if not disp_socket or not disp_socket.is_linked: continue
+            
+            height_source_node = disp_socket.links[0].from_node
+            is_complex_disp = False
+
+            # Look past the Displacement node.
+            if height_source_node and height_source_node.type == 'DISPLACEMENT':
+                height_input_socket = height_source_node.inputs.get('Height')
+                height_source_node, is_complex_disp = _find_ultimate_source_node(height_input_socket)
+            else:
+                 _, is_complex_disp = _find_ultimate_source_node(disp_socket)
+
+            if is_complex_disp and height_source_node:
+                logging.info(f"'{mat.name}':'Displacement' requires baking (source: {height_source_node.type} '{height_source_node.name}').")
+                W, H = (2048, 2048)
+                baked_height_path = os.path.join(bake_dir, f"{mat_uuid}_Displacement.png")
+                height_map_info[mat.name] = baked_height_path # Store path to BAKED height map
+                tasks.append({
+                    "blend_file": blend_fp, "object_name": obj.name, "material_uuid": mat_uuid,
+                    "bake_type": "EMIT", "output_path": baked_height_path,
+                    "resolution_x": W, "resolution_y": H, "is_value_bake": True,
+                    "target_socket_name": "Displacement"
+                })
+            # If not complex and it's a valid texture, store its original path.
+            elif not is_complex_disp and height_source_node and height_source_node.type == 'TEX_IMAGE' and height_source_node.image and height_source_node.image.filepath:
+                original_height_path = abspath(height_source_node.image.filepath)
+                if os.path.exists(original_height_path):
+                    height_map_info[mat.name] = original_height_path
+                    logging.info(f"Found direct height map for '{mat.name}': {original_height_path}")
+                else:
+                    logging.warning(f"Direct height map for '{mat.name}' does not exist: {original_height_path}")
+
+
+    logging.info(f"Generated {len(tasks)} total bake tasks. Found {len(height_map_info)} materials with height maps.")
+    return tasks, material_map, bake_dir, height_map_info
+
+def handle_height_textures(context, reference_prim, export_data=None):
+    """
+    Finds the server-side material, ingests the baked height map, and assigns it.
+    This version uses the provided export_data and discovers the material path via the API.
+    """
     addon_prefs = context.preferences.addons[__name__].preferences
     try:
-        logging.info(f"Starting height texture processing for reference_prim: {reference_prim}")
-        
-        if exported_objects is not None:
-            mesh_objects = [obj for obj in exported_objects if obj.type == 'MESH']
-        else:
-            # Fallback: if no specific exported_objects, process selected or all scene meshes
-            # This part might need adjustment based on whether this function is ONLY for post-export
-            # or also for general height texture handling. Assuming post-export for now.
-            if context.selected_objects and addon_prefs.remix_use_selection_only:
-                 mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-            else:
-                 mesh_objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
+        logging.info(f"Starting final height texture processing for asset: {reference_prim}")
 
+        bake_info = (export_data or {}).get('bake_info', {})
+        height_map_info = bake_info.get('height_map_info', {})
 
-        used_materials = set()
-        for obj in mesh_objects:
-            for slot in obj.material_slots:
-                if slot.material:
-                    used_materials.add(slot.material)
-
-        height_textures_to_process = [] # Stores (material_name, texture_file_path)
-        for mat in used_materials:
-            if not mat.use_nodes or not mat.node_tree:
-                continue
-            for node in mat.node_tree.nodes:
-                # Simplified: Check for Displacement or Bump nodes
-                # This could be made more robust to find any image texture intended for height/displacement
-                if node.type in {'DISPLACEMENT', 'BUMP'}: # Check typical nodes
-                    # Find linked image texture to the 'Height' or 'Normal' input
-                    # For Displacement node, it's 'Height'. For Bump, it's also 'Height'.
-                    # If Bump uses a Normal Map node, that's a different path (not height texture directly)
-                    height_input_socket_name = 'Height' # Common for both
-                    if node.type == 'BUMP' and not node.inputs.get('Height').is_linked and node.inputs.get('Normal').is_linked:
-                        # If Bump node's Height is not linked, but Normal is, it might be fed by a Normal Map node.
-                        # This function is for raw height textures, so skip this case for now.
-                        # Or, trace back from Normal input if logic is to handle normal maps too.
-                        # For now, assuming direct height texture input.
-                        pass
-
-                    height_input = node.inputs.get(height_input_socket_name)
-                    if height_input and height_input.is_linked:
-                        source_node = height_input.links[0].from_node
-                        if source_node.type == 'TEX_IMAGE' and source_node.image:
-                            tex_path = bpy.path.abspath(source_node.image.filepath).replace('\\', '/')
-                            if os.path.exists(tex_path):
-                                # Only add if not already scheduled for this material (though material loop should handle it)
-                                if not any(ht[0] == mat.name for ht in height_textures_to_process):
-                                     height_textures_to_process.append((mat.name, tex_path))
-                                logging.info(f"Found height texture '{tex_path}' for material '{mat.name}' via node '{node.name}'.")
-                            else:
-                                logging.warning(f"Height texture path '{tex_path}' for material '{mat.name}' does not exist.")
-        
-        if not height_textures_to_process:
-            logging.info("No height textures found linked to Displacement/Bump nodes for processing.")
+        if not height_map_info:
+            logging.info("No baked height maps to process.")
             return {'FINISHED'}
 
-        ingest_dir_server = addon_prefs.remix_ingest_directory # This is server path
-        # TextureImporter in payload uses server paths.
-        # The 'textures_subdir' on the server is where TextureImporter will place processed textures.
+        # Since there's only one material in your case, we take the first (and only) item.
+        blender_mat_name = list(height_map_info.keys())[0]
+        local_texture_path = height_map_info[blender_mat_name]
+
+        if not os.path.exists(local_texture_path):
+            logging.error(f"Baked height map for '{blender_mat_name}' not found at: {local_texture_path}. Aborting.")
+            return {'CANCELLED'}
+
+        # --- DISCOVER THE REAL MATERIAL PATH ---
+        # After the mesh is ingested and selected, we ask the server "what is selected?"
+        # The response will include the prim paths for the mesh AND its materials.
+        logging.info("Discovering server-side material path via selection...")
+        all_selected_prims = fetch_selected_mesh_prim_paths()
+        server_material_prims = [p for p in all_selected_prims if '/Looks/' in p]
+
+        if not server_material_prims:
+            logging.error("Could not discover the server-side material prim path after ingest. Cannot assign height map.")
+            return {'CANCELLED'}
+
+        # Assuming the first material found is the correct one for this mesh.
+        server_material_prim_path = server_material_prims[0]
+        logging.info(f"Discovered material path: {server_material_prim_path}")
+
+        # --- INGEST AND ASSIGN THE HEIGHT MAP ---
+        # This logic is adapted from your original, working code.
+        ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
         server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
-        # No need to os.makedirs for server_textures_output_dir here, server handles it.
+        base_api_url = addon_prefs.remix_export_url.rstrip('/')
+        stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
 
-        base_api_url = addon_prefs.remix_export_url.rstrip('/') # For mass-validator/queue
+        logging.info(f"Ingesting height texture for '{blender_mat_name}': {local_texture_path}")
+        ingest_payload = {"executor":1,"name":"Material(s)","context_plugin":{"name":"TextureImporter","data":{"allow_empty_input_files_list":True,"channel":"Default","context_name":"ingestcraft","cook_mass_template":True,"create_context_if_not_exist":True,"create_output_directory_if_missing":True,"data_flows":[{"channel":"Default","name":"InOutData","push_input_data":True,"push_output_data":False}],"default_output_endpoint":"/stagecraft/assets/default-directory","expose_mass_queue_action_ui":False,"expose_mass_ui":True,"global_progress_value":0,"hide_context_ui":True,"input_files":[[local_texture_path, "HEIGHT"]],"output_directory":server_textures_output_dir,"progress":[0,"Initializing",True]}},"check_plugins":[{"name":"MaterialShaders","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllMaterials"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"ignore_not_convertable_shaders":False,"progress":[0,"Initializing",True],"save_on_fix_failure":True,"shader_subidentifiers":{"AperturePBR_Opacity":".*"}},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToOctahedral","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files_normal","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:normalmap_texture":{"encoding_attr":"inputs:encoding","replace_suffix":"_Normal","suffix":"_OTH_Normal"}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files_normal","name":"InOutData","push_input_data":True,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToDDS","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:diffuse_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:emissive_mask_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:height_texture":{"args":["--format","bc4","--no-mip-gamma-correct","--mip-filter","max"]},"inputs:metallic_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:normalmap_texture":{"args":["--format","bc5","--no-mip-gamma-correct"]},"inputs:reflectionroughness_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:transmittance_texture":{"args":["--format","bc7","--mip-gamma-correct"]}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files","name":"InOutData","push_input_data":True,"push_output_data":True},{"channel":"write_metadata","name":"InOutData","push_input_data":False,"push_output_data":True},{"channel":"ingestion_output","name":"InOutData","push_input_data":False,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True,"suffix":".rtex.dds"},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"MassTexturePreview","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"Nothing"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":True,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}}],"resultor_plugins":[{"name":"FileMetadataWritter","data":{"channel":"write_metadata","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]}}]}
+        
+        ingest_response = make_request_with_retries('POST', f"{base_api_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl)
+        if not ingest_response: return {'CANCELLED'}
 
-        for material_name, local_tex_file_path in height_textures_to_process:
-            logging.info(f"Processing height texture for material '{material_name}': {local_tex_file_path}")
+        time.sleep(2)
+        
+        base_filename = os.path.splitext(os.path.basename(local_texture_path))[0]
+        final_ingested_texture_path_on_server = os.path.join(server_textures_output_dir, f"{base_filename}.h.rtex.dds").replace('\\', '/')
+        
+        encoded_material_prim = urllib.parse.quote(server_material_prim_path, safe='')
+        textures_on_material_url = f"{stagecraft_api_url_base}/assets/{encoded_material_prim}/textures"
+        textures_response = make_request_with_retries('GET', textures_on_material_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
+        if not textures_response: return {'CANCELLED'}
+        
+        shader_core_input_prim = textures_response.json().get("textures", [[]])[0][0]
+        encoded_shader_core_input = urllib.parse.quote(shader_core_input_prim, safe='')
+        height_input_query_url = f"{stagecraft_api_url_base}/textures/{encoded_shader_core_input}/material/inputs?texture_type=HEIGHT"
+        
+        height_input_prim_response = make_request_with_retries('GET', height_input_query_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
+        if not height_input_prim_response: return {'CANCELLED'}
+        
+        height_shader_input_target_prim = height_input_prim_response.json().get("prim_paths", [])[0]
+        
+        logging.info(f"Target prim for height assignment: {height_shader_input_target_prim}")
+        update_texture_connection_url = f"{stagecraft_api_url_base}/textures/"
+        put_payload = {"force": False, "textures": [[height_shader_input_target_prim, final_ingested_texture_path_on_server]]}
+        
+        put_response = make_request_with_retries('PUT', update_texture_connection_url, json_payload=put_payload, headers={"accept": "application/lightspeed.remix.service+json; version=1.0", "Content-Type": "application/lightspeed.remix.service+json; version=1.0"}, verify=addon_prefs.remix_verify_ssl)
+        if not put_response:
+            logging.error(f"Failed to update shader with height texture.")
+            return {'CANCELLED'}
 
-            # STEP 1: Ingest the texture file (via TextureImporter on the server)
-            # The input_files should be the *local path* to the texture that the server can access
-            # or that the payload implies will be uploaded/found by the server.
-            # The current TextureImporter payload in the script implies server-side access or direct provision.
-            # Assuming local_tex_file_path is accessible or handled by the ingestcraft API.
-            ingest_payload = {
-                "executor": 1, "name": "Material(s)",
-                "context_plugin": {
-                    "name": "TextureImporter",
-                    "data": {
-                        "context_name": "ingestcraft",
-                        "input_files": [[local_tex_file_path, "HEIGHT"]], # Texture path and its type
-                        "output_directory": server_textures_output_dir, # Server path for output
-                        "allow_empty_input_files_list": True,
-                        "data_flows": [{"name": "InOutData", "push_input_data": True}],
-                        "hide_context_ui": True, "create_context_if_not_exist": True,
-                        "expose_mass_ui": True, "cook_mass_template": True
-                    }
-                },
-                "check_plugins": [ # Simplified, use your detailed check_plugins
-                    {"name": "MaterialShaders", "selector_plugins": [{"name": "AllMaterials", "data": {}}], "data": {"shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}},
-                    {"name": "ConvertToOctahedral", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files_normal", "cleanup_output": False}}], "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}},
-                    {"name": "ConvertToDDS", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}], "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}, {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}, {"name": "InOutData", "push_output_data": True, "channel": "ingestion_output"}]}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}},
-                    {"name": "MassTexturePreview", "selector_plugins": [{"name": "Nothing", "data": {}}], "data": {"expose_mass_queue_action_ui": True}, "stop_if_fix_failed": True, "context_plugin": {"name": "CurrentStage", "data": {}}}
-                ],
-                "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}]
-            }
-            
-            logging.debug(f"Texture ingest payload for '{material_name}': {ingest_payload}")
-            ingest_response = make_request_with_retries(
-                'POST', f"{base_api_url}/material", # Endpoint for material/texture ingestion
-                json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl
-            )
+        logging.info(f"Successfully assigned height texture for material '{blender_mat_name}'.")
 
-            if not ingest_response or ingest_response.status_code not in [200, 201, 204]:
-                logging.error(f"Failed to ingest height texture for material '{material_name}'. Status: {ingest_response.status_code if ingest_response else 'No Response'}, Response: {ingest_response.text if ingest_response else 'N/A'}")
-                return {'CANCELLED'} # Or continue to next texture? For now, fail hard.
-            
-            ingest_data = ingest_response.json()
-            final_ingested_texture_path_on_server = None
-            
-            # Parse ingest_data to find the path of the *processed* texture (e.g., the .dds or .h.rtex.dds)
-            # This logic needs to correctly navigate the 'completed_schemas' as in upload_to_api
-            completed_schemas = ingest_data.get("completed_schemas", [])
-            if completed_schemas:
-                # Look in data_flows of the ConvertToDDS plugin for the output path
-                for schema in completed_schemas:
-                    for plugin_run in schema.get("check_plugins", []):
-                        if plugin_run.get("name") == "ConvertToDDS":
-                            plugin_data = plugin_run.get("data", {})
-                            for flow in plugin_data.get("data_flows", []):
-                                if flow.get("channel") == "ingestion_output" and flow.get("push_output_data") and flow.get("output_data"):
-                                    # output_data is a list of paths
-                                    for out_path in flow["output_data"]:
-                                        if isinstance(out_path, str) and (out_path.lower().endswith(".dds") or out_path.lower().endswith(".rtex.dds")):
-                                            # Heuristic: prefer .h.rtex.dds if multiple DDS outputs
-                                            if ".h.rtex.dds" in out_path.lower() or final_ingested_texture_path_on_server is None:
-                                                final_ingested_texture_path_on_server = out_path.replace('\\','/')
-                                            if ".h.rtex.dds" in out_path.lower(): # Prioritize this exact match
-                                                break 
-                                    if final_ingested_texture_path_on_server and ".h.rtex.dds" in final_ingested_texture_path_on_server.lower():
-                                        break 
-                            if final_ingested_texture_path_on_server and ".h.rtex.dds" in final_ingested_texture_path_on_server.lower():
-                                break
-                    if final_ingested_texture_path_on_server and ".h.rtex.dds" in final_ingested_texture_path_on_server.lower():
-                        break
-            
-            if not final_ingested_texture_path_on_server:
-                logging.error(f"Failed to find final ingested texture path for material '{material_name}' from TextureImporter response. Full response: {ingest_data}")
-                return {'CANCELLED'}
-            logging.info(f"Successfully ingested height texture for material '{material_name}'. Server path: {final_ingested_texture_path_on_server}")
-
-            # STEP 2: Construct the material prim asset path dynamically
-            remix_mat_name = blender_mat_to_remix(material_name) # Sanitize material name
-            # 'reference_prim' is the path to the parent of XForms/World, e.g., /RootNode/meshes/mesh_ID/ref_ID
-            material_prim_on_stage = f"{reference_prim}/XForms/World/Looks/{remix_mat_name}"
-            encoded_material_prim = urllib.parse.quote(material_prim_on_stage, safe='')
-            logging.debug(f"Constructed material prim path on stage: {material_prim_on_stage}")
-
-            # STEP 3: Fetch the list of shader input connections for this material prim
-            stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/') # For /assets/ and /textures/
-            textures_on_material_url = f"{stagecraft_api_url_base}/assets/{encoded_material_prim}/textures"
-            
-            textures_response = make_request_with_retries(
-                'GET', textures_on_material_url,
-                headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
-                verify=addon_prefs.remix_verify_ssl
-            )
-            if not textures_response or textures_response.status_code != 200:
-                logging.error(f"Failed to retrieve texture connections for material prim: {material_prim_on_stage}. Status: {textures_response.status_code if textures_response else 'N/A'}")
-                return {'CANCELLED'}
-            
-            textures_data = textures_response.json()
-            shader_core_input_prim = None # This will be like /.../Shader.inputs:diffuse_texture
-            textures_list = textures_data.get("textures", []) # List of [input_prim_path, texture_asset_path]
-            if textures_list and len(textures_list) > 0 and textures_list[0] and isinstance(textures_list[0], list) and len(textures_list[0]) > 0:
-                shader_core_input_prim = textures_list[0][0] # Take the first available input prim as a representative of the shader
-            else:
-                logging.error(f"No shader input connections found in textures response for material: {material_prim_on_stage}. Response: {textures_data}")
-                return {'CANCELLED'}
-            logging.debug(f"Representative shader core input prim for material '{material_name}': {shader_core_input_prim}")
-
-            # STEP 4: Get the specific 'HEIGHT' shader input prim path using the representative input prim
-            encoded_shader_core_input = urllib.parse.quote(shader_core_input_prim, safe='')
-            height_input_query_url = f"{stagecraft_api_url_base}/textures/{encoded_shader_core_input}/material/inputs?texture_type=HEIGHT"
-            
-            height_input_prim_response = make_request_with_retries(
-                'GET', height_input_query_url,
-                headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'},
-                verify=addon_prefs.remix_verify_ssl
-            )
-            if not height_input_prim_response or height_input_prim_response.status_code != 200:
-                logging.error(f"Failed to fetch 'HEIGHT' type shader input prim using representative '{shader_core_input_prim}'. Status: {height_input_prim_response.status_code if height_input_prim_response else 'N/A'}")
-                return {'CANCELLED'}
-            
-            height_input_data = height_input_prim_response.json()
-            # CORRECTED: Expect "prim_paths" key
-            height_shader_input_prim_paths = height_input_data.get("prim_paths", []) 
-            
-            if not height_shader_input_prim_paths or not height_shader_input_prim_paths[0]:
-                logging.error(f"No height shader input prim path returned in response for material '{material_name}'. Query URL: {height_input_query_url}, Response: {height_input_data}")
-                return {'CANCELLED'} # Fail if no height input target
-            
-            height_shader_input_target_prim = height_shader_input_prim_paths[0] # This is the actual target like /.../Shader.inputs:height_texture
-            logging.info(f"Target prim for height texture assignment of material '{material_name}': {height_shader_input_target_prim}")
-
-            # STEP 5: Update the shader input with the ingested height texture (via PUT to /textures/)
-            # The /textures/ endpoint takes a list of [target_shader_input_prim, texture_asset_path]
-            update_texture_connection_url = f"{stagecraft_api_url_base}/textures/" 
-            put_payload = {
-                "force": False, # or True, depending on desired behavior
-                "textures": [
-                    [height_shader_input_target_prim, final_ingested_texture_path_on_server]
-                ]
-            }
-            logging.debug(f"PUT payload to connect height texture: {put_payload} to URL: {update_texture_connection_url}")
-            
-            put_response = make_request_with_retries(
-                'PUT', update_texture_connection_url, json_payload=put_payload,
-                headers={
-                    "accept": "application/lightspeed.remix.service+json; version=1.0",
-                    "Content-Type": "application/lightspeed.remix.service+json; version=1.0"
-                },
-                verify=addon_prefs.remix_verify_ssl
-            )
-            if not put_response or put_response.status_code not in [200, 201, 204]:
-                logging.error(f"Failed to update shader input with ingested height texture for material '{material_name}'. Target prim: {height_shader_input_target_prim}, Texture: {final_ingested_texture_path_on_server}. Status: {put_response.status_code if put_response else 'N/A'}, Response: {put_response.text if put_response else 'N/A'}")
-                return {'CANCELLED'}
-
-            logging.info(f"Successfully updated height texture for material '{material_name}' using prim: {height_shader_input_target_prim} with texture: {final_ingested_texture_path_on_server}")
-
-        logging.info("Height texture processing for all materials completed successfully.")
         return {'FINISHED'}
 
     except Exception as e:
@@ -1967,151 +2332,137 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
     def _import_and_process_files_iteratively(self, context, temp_scene, addon_prefs, main_scene_ref):
         """
-        Optimized USD import loop:
-          - Switch once to temp_scene
-          - Use set-difference to detect new objects
-          - Progress bar via window_manager.progress_*
-          - Set cursor to WAIT via window.cursor_set, then restore
-          - Integrate existing logic: conceptual-base filtering, transform application, texture attach, cleanup
-        Returns: (all_keep_objs, processed_files_count, textures_processed_for_count)
+        1) Optionally override USD importer’s axis prefs so meshes aren’t “all facing upward.”
+        2) Import each USD into `temp_scene` (no per‐file redraws).
+        3) Detect newly created objects via a “marker” property.
+        4) Keep only unique meshes by conceptual base name.
+        5) Collapse transforms, optionally attach textures, then prune any dead references.
+        6) Return a final list of still‐alive keeper objects, plus counts of processed files/textures.
         """
-        import bpy
-        import os
-        import logging
-        from mathutils import Matrix
 
-        wm = context.window_manager
-        win = context.window
+        # 1) Override USD importer preferences ONCE at the start of this batch
+        original_importer_settings = {}
+        usd_importer_addon = context.preferences.addons.get('io_scene_usd')
+        if usd_importer_addon:
+            importer_prefs = usd_importer_addon.preferences
+            # Back up the axis settings and scale
+            for attr in ("axis_forward", "axis_up"):
+                if hasattr(importer_prefs, attr):
+                    original_importer_settings[attr] = getattr(importer_prefs, attr)
 
-        total_files = len(self.files)
-        # Begin progress
-        try:
-            wm.progress_begin(0, total_files)
-        except Exception:
-            pass
+            # Pull from addon_prefs: assume “usd_import_forward_axis” and “usd_import_up_axis” exist
+            forward_axis = getattr(addon_prefs, "usd_import_forward_axis", "-Z")
+            up_axis = getattr(addon_prefs, "usd_import_up_axis", "Y")
+            if hasattr(importer_prefs, "axis_forward"):
+                importer_prefs.axis_forward = forward_axis
+            if hasattr(importer_prefs, "axis_up"):
+                importer_prefs.axis_up = up_axis
 
-        # Attempt to set wait cursor, if supported
-        try:
-            win.cursor_set('WAIT')
-        except Exception:
-            pass
+            logging.debug(f"USD Importer axes set to Forward={forward_axis}, Up={up_axis}.")
 
-        # Switch once to temp_scene
-        original_scene = context.window.scene
-        context.window.scene = temp_scene
+        # Local aliases for speed
+        data_materials = bpy.data.materials
+        data_objects = bpy.data.objects
+        materials_seen = set(data_materials.keys())
+        processed_bases = self._processed_conceptual_asset_bases
+
+        # 2) Cache transform/texture flags once
+        remix_scale = getattr(addon_prefs, "remix_import_scale", 1.0)
+        scale_needed = abs(remix_scale - 1.0) > 1e-6
+        mirror_flag = bool(getattr(addon_prefs, "mirror_import", False))
+        flip_flag = bool(getattr(addon_prefs, "flip_normals_import", False))
+        attach_textures_flag = bool(getattr(addon_prefs, "remix_import_original_textures", False))
+
+        if scale_needed:
+            scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
+        if mirror_flag:
+            mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
+
+        valid_exts = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
 
         all_keep_objs = []
         processed_files_count = 0
         textures_processed_for_count = 0
 
-        # Prepare USD importer prefs backup if needed
-        usd_importer_addon = context.preferences.addons.get('io_scene_usd')
-        original_importer_settings = {}
-        if usd_importer_addon:
-            importer_prefs = usd_importer_addon.preferences
-            # Backup relevant settings; adjust as needed
-            for attr in ("axis_forward", "axis_up"):
-                if hasattr(importer_prefs, attr):
-                    original_importer_settings[attr] = getattr(importer_prefs, attr)
-            # Apply from addon_prefs if desired; this matches your original logic
-            forward_axis = getattr(addon_prefs, "usd_import_forward_axis", None)
-            up_axis = getattr(addon_prefs, "usd_import_up_axis", None)
-            if forward_axis and hasattr(importer_prefs, "axis_forward"):
-                importer_prefs.axis_forward = forward_axis
-            if up_axis and hasattr(importer_prefs, "axis_up"):
-                importer_prefs.axis_up = up_axis
-            logging.debug(f"USD Importer axes set to Forward={forward_axis}, Up={up_axis}.")
+        # 3) Switch to temp_scene once (avoiding repeated context switches)
+        original_scene_for_loop = context.window.scene
+        context.window.scene = temp_scene
 
-        # Prepare for transform flags once
-        remix_scale = getattr(addon_prefs, "remix_import_scale", 1.0)
-        scale_needed = abs(remix_scale - 1.0) > 1e-6
-        if scale_needed:
-            scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
-        mirror_flag = bool(getattr(addon_prefs, "mirror_import", False))
-        flip_flag = bool(getattr(addon_prefs, "flip_normals_import", False))
-        attach_textures_flag = bool(getattr(addon_prefs, "remix_import_original_textures", False))
-
-        # If mirror_flag needs a matrix:
-        if mirror_flag:
-            mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
-
-        # For material dedupe
-        data_materials = bpy.data.materials
-        materials_seen = set(data_materials.keys())
-
-        # Process each file
-        for idx, file_elem in enumerate(self.files):
-            # Update progress early if skipping
-            try:
-                wm.progress_update(idx)
-            except Exception:
-                pass
-
+        for file_elem in self.files:
             filepath = os.path.join(self.directory, file_elem.name)
-            # Only proceed if file exists and extension matches
-            valid_exts = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
             if not (os.path.exists(filepath) and filepath.lower().endswith(valid_exts)):
+                logging.warning(f"Skipping invalid file: {filepath}")
                 continue
 
             processed_files_count += 1
+            if getattr(bpy.app, "debug", False):
+                logging.debug(f"[{processed_files_count}/{len(self.files)}] Importing: {filepath}")
 
-            # Detect pre-import objects
-            before_objs = set(temp_scene.objects)
+            # Tag all existing objects in temp_scene with a “pre‐import marker”
+            for obj in temp_scene.objects:
+                obj["_pre_import_marker"] = True
 
-            # Import USD
+            # Import WITHOUT calling view_layer.update() each time
             try:
                 bpy.ops.wm.usd_import(filepath=filepath)
             except Exception as e_import:
                 logging.error(f"Error importing {filepath}: {e_import}", exc_info=True)
-                # skip to next
+                # Clean up markers
+                for obj in temp_scene.objects:
+                    obj.pop("_pre_import_marker", None)
                 continue
 
-            # Detect newly added objects
-            after_objs = set(temp_scene.objects)
-            new_objs = [o for o in after_objs if o not in before_objs]
+            # 4) Collect newly created objects: those missing the marker
+            newly_added_raw_objects = [
+                obj for obj in temp_scene.objects
+                if "_pre_import_marker" not in obj
+            ]
 
-            if not new_objs:
-                logging.warning(f"No new objects detected in import of {filepath}")
-                # maybe fallback to selected?
-                if context.selected_objects:
-                    new_objs = list(context.selected_objects)
-                else:
-                    continue
+            # Remove markers from all
+            for obj in temp_scene.objects:
+                obj.pop("_pre_import_marker", None)
 
-            # 1) Classify unique meshes vs discards
+            if not newly_added_raw_objects:
+                logging.warning(f"No new objects detected in {filepath}")
+                continue
+
+            # 5) Classify “unique meshes” vs “discards” in one pass
             unique_meshes = []
             discards = []
             get_base = self._get_conceptual_asset_base_name
-            for obj_raw in new_objs:
+
+            for obj_raw in newly_added_raw_objects:
                 if obj_raw.type != 'MESH':
                     discards.append(obj_raw)
                     continue
+
                 base_name = get_base(obj_raw)
-                if base_name not in self._processed_conceptual_asset_bases:
-                    self._processed_conceptual_asset_bases.add(base_name)
+                if base_name not in processed_bases:
+                    processed_bases.add(base_name)
                     unique_meshes.append(obj_raw)
                 else:
                     discards.append(obj_raw)
 
             if not unique_meshes:
-                # nothing unique; discard all
-                discards = new_objs.copy()
+                # No unique meshes ⇒ discard everything
+                discards = newly_added_raw_objects.copy()
             else:
-                # keep parents of unique meshes if in new_objs
-                newly_set = set(new_objs)
+                # Also keep any parents of each unique mesh (if they live in the newly‐added set)
+                newly_set = set(newly_added_raw_objects)
                 keepers_set = set(unique_meshes)
                 for mesh in unique_meshes:
                     parent = mesh.parent
                     while parent and parent in newly_set:
                         keepers_set.add(parent)
                         parent = parent.parent
-                # anything not in keepers_set goes to discards if not already
-                for obj_raw in new_objs:
+
+                for obj_raw in newly_added_raw_objects:
                     if obj_raw not in keepers_set and obj_raw not in discards:
                         discards.append(obj_raw)
+
                 unique_meshes = list(keepers_set)
 
-            # 2) Material dedupe on unique_meshes
+            # 6) Material dedupe: “one‐pass” replacement of duplicate materials
             mats_before = materials_seen.copy()
             for obj in unique_meshes:
                 for slot in obj.material_slots:
@@ -2123,7 +2474,6 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                         master_mat = data_materials.get(base_mat_name)
                         if master_mat:
                             slot.material = master_mat
-                            # remove old if unused
                             if mat.users == 0:
                                 try:
                                     data_materials.remove(mat, do_unlink=True)
@@ -2133,106 +2483,95 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                         mats_before.add(mat.name)
             materials_seen = mats_before
 
-            # 3) Apply transforms & collect for texture
+            # 7) Apply transforms (scale, mirror, flip), collect meshes_for_texture
             meshes_for_texture = []
-            for keeper in unique_meshes:
-                # scale
-                if scale_needed and keeper.type in {'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'}:
-                    if not keeper.parent or keeper.parent not in unique_meshes:
-                        keeper.matrix_world = scale_matrix @ keeper.matrix_world
-                # mirror
-                if mirror_flag and keeper.type == 'MESH' and keeper.select_get():
-                    keeper.matrix_world = mirror_matrix @ keeper.matrix_world
-                # flip normals
-                if flip_flag and keeper.type == 'MESH':
-                    mesh_data = keeper.data
+            for keeper_obj in unique_meshes:
+                # Scale (only top‐level objects)
+                if scale_needed and keeper_obj.type in {
+                    'MESH', 'CURVE', 'EMPTY', 'ARMATURE', 'LIGHT', 'CAMERA'
+                }:
+                    if not keeper_obj.parent or keeper_obj.parent not in unique_meshes:
+                        keeper_obj.matrix_world = scale_matrix @ keeper_obj.matrix_world
+
+                # Mirror (only selected meshes)
+                if mirror_flag and keeper_obj.type == 'MESH' and keeper_obj.select_get():
+                    keeper_obj.matrix_world = mirror_matrix @ keeper_obj.matrix_world
+
+                # Flip normals
+                if flip_flag and keeper_obj.type == 'MESH':
+                    mesh_data = keeper_obj.data
                     if hasattr(mesh_data, "flip_normals"):
                         mesh_data.flip_normals()
-                # mark for texture attach
-                if attach_textures_flag and keeper.type == 'MESH':
-                    meshes_for_texture.append(keeper)
 
-            # 4) Attach textures if requested and blend saved
-            if meshes_for_texture and bpy.data.filepath:
-                try:
-                    attach_original_textures(meshes_for_texture, context, os.path.dirname(filepath))
-                    textures_processed_for_count += len(meshes_for_texture)
-                except Exception as e_tex:
-                    logging.error(f"Error attaching textures for {filepath}: {e_tex}", exc_info=True)
+                # Mark for texture attachment
+                if attach_textures_flag and keeper_obj.type == 'MESH':
+                    meshes_for_texture.append(keeper_obj)
 
-            # 5) Delete discards
+            # 8) Attach textures if requested (ONLY on still‐alive meshes)
+            if meshes_for_texture and is_blend_file_saved():
+                attach_original_textures(meshes_for_texture, context, os.path.dirname(filepath))
+                textures_processed_for_count += len(meshes_for_texture)
+
+            # 9) Delete/discard “discards” if still present
             for obj_del in discards:
                 if obj_del.name in temp_scene.objects:
-                    # unlink from collections
+                    # Unlink from only those collections that reference it
                     for coll in list(obj_del.users_collection):
-                        try:
-                            coll.objects.unlink(obj_del)
-                        except Exception:
-                            pass
-                    # unlink from scene.collection
+                        coll.objects.unlink(obj_del)
                     if obj_del.name in temp_scene.collection.objects:
                         temp_scene.collection.objects.unlink(obj_del)
-                    # remove object data-block
                     data_blk = obj_del.data
-                    try:
-                        bpy.data.objects.remove(obj_del, do_unlink=True)
-                    except Exception:
-                        pass
-                    # remove mesh data if orphaned
+                    data_objects.remove(obj_del, do_unlink=True)
                     if data_blk and data_blk.users == 0:
-                        try:
-                            if isinstance(data_blk, bpy.types.Mesh):
-                                bpy.data.meshes.remove(data_blk)
-                            elif isinstance(data_blk, bpy.types.Curve):
-                                bpy.data.curves.remove(data_blk)
-                        except Exception:
-                            pass
+                        if isinstance(data_blk, bpy.types.Mesh):
+                            bpy.data.meshes.remove(data_blk)
+                        elif isinstance(data_blk, bpy.types.Curve):
+                            bpy.data.curves.remove(data_blk)
 
-            # 6) Prune dead references from unique_meshes
+            # 10) CRASH‐FIXED FILTER: prune any dead references from unique_meshes
             pruned = []
             for o in unique_meshes:
                 try:
-                    if o.name in temp_scene.objects:
-                        pruned.append(o)
+                    nm = o.name
                 except ReferenceError:
                     continue
-            unique_meshes = pruned
+                if nm in temp_scene.objects:
+                    pruned.append(o)
+            unique_meshes[:] = pruned
 
-            # 7) Accumulate keepers
             all_keep_objs.extend(unique_meshes)
 
-            # Update progress
+        # end for file_elem
+
+        # Restore original scene
+        context.window.scene = original_scene_for_loop
+
+        # 11) FINAL DEDUPLICATION (only still‐alive objects)
+        keepers_by_name = {}
+        all_keep_objs_valid = []
+        for obj in all_keep_objs:
+            if not obj:
+                continue
             try:
-                wm.progress_update(idx + 1)
-            except Exception:
-                pass
+                nm = obj.name
+            except ReferenceError:
+                continue
+            if nm in bpy.data.objects and nm not in keepers_by_name:
+                keepers_by_name[nm] = obj
+                all_keep_objs_valid.append(obj)
 
-        # end for files
+        all_keep_objs = all_keep_objs_valid
 
-        # Restore USD importer prefs
+        # 12) Restore USD importer prefs back to what they were
         if usd_importer_addon and original_importer_settings:
             importer_prefs = usd_importer_addon.preferences
             for attr, val in original_importer_settings.items():
                 if hasattr(importer_prefs, attr):
                     try:
                         setattr(importer_prefs, attr, val)
-                    except Exception:
-                        pass
+                    except Exception as e_restore:
+                        logging.warning(f"Could not restore USD importer setting {attr}: {e_restore}")
             logging.debug("USD importer axis settings restored.")
-
-        # Restore scene
-        context.window.scene = original_scene
-
-        # Restore cursor
-        try:
-            win.cursor_set('DEFAULT')
-        except Exception:
-            pass
-        # End progress
-        try:
-            wm.progress_end()
-        except Exception:
-            pass
 
         return all_keep_objs, processed_files_count, textures_processed_for_count
 
@@ -2811,372 +3150,913 @@ class OBJECT_OT_import_usd_from_remix(Operator):
 
 class OBJECT_OT_export_and_ingest(Operator):
     bl_idname = "object.export_and_ingest"
-    bl_label = "Export and Ingest Selected Objects"
+    bl_label = "Export and Ingest (with Bake)"
     bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        addon_prefs = context.preferences.addons[__name__].preferences
+    # --- Operator State Variables ---
+    _timer = None
+    _bake_task_queue: Queue = None
+    _worker_pool: list = []
+    _total_tasks: int = 0
+    _finished_tasks: int = 0
+    _op_lock: Lock = None
+    _export_data: dict = {}
+
+    WORKER_TIMEOUT_SECONDS: int = 300
+
+    def _validate_and_recover_image_source(self, image_datablock, temp_dir):
+        """
+        Ensures an image datablock has a valid, on-disk source file for the baker to read.
+        If the path is invalid but pixel data exists (e.g., packed file), it saves
+        the data to the provided temporary directory and reloads it.
+        This logic is copied from the addon's own _prepare_and_validate_textures function.
+        """
+        if not image_datablock:
+            return True
+
+        filepath = ""
+        try:
+            # Use filepath_from_user() to respect user-set paths
+            filepath = abspath(image_datablock.filepath_from_user())
+        except Exception:
+            logging.debug(f"Could not resolve path for image '{image_datablock.name}'. Will attempt recovery.")
+            filepath = ""
+
+        # If the file doesn't exist on disk, but Blender has the pixel data in memory
+        if not os.path.exists(filepath) and image_datablock.has_data:
+            logging.warning(f"Source image '{image_datablock.name}' has no valid file path. Recovering from memory for bake.")
+            try:
+                safe_name = "".join(c for c in image_datablock.name if c.isalnum() or c in ('_', '.', '-')).strip()
+                ext = ".png" # Default to PNG for recovery
+                
+                # For UDIMs, the name might be like 'texture.<UDIM>.png'. We need a clean base name.
+                base_name = re.sub(r'<UDIM>', 'tile', safe_name) # Replace udim token for the temp file
+                base_name, _ = os.path.splitext(base_name)
+                recovery_path = os.path.join(temp_dir, f"{base_name}{ext}")
+
+                # Save a copy of the image data to the new path
+                # This forces the data onto the disk where the baker can find it.
+                image_copy = image_datablock.copy()
+                image_copy.filepath_raw = recovery_path
+                image_copy.file_format = 'PNG'
+                image_copy.save()
+                
+                # CRITICAL: Point the original image datablock to the newly saved file and reload
+                image_datablock.filepath = recovery_path
+                image_datablock.source = 'FILE' # It's now a single file, not a tiled source for the purpose of this bake
+                image_datablock.reload()
+                
+                logging.info(f"Successfully recovered source image '{image_datablock.name}' to '{recovery_path}'")
+                # Add the temp file to the cleanup list
+                self._export_data['temp_files_to_clean'].add(recovery_path)
+
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to recover source image data for '{image_datablock.name}': {e}")
+                logging.error(f"Could not save in-memory data for source image '{image_datablock.name}': {e}", exc_info=True)
+                return False # This is a critical failure
         
-        # Check if the ingest directory is still the default one.
-        if addon_prefs.remix_ingest_directory.strip() == "/ProjectFolder/Assets":
-            popup_message = "Please change the Ingest Directory to inside the Project folder."
-            logging.warning(popup_message)
-            # Using the same popup code as for unsaved blend file.
-            bpy.ops.object.show_popup('INVOKE_DEFAULT', message=popup_message, success=False)
-            return {'CANCELLED'}
+        return True
 
-        global export_lock
-        if export_lock:
-            self.report({'INFO'}, "Another export is already in progress.")
-            logging.info("Another export is already in progress.")
-            return {'CANCELLED'}
+    def _launch_worker_from_queue(self):
+        """
+        Pops a batch of tasks from the queue and launches a background
+        Blender worker process to handle them. stdout and stderr are piped
+        to be readable for error checking.
+        """
+        try:
+            batch = self._bake_task_queue.get_nowait()
+        except Empty:
+            return  # No more tasks to launch
 
-        if not is_blend_file_saved():
-            popup_message = "Please save your Blender file before exporting and ingesting assets."
-            logging.warning(popup_message)
-            bpy.ops.object.show_popup('INVOKE_DEFAULT', message=popup_message, success=False)
-            return {'CANCELLED'}
-
-        # (Rest of your existing code follows unchanged...)
-        bpy.ops.file.unpack_all(method="USE_LOCAL")
-        logging.info("Successfully unpacked all packed files.")
-        self.report({'INFO'}, "All packed files have been unpacked.")
-
-        export_lock = True
-        logging.debug("Lock acquired for export process.")
-
-        normals_flipped = False
-        temp_filepath = ""
-        mtl_filepath = ""
+        payload = json.dumps(batch)
+        # Command to run a headless blender instance executing the bake worker script
+        cmd = [
+            bpy.app.binary_path,
+            "--background",
+            "--factory-startup",
+            batch[0]['blend_file'],
+            "--python", BAKE_WORKER_PY,
+            "--",
+            "--tasks-json", payload
+        ]
 
         try:
-            success, missing_textures = verify_texture_files_exist(context)
-            if not isinstance(success, bool) or not isinstance(missing_textures, list):
-                error_message = "verify_texture_files_exist() should return a tuple (bool, list)."
-                logging.error(error_message)
-                self.report({'ERROR'}, error_message)
-                return {'CANCELLED'}
+            # Platform-specific flag to hide the console window on Windows
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-            if not success:
-                error_message = "Export canceled due to missing texture files:\n"
-                for obj_name, mat_name, node_name, img_path in missing_textures:
-                    error_message += f" - Object: {obj_name}, Material: {mat_name}, Node: {node_name}, Path: {img_path}\n"
-                logging.error(error_message)
-                self.report({'ERROR'}, "Missing texture files. Check the log for details.")
-                bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_message, success=False)
-                export_lock = False
-                logging.debug("Lock released for export process due to missing textures.")
-                return {'CANCELLED'}
-                
-            success, replaced_textures = convert_exr_textures_to_png(context)
-            if not isinstance(success, bool) or not isinstance(replaced_textures, list):
-                error_message = "convert_exr_textures_to_png() should return a tuple (bool, list)."
-                logging.error(error_message)
-                self.report({'ERROR'}, error_message)
-                return {'CANCELLED'}
-
-            if not success:
-                self.report({'ERROR'}, "Failed to convert EXR textures to PNG.")
-                logging.error("Failed to convert EXR textures to PNG.")
-                return {'CANCELLED'}
-
-            for material_name, old_path, new_path in replaced_textures:
-                replace_texture(material_name, old_path, new_path)
-
-            mesh_objects = [obj for obj in (context.selected_objects if addon_prefs.remix_use_selection_only else context.scene.objects) if obj.type == 'MESH']
-            logging.debug(f"Number of mesh objects to process: {len(mesh_objects)}")
-            if not mesh_objects:
-                self.report({'WARNING'}, "No mesh objects found to export.")
-                logging.warning("No mesh objects found to export.")
-                return {'CANCELLED'}
-
-            if addon_prefs.flip_faces_export:
-                for obj in mesh_objects:
-                    flip_normals_api(obj)
-                    logging.debug(f"Flipped normals for object: {obj.name}")
-                    print(f"Flipped normals for object: {obj.name}")
-                normals_flipped = True
-                logging.info("Normals flipped before export.")
-                print("Normals flipped before export.")
-
-            base_name, asset_number = get_asset_number(context)
-            if not isinstance(base_name, str) or not isinstance(asset_number, int):
-                error_message = "get_asset_number() should return a tuple (base_name, asset_number)."
-                logging.error(error_message)
-                self.report({'ERROR'}, error_message)
-                return {'CANCELLED'}
-
-            obj_filename = f"{base_name}_{asset_number}.obj"
-            temp_dir = tempfile.gettempdir().replace('\\', '/')
-            temp_filepath = os.path.join(temp_dir, obj_filename).replace('\\', '/')
-            logging.info(f"Temporary OBJ filepath: {temp_filepath}")
-
-            forward_axis = addon_prefs.obj_export_forward_axis
-            up_axis = addon_prefs.obj_export_up_axis
-            # Increase scale by modifying the global_scale parameter:
-            export_scale = addon_prefs.remix_export_scale
-
-            result = bpy.ops.wm.obj_export(
-                filepath=temp_filepath,
-                check_existing=True,
-                filter_blender=False,
-                filter_backup=False,
-                filter_image=False,
-                filter_movie=False,
-                filter_python=False,
-                filter_font=False,
-                filter_sound=False,
-                filter_text=False,
-                filter_archive=False,
-                filter_btx=False,
-                filter_collada=False,
-                filter_alembic=False,
-                filter_usd=False,
-                filter_obj=False,
-                filter_volume=False,
-                filter_folder=True,
-                filter_blenlib=False,
-                filemode=8,
-                display_type='DEFAULT',
-                sort_method='DEFAULT',
-                export_animation=False,
-                start_frame=-2147483648,
-                end_frame=2147483647,
-                forward_axis=forward_axis,
-                up_axis=up_axis,
-                global_scale=export_scale,
-                apply_modifiers=True,
-                export_eval_mode='DAG_EVAL_VIEWPORT',
-                export_selected_objects=addon_prefs.remix_use_selection_only,
-                export_uv=True,
-                export_normals=True,
-                export_colors=False,
-                export_materials=True,
-                export_pbr_extensions=True,
-                path_mode='ABSOLUTE',
-                export_triangulated_mesh=False,
-                export_curves_as_nurbs=False,
-                export_object_groups=False,
-                export_material_groups=False,
-                export_vertex_groups=False,
-                export_smooth_groups=False,
-                smooth_group_bitflags=False,
-                filter_glob='*.obj;*.mtl',
-                collection=''
+            # --- MODIFIED FOR ERROR CAPTURING ---
+            # Launch the worker, piping stdout and stderr so we can read them if an error occurs.
+            # text=True and encoding='utf-8' ensures the output is decoded as text.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=flags,
+                text=True,
+                encoding='utf-8'
             )
 
-            if result != {'FINISHED'} or not os.path.exists(temp_filepath):
-                self.report({'ERROR'}, "OBJ export failed; file not found.")
-                logging.error("OBJ export failed; file not found.")
-                return {'CANCELLED'}
-
-            mtl_filepath = temp_filepath.replace('.obj', '.mtl')
-
-            ingested_usd = upload_to_api(temp_filepath, addon_prefs.remix_ingest_directory, context)
-            if not isinstance(ingested_usd, str):
-                self.report({'ERROR'}, "Failed to ingest OBJ into Remix.")
-                logging.error("Failed to ingest OBJ into Remix.")
-                return {'CANCELLED'}
-
-            if addon_prefs.remix_replace_stock_mesh:
-                logging.debug("Replace Stock Mesh option is checked. Proceeding to replace using fetched prim paths.")
-                prim_paths = fetch_selected_mesh_prim_paths()
-                if not isinstance(prim_paths, list):
-                    error_message = "fetch_selected_mesh_prim_paths() should return a list."
-                    logging.error(error_message)
-                    self.report({'ERROR'}, error_message)
-                    return {'CANCELLED'}
-
-                if not prim_paths:
-                    self.report({'ERROR'}, "Replace Stock Mesh is ticked but no selected mesh prim paths were found.")
-                    logging.error("Replace Stock Mesh is ticked but no selected mesh prim paths were found.")
-                    return {'CANCELLED'}
-
-                for prim_path in prim_paths:
-                    result_replace = replace_mesh_with_put_request(prim_path, ingested_usd, "", "", context)
-                    if not isinstance(result_replace, tuple) or len(result_replace) != 2:
-                        error_message = "replace_mesh_with_put_request() should return a tuple (bool, str)."
-                        logging.error(error_message)
-                        self.report({'ERROR'}, error_message)
-                        return {'CANCELLED'}
-
-                    success_replace, new_reference_path = result_replace
-
-                    if success_replace and isinstance(new_reference_path, str):
-                        self.report({'INFO'}, "Ingest Complete - Mesh Replaced")
-                        logging.info("Mesh replaced successfully in Remix.")
-                        print("Mesh replaced successfully in Remix.")
-
-                        select_success = select_mesh_prim_in_remix(new_reference_path, context)
-                        if not select_success:
-                            self.report({'WARNING'}, "Failed to select mesh prim in Remix.")
-                            logging.warning("Failed to select mesh prim in Remix.")
-
-                        ingest_result = handle_height_textures(context, new_reference_path, exported_objects=mesh_objects)
-                        if ingest_result != {'FINISHED'}:
-                            self.report({'ERROR'}, "Failed to process height textures.")
-                            logging.error("Failed to process height textures.")
-                            return {'CANCELLED'}
-
-                    else:
-                        self.report({'ERROR'}, f"Failed to replace mesh via PUT request for prim: {prim_path}.")
-                        logging.error(f"Failed to replace mesh via PUT request for prim: {prim_path}.")
-                        return {'CANCELLED'}
-
-            else:
-                logging.debug("Replace Stock Mesh option is unchecked. Proceeding with replacement if prim exists, else append.")
-                prim_path, reference_path = check_blend_file_in_prims(base_name, context)
-                if not isinstance(prim_path, (str, type(None))) or not isinstance(reference_path, (str, type(None))):
-                    error_message = "check_blend_file_in_prims() should return a tuple (str or None, str or None)."
-                    logging.error(error_message)
-                    self.report({'ERROR'}, error_message)
-                    return {'CANCELLED'}
-
-                if prim_path:
-                    logging.info(f"Existing prim found: {prim_path}. Initiating replacement.")
-                    print(f"Existing prim found: {prim_path}. Initiating replacement.")
-
-                    result_fetch = fetch_file_paths_from_reference_prim(reference_path, context)
-                    if not isinstance(result_fetch, tuple) or len(result_fetch) != 2:
-                        error_message = "fetch_file_paths_from_reference_prim() should return a tuple (str, str)."
-                        logging.error(error_message)
-                        self.report({'ERROR'}, error_message)
-                        export_lock = False
-                        logging.debug("Lock released for export process due to failed asset path retrieval.")
-                        return {'CANCELLED'}
-
-                    existing_path, existing_layer = result_fetch
-
-                    if not existing_path or not existing_layer:
-                        self.report({'ERROR'}, "Failed to retrieve existing asset file paths for replacement.")
-                        logging.error("Failed to retrieve existing asset file paths for replacement.")
-                        export_lock = False
-                        logging.debug("Lock released for export process due to failed asset path retrieval.")
-                        return {'CANCELLED'}
-
-                    result_replace = replace_mesh_with_put_request(reference_path, ingested_usd, existing_path, existing_layer, context)
-                    if not isinstance(result_replace, tuple) or len(result_replace) != 2:
-                        error_message = "replace_mesh_with_put_request() should return a tuple (bool, str)."
-                        logging.error(error_message)
-                        self.report({'ERROR'}, error_message)
-                        return {'CANCELLED'}
-
-                    success_replace, new_reference_path = result_replace
-
-                    if success_replace and isinstance(new_reference_path, str):
-                        self.report({'INFO'}, "Ingest Complete - Mesh Replaced")
-                        logging.info("Mesh replaced successfully in Remix.")
-                        print("Mesh replaced successfully in Remix.")
-
-                        select_success = select_mesh_prim_in_remix(new_reference_path, context)
-                        if not select_success:
-                            self.report({'WARNING'}, "Failed to select mesh prim in Remix.")
-                            logging.warning("Failed to select mesh prim in Remix.")
-
-                        ingest_result = handle_height_textures(context, new_reference_path, exported_objects=mesh_objects)
-                        if ingest_result != {'FINISHED'}:
-                            self.report({'ERROR'}, "Failed to process height textures.")
-                            logging.error("Failed to process height textures.")
-                            return {'CANCELLED'}
-                    else:
-                        self.report({'ERROR'}, "Failed to replace mesh via PUT request.")
-                        logging.error("Failed to replace mesh via PUT request.")
-                        return {'CANCELLED'}
-                else:
-                    logging.info("No existing prim found. Proceeding to append the new mesh.")
-                    print("No existing prim found. Proceeding to append the new mesh.")
-
-                    selected_prim_paths = fetch_selected_mesh_prim_paths()
-                    if not isinstance(selected_prim_paths, list):
-                        error_message = "fetch_selected_mesh_prim_paths() should return a list."
-                        logging.error(error_message)
-                        self.report({'ERROR'}, error_message)
-                        export_lock = False
-                        logging.debug("Lock released for export process due to failed prim path retrieval.")
-                        return {'CANCELLED'}
-
-                    if not selected_prim_paths:
-                        self.report({'ERROR'}, "Failed to retrieve the target prim path from Remix server.")
-                        logging.error("Failed to retrieve the target prim path from Remix server.")
-                        export_lock = False
-                        logging.debug("Lock released for export process due to failed prim path retrieval.")
-                        return {'CANCELLED'}
-
-                    for prim_path_full in selected_prim_paths:
-                        trimmed_prim_path = trim_prim_path(prim_path_full, segments_to_trim=1)
-                        logging.info(f"Trimmed prim path for appending: {trimmed_prim_path}")
-                        print(f"Trimmed prim path for appending: {trimmed_prim_path}")
-
-                        result_append = append_mesh_with_post_request(trimmed_prim_path, ingested_usd, context)
-                        if not isinstance(result_append, tuple) or len(result_append) != 2:
-                            error_message = "append_mesh_with_post_request() should return a tuple (bool, str)."
-                            logging.error(error_message)
-                            self.report({'ERROR'}, error_message)
-                            return {'CANCELLED'}
-
-                        success_append, new_reference_path = result_append
-
-                        if success_append and isinstance(new_reference_path, str):
-                            self.report({'INFO'}, "Ingest Complete - Mesh Appended")
-                            logging.info("Mesh appended successfully in Remix.")
-                            print("Mesh appended successfully in Remix.")
-
-                            obj_name = obj_filename.replace('.obj', '')
-                            actual_mesh = get_actual_mesh_name(mesh_objects)
-                            dynamic_prim = construct_dynamic_prim_path(new_reference_path, obj_name, actual_mesh, append_world=True)
-                            if not dynamic_prim:
-                                self.report({'ERROR'}, "Failed to construct dynamic prim path.")
-                                logging.error("Failed to construct dynamic prim path.")
-                                return {'CANCELLED'}
-
-                            ingest_result = handle_height_textures(context, new_reference_path, exported_objects=mesh_objects)
-                            if ingest_result != {'FINISHED'}:
-                                self.report({'ERROR'}, "Failed to process height textures.")
-                                logging.error("Failed to process height textures.")
-                                return {'CANCELLED'}
-                        else:
-                            self.report({'ERROR'}, "Failed to append mesh via POST request.")
-                            logging.error("Failed to append mesh via POST request.")
-                            return {'CANCELLED'}
-
-            return {'FINISHED'}
+            self._worker_pool.append({
+                "process": proc,
+                "tasks_count": len(batch),
+                "start_time": time.time()
+            })
+            logging.info(f"→ Launched worker PID {proc.pid} for {len(batch)} tasks.")
 
         except Exception as e:
-            logging.error(f"Unexpected error during export and ingest: {e}")
-            self.report({'ERROR'}, f"Failed Ingest: {e}")
+            logging.error(f"Could not launch bake worker: {e}", exc_info=True)
+            # If launch fails, immediately mark its tasks as "finished" to avoid a stall
+            with self._op_lock:
+                self._finished_tasks += len(batch)
+
+    def _prepare_and_validate_textures(self, context, objects_to_export):
+        """
+        Recursively finds all image textures in used materials and ensures they have
+        a valid, accessible file path before baking or exporting.
+        - Handles textures nested inside node groups (e.g., from other addons).
+        - Recovers textures with invalid paths (e.g., from temp files) by saving their in-memory data.
+        - Converts EXR files to PNG for wider compatibility.
+        """
+
+        def get_all_image_nodes_recursive(node_tree):
+            """
+            A generator function that recursively yields all TEX_IMAGE nodes
+            from a node tree and any nested groups.
+            """
+            for node in node_tree.nodes:
+                if node.type == 'TEX_IMAGE':
+                    yield node
+                elif node.type == 'GROUP' and node.node_tree:
+                    # Recurse into the group's node tree
+                    yield from get_all_image_nodes_recursive(node.node_tree)
+
+        logging.info("Starting recursive texture preparation and validation...")
+        processed_materials = set()
+        
+        # Create a single, managed temporary directory for any recovered textures.
+        temp_texture_dir = os.path.join(tempfile.gettempdir(), "remix_recovered_textures")
+        if os.path.isdir(temp_texture_dir):
+            shutil.rmtree(temp_texture_dir, ignore_errors=True)
+        os.makedirs(temp_texture_dir, exist_ok=True)
+        self._export_data['temp_files_to_clean'].add(temp_texture_dir)
+
+        for obj in objects_to_export:
+            if obj.type != 'MESH' or not obj.data:
+                continue
+                
+            used_material_indices = {p.material_index for p in obj.data.polygons}
+
+            for i, slot in enumerate(obj.material_slots):
+                if i not in used_material_indices:
+                    continue
+
+                mat = slot.material
+                if not mat or not mat.use_nodes or mat in processed_materials:
+                    continue
+                
+                processed_materials.add(mat)
+                logging.debug(f"Validating textures for used material: '{mat.name}'")
+
+                # Use the recursive helper to find ALL image nodes
+                for node in get_all_image_nodes_recursive(mat.node_tree):
+                    if not node.image:
+                        continue
+
+                    # Use the now-centralized validation logic
+                    if not self._validate_and_recover_image_source(node.image, temp_texture_dir):
+                        return False # Stop if recovery fails
+
+                    # --- EXR Conversion (runs on the now-guaranteed-to-exist filepath) ---
+                    # Need to get the path again as recovery might have changed it
+                    filepath = abspath(node.image.filepath_from_user())
+                    if filepath.lower().endswith('.exr'):
+                        png_path = os.path.splitext(filepath)[0] + ".png"
+                        if os.path.exists(png_path) and os.path.getmtime(png_path) > os.path.getmtime(filepath):
+                            logging.debug(f"Using existing, newer PNG for '{os.path.basename(filepath)}'.")
+                            try:
+                                png_img = bpy.data.images.load(png_path, check_existing=True)
+                                node.image = png_img
+                            except Exception as e_load:
+                                logging.warning(f"Could not load existing PNG {png_path}, will re-convert: {e_load}")
+                            else:
+                                continue 
+                                
+                        logging.info(f"Converting EXR '{os.path.basename(filepath)}' to PNG for export.")
+                        try:
+                            exr_img = bpy.data.images.load(filepath, check_existing=True)
+                            png_img = exr_img.copy()
+                            png_img.filepath_raw = png_path
+                            png_img.file_format = 'PNG'
+                            png_img.save()
+                            node.image = png_img
+                        except Exception as e_convert:
+                            self.report({'ERROR'}, f"Failed to convert EXR '{os.path.basename(filepath)}': {e_convert}")
+                            logging.error(f"Failed to convert EXR '{filepath}': {e_convert}", exc_info=True)
+                            return False
+
+        logging.info("Texture preparation and validation successful.")
+        return True
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        with self._op_lock:
+            # --- Check on active workers ---
+            completed_indices = []
+            has_errors = False
+            for i, worker in enumerate(self._worker_pool):
+                proc = worker['process']
+                # Check if process has terminated
+                if proc.poll() is not None:
+                    completed_indices.append(i)
+                    self._finished_tasks += worker['tasks_count']
+
+                    # --- CRITICAL: Check for worker errors ---
+                    if proc.returncode != 0:
+                        has_errors = True
+                        stdout, stderr = proc.communicate()  # Get all output
+                        logging.error(f"Bake worker PID {proc.pid} FAILED with exit code {proc.returncode}.")
+                        logging.error("--- Worker STDERR ---\n" + (stderr or "N/A"))
+                        logging.error("--- Worker STDOUT ---\n" + (stdout or "N/A"))
+                        # Report the error to the user via the popup
+                        bpy.ops.object.show_popup('INVOKE_DEFAULT',
+                                                message=f"Bake failed! Worker PID {proc.pid} exited with an error. See System Console.",
+                                                success=False)
+
+                # Check for timeout
+                elif (time.time() - worker['start_time']) > self.WORKER_TIMEOUT_SECONDS:
+                    logging.error(f"Bake worker PID {proc.pid} TIMED OUT. Terminating.")
+                    proc.kill()
+                    stdout, stderr = proc.communicate()  # Get any output before kill
+                    logging.error("--- Worker STDERR on Timeout ---\n" + (stderr or "N/A"))
+                    logging.error("--- Worker STDOUT on Timeout ---\n" + (stdout or "N/A"))
+
+                    completed_indices.append(i)
+                    self._finished_tasks += worker['tasks_count']
+                    has_errors = True
+                    bpy.ops.object.show_popup('INVOKE_DEFAULT',
+                                            message=f"Bake worker PID {proc.pid} timed out.",
+                                            success=False)
+
+            # --- If any worker failed, abort the entire operation ---
+            if has_errors:
+                # Kill any other remaining workers
+                for worker in self._worker_pool:
+                    if worker['process'].poll() is None:
+                        worker['process'].kill()
+                self.report({'ERROR'}, "Bake process failed. See System Console for worker logs.")
+                return self._cleanup(context, {'CANCELLED'})
+
+            # --- Clean up completed workers from the pool ---
+            for i in sorted(completed_indices, reverse=True):
+                self._worker_pool.pop(i)
+
+            # --- Launch new workers if there are tasks and capacity ---
+            while len(self._worker_pool) < MAX_CONCURRENT_BAKE_WORKERS and not self._bake_task_queue.empty():
+                self._launch_worker_from_queue()
+
+            # --- Update progress bar ---
+            if self._total_tasks > 0:
+                progress = (self._finished_tasks / self._total_tasks) * 100
+                context.workspace.status_text_set(f"Baking Textures... {self._finished_tasks}/{self._total_tasks} ({progress:.0f}%) Complete")
+
+            # --- Check for successful completion ---
+            if self._finished_tasks >= self._total_tasks and not self._worker_pool:
+                logging.info("All bake workers completed successfully.")
+                try:
+                    # Now that we know bakes are done, finalize the export
+                    self._finalize_export(context)
+                except Exception as e:
+                    # Catch errors during finalization (e.g., file system issues)
+                    logging.error(f"Finalization failed even after bake success: {e}", exc_info=True)
+                    self.report({'ERROR'}, f"Finalization failed: {e}")
+                    return self._cleanup(context, {'CANCELLED'})
+
+                # The original success report is fine here
+                self.report({'INFO'}, f"Export complete. Baked {self._total_tasks} textures.")
+                return self._cleanup(context, {'FINISHED'})
+
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        if not export_lock.acquire(blocking=False):
+            self.report({'INFO'}, "Another export is already in progress.")
             return {'CANCELLED'}
 
-        finally:
-            if normals_flipped:
-                for obj in mesh_objects:
-                    flip_normals_api(obj)
-                    logging.debug(f"Flipped normals back for object after export: {obj.name}")
-                    print(f"Flipped normals back for object after export: {obj.name}")
+        # Reset state for a fresh run
+        self._export_data = {
+            "mesh_objects_to_export": [], "bake_info": {}, "temp_files_to_clean": set(),
+            "original_material_assignments": {}, "baked_materials": {}, "normals_were_flipped": False,
+            "original_texture_paths": {}, "original_active_uv_maps": {}
+        }
 
-                logging.info("Normals flipped back after export to restore original state.")
-                print("Normals flipped back after export to restore original state.")
+        try:
+            addon_prefs = context.preferences.addons[__name__].preferences
+            if addon_prefs.remix_ingest_directory.strip() in ["/ProjectFolder/Assets", ""]:
+                bpy.ops.object.show_popup('INVOKE_DEFAULT', message="Ingestion Canceled: Please set a valid 'Ingest Directory' in addon preferences.", success=False)
+                return self._cleanup(context, {'CANCELLED'})
 
-            if temp_filepath and os.path.exists(temp_filepath):
+            if not is_blend_file_saved():
+                raise RuntimeError("Please save the .blend file at least once before exporting.")
+            if not BAKE_WORKER_PY or not os.path.exists(BAKE_WORKER_PY):
+                raise RuntimeError(f"Bake worker script not found at: {BAKE_WORKER_PY}")
+
+            self._export_data["mesh_objects_to_export"] = [o for o in (context.selected_objects if addon_prefs.remix_use_selection_only else context.scene.objects) if o.type == 'MESH']
+            if not self._export_data["mesh_objects_to_export"]:
+                raise RuntimeError("No mesh objects found to export.")
+
+            for mat in {s.material for o in self._export_data["mesh_objects_to_export"] for s in o.material_slots if s.material}:
+                if not mat or not mat.use_nodes: continue
+                for node in mat.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        self._export_data["original_texture_paths"][node.name + "@" + mat.name] = (node.image, node.image.filepath_raw)
+
+            if not self._prepare_and_validate_textures(context, self._export_data["mesh_objects_to_export"]):
+                return self._cleanup(context, {'CANCELLED'})
+
+            self._op_lock = Lock()
+            self._bake_task_queue = Queue()
+
+            tasks, mat_map, bake_dir, height_info = collect_bake_tasks(context, self._export_data["mesh_objects_to_export"])
+            self._export_data['bake_info'] = {'tasks': tasks, 'material_map': mat_map, 'bake_dir': bake_dir, 'height_map_info': height_info}
+
+            if not tasks:
+                logging.info("No procedural textures to bake. Finalizing export directly.")
+                self._finalize_export(context)
+                return self._cleanup(context, {'FINISHED'})
+
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".blend", delete=False) as temp_f:
+                    temp_filepath = temp_f.name
+                
+                logging.info(f"Saving temporary copy of the scene for baking to: {temp_filepath}")
+                bpy.ops.wm.save_as_mainfile(filepath=temp_filepath, copy=True)
+                
+                self._export_data["temp_files_to_clean"].add(temp_filepath)
+
+                for task in tasks:
+                    task['blend_file'] = temp_filepath
+                
+                logging.info("Temporary file saved. Workers will use this copy.")
+
+            except Exception as e:
+                logging.error(f"Failed to save temporary .blend file for baking: {e}", exc_info=True)
+                self.report({'ERROR'}, "Could not save temporary file for baking process.")
+                return self._cleanup(context, {'CANCELLED'})
+
+            self._total_tasks = len(tasks)
+            self._finished_tasks = 0
+            for i in range(0, self._total_tasks, BAKE_BATCH_SIZE_PER_WORKER):
+                self._bake_task_queue.put(tasks[i:i + BAKE_BATCH_SIZE_PER_WORKER])
+
+            for _ in range(MAX_CONCURRENT_BAKE_WORKERS): self._launch_worker_from_queue()
+
+            self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
+
+        except Exception as e:
+            logging.error(f"Export failed during setup: {e}", exc_info=True)
+            self.report({'ERROR'}, f"Export setup failed: {e}")
+            return self._cleanup(context, {'CANCELLED'})
+
+    def _finalize_export(self, context):
+        addon_prefs = context.preferences.addons[__name__].preferences
+        try:
+            self._prepare_materials_for_export()
+
+            if addon_prefs.flip_faces_export:
+                batch_flip_normals_optimized(self._export_data["mesh_objects_to_export"], context)
+                self._export_data["normals_were_flipped"] = True
+
+            base_name, asset_number = get_asset_number(context)
+            obj_filename = f"{base_name}_{asset_number}.obj"
+            temp_dir = tempfile.gettempdir()
+            exported_obj_path = os.path.join(temp_dir, obj_filename)
+            self._export_data["temp_files_to_clean"].add(exported_obj_path)
+
+            bpy.ops.wm.obj_export(
+                filepath=exported_obj_path, check_existing=True,
+                forward_axis=addon_prefs.obj_export_forward_axis, up_axis=addon_prefs.obj_export_up_axis,
+                global_scale=addon_prefs.remix_export_scale, apply_modifiers=addon_prefs.apply_modifiers,
+                export_selected_objects=addon_prefs.remix_use_selection_only,
+                export_materials=True, path_mode='COPY'
+            )
+            self._export_data["temp_files_to_clean"].add(exported_obj_path.replace('.obj', '.mtl'))
+            logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
+
+            self._restore_original_materials()
+
+            ingested_usd = upload_to_api(exported_obj_path, addon_prefs.remix_ingest_directory, context)
+            if not ingested_usd: raise RuntimeError("API upload failed.")
+
+            final_reference_prim = self._replace_or_append_on_server(context, ingested_usd)
+            if not final_reference_prim: raise RuntimeError("Server replace/append operation failed.")
+
+            # --- CRITICAL FIX ---
+            # Pass the _export_data dictionary, which contains the path
+            # to the baked height map, to the handler function.
+            handle_height_textures(context, final_reference_prim, export_data=self._export_data)
+
+        except Exception as e:
+            logging.error(f"Export finalization failed: {e}", exc_info=True)
+            self.report({'ERROR'}, f"Finalization failed: {e}")
+            self._restore_original_materials()
+
+          
+    def _find_udim_source_node_recursive(self, start_socket):
+        """
+        Recursively traces back from a socket to find the ultimate source node,
+        specifically looking for a TEX_IMAGE node with UDIMs.
+        Returns the node if found, otherwise None.
+        """
+        if not start_socket.is_linked:
+            return None
+
+        # Use a deque for a non-recursive stack-based traversal
+        # to avoid Python's recursion depth limits on complex node graphs.
+        q = collections.deque([(start_socket.links[0].from_node, start_socket.links[0].from_socket)])
+        visited_groups = set()
+
+        while q:
+            node, socket = q.popleft()
+
+            # Base case: Found the target UDIM texture node
+            if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
+                return node
+
+            # Traversal case 1: Reroute node
+            if node.type == 'REROUTE':
+                if node.inputs[0].is_linked:
+                    q.append((node.inputs[0].links[0].from_node, node.inputs[0].links[0].from_socket))
+                continue
+
+            # Traversal case 2: Node Group
+            if node.type == 'GROUP':
+                if node.name in visited_groups or not node.node_tree:
+                    continue
+                visited_groups.add(node.name)
+                # Find the corresponding output socket inside the group
+                internal_out_socket = next((s for n in node.node_tree.nodes if n.type == 'GROUP_OUTPUT' for s in n.inputs if s.identifier == socket.identifier), None)
+                if internal_out_socket and internal_out_socket.is_linked:
+                    q.append((internal_out_socket.links[0].from_node, internal_out_socket.links[0].from_socket))
+                continue
+
+            # Traversal case 3: Utility nodes that pass color/value through
+            if node.type in ('NORMAL_MAP', 'DISPLACEMENT', 'BUMP'):
+                input_socket_name = 'Color' if node.type == 'NORMAL_MAP' else 'Height'
+                if node.type == 'BUMP': input_socket_name = 'Height'
+                
+                if input_socket_name in node.inputs and node.inputs[input_socket_name].is_linked:
+                    q.append((node.inputs[input_socket_name].links[0].from_node, node.inputs[input_socket_name].links[0].from_socket))
+                continue
+                
+        # If the loop finishes without finding a UDIM texture
+        return None
+
+          
+    def _bake_udim_material_to_atlas(self, context, mat, objects_using_mat, bake_dir):
+        if not mat or not mat.use_nodes:
+            return None, None
+        logging.info(f"--- Starting NON-BAKING UDIM Stitch for Material: '{mat.name}' ---")
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        output_node = next((n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL"), None)
+        if not bsdf or not output_node:
+            logging.warning(f"No Principled BSDF or Material Output found in '{mat.name}'. Cannot stitch.")
+            return mat, None
+        udim_jobs = collections.defaultdict(list)
+        sockets_to_check = list(bsdf.inputs) + [output_node.inputs['Displacement']]
+        for socket in sockets_to_check:
+            if not socket.is_linked: continue
+            source_node = self._find_udim_source_node_recursive(socket)
+            if source_node:
+                udim_jobs[source_node].append(socket.name)
+        if not udim_jobs:
+            logging.info(f"No UDIM textures found to stitch for material '{mat.name}'.")
+            return mat, None
+
+        final_stitched_mat = bpy.data.materials.new(name=f"{mat.name}__UDIM_STITCHED")
+        self._export_data["baked_materials"][mat.name] = final_stitched_mat
+        final_stitched_mat.use_nodes = True
+        nt = final_stitched_mat.node_tree
+        for node in nt.nodes: nt.nodes.remove(node)
+        new_bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+        new_mat_output = nt.nodes.new('ShaderNodeOutputMaterial')
+        nt.links.new(new_bsdf.outputs['BSDF'], new_mat_output.inputs['Surface'])
+        uv_map_node = nt.nodes.new('ShaderNodeUVMap')
+        uv_map_node.uv_map = "remix_atlas_uv"
+
+        all_processed_tiles = []
+        for udim_node, target_socket_names in udim_jobs.items():
+            image = udim_node.image
+            tiles = sorted([t for t in image.tiles if t.label], key=lambda t: t.number)
+            if not all_processed_tiles: all_processed_tiles = tiles
+            num_tiles = len(tiles)
+            if num_tiles == 0:
+                logging.warning(f"UDIM texture '{image.name}' has no valid tiles. Skipping.")
+                continue
+            logging.info(f"Found {num_tiles} tiles for UDIM texture '{image.name}'. Stitching...")
+            tile_width, tile_height = image.size
+            if tile_width == 0 or tile_height == 0:
+                determined_size = False
+                for tile_to_check in tiles:
+                    base_path_pattern = image.filepath_raw
+                    if not base_path_pattern: continue
+                    tile_path = abspath(base_path_pattern.replace('<UDIM>', str(tile_to_check.number)))
+                    if os.path.exists(tile_path):
+                        loaded_tile = self._load_tile_robustly(tile_path, tile_to_check.label)
+                        if loaded_tile:
+                            tile_width, tile_height = loaded_tile.size
+                            determined_size = True
+                            bpy.data.images.remove(loaded_tile)
+                            break
+                if not determined_size:
+                    logging.error(f"Could not determine tile size for any tile in '{image.name}'. Defaulting to 2048x2048.")
+                    tile_width, tile_height = 2048, 2048
+            atlas_width = tile_width * num_tiles
+            atlas_height = tile_height
+            safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '.', '-'))
+            safe_img_name = "".join(c for c in image.name if c.isalnum() or c in ('_', '.', '-'))
+            atlas_filename = f"{safe_mat_name}_{safe_img_name}_atlas.png"
+            atlas_filepath = os.path.join(bake_dir, atlas_filename)
+            logging.info(f"Creating atlas: {atlas_width}x{atlas_height} at '{atlas_filepath}'")
+            atlas_image = bpy.data.images.new(name=atlas_filename, width=atlas_width, height=atlas_height, alpha=True)
+            atlas_image.filepath_raw = atlas_filepath
+            atlas_image.file_format = 'PNG'
+            atlas_pixels = [0.0] * (atlas_width * atlas_height * 4)
+            for i, tile in enumerate(tiles):
+                base_path_pattern = image.filepath_raw
+                if not base_path_pattern:
+                    logging.warning(f"Image '{image.name}' has no base filepath pattern. Cannot resolve tile {tile.number}.")
+                    continue
+                tile_path = abspath(base_path_pattern.replace('<UDIM>', str(tile.number)))
+                if not os.path.exists(tile_path):
+                    logging.warning(f"Tile path does not exist, skipping: {tile_path}")
+                    continue
+                tile_image = self._load_tile_robustly(tile_path, tile.label)
+                if not tile_image: continue
                 try:
-                    os.remove(temp_filepath)
-                    logging.info(f"Deleted temporary OBJ file: {temp_filepath}")
-                    print(f"Deleted temporary OBJ file: {temp_filepath}")
-                except Exception as e:
-                    logging.error(f"Failed to delete temporary OBJ file: {e}")
-                    print(f"Failed to delete temporary OBJ file: {e}")
+                    if tile_image.size[0] != tile_width or tile_image.size[1] != tile_height:
+                        logging.warning(f"Tile '{tile.label}' has mismatched dimensions ({tile_image.size[0]}x{tile_image.size[1]}) vs atlas tile size ({tile_width}x{tile_height}). Resizing in memory.")
+                        tile_image.scale(tile_width, tile_height)
+                    tile_pixels = tile_image.pixels[:]
+                    for y in range(tile_height):
+                        src_start_idx = (y * tile_width) * 4
+                        src_end_idx = src_start_idx + (tile_width * 4)
+                        dest_x_offset = i * tile_width
+                        dest_start_idx = (y * atlas_width + dest_x_offset) * 4
+                        dest_end_idx = dest_start_idx + (tile_width * 4)
+                        atlas_pixels[dest_start_idx:dest_end_idx] = tile_pixels[src_start_idx:src_end_idx]
+                finally:
+                    bpy.data.images.remove(tile_image)
+            atlas_image.pixels = atlas_pixels
+            atlas_image.save()
+            atlas_tex_node = nt.nodes.new('ShaderNodeTexImage')
+            atlas_tex_node.image = atlas_image
+            nt.links.new(uv_map_node.outputs['UV'], atlas_tex_node.inputs['Vector'])
+            is_data = any('Normal' in name or 'Roughness' in name or 'Metallic' in name for name in target_socket_names)
+            atlas_image.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
+            for socket_name in target_socket_names:
+                target_socket = new_bsdf.inputs.get(socket_name) or new_mat_output.inputs.get(socket_name)
+                if not target_socket: continue
+                if target_socket.type == 'VECTOR' and 'Normal' in target_socket.name:
+                    normal_map_node = nt.nodes.new('ShaderNodeNormalMap')
+                    nt.links.new(atlas_tex_node.outputs['Color'], normal_map_node.inputs['Color'])
+                    nt.links.new(normal_map_node.outputs['Normal'], target_socket)
+                elif socket_name == 'Displacement':
+                    disp_node = nt.nodes.new('ShaderNodeDisplacement')
+                    nt.links.new(atlas_tex_node.outputs['Color'], disp_node.inputs['Height'])
+                    nt.links.new(disp_node.outputs['Displacement'], new_mat_output.inputs['Displacement'])
+                    logging.info(f"Storing stitched displacement map path for API: {atlas_filepath}")
+                    self._export_data.setdefault('bake_info', {}).setdefault('height_map_info', {})[mat.name] = atlas_filepath
+                else:
+                    nt.links.new(atlas_tex_node.outputs['Color'], target_socket)
+        logging.info(f"--- Finished NON-BAKING UDIM Stitch for '{mat.name}' ---")
+        return final_stitched_mat, all_processed_tiles
 
-            if mtl_filepath and os.path.exists(mtl_filepath):
-                try:
-                    os.remove(mtl_filepath)
-                    logging.info(f"Deleted temporary MTL file: {mtl_filepath}")
-                    print(f"Deleted temporary MTL file: {mtl_filepath}")
-                except Exception as e:
-                    logging.error(f"Failed to delete temporary MTL file: {e}")
-                    print(f"Failed to delete temporary MTL file: {e}")
+    def _load_tile_robustly(self, tile_path, tile_label):
+        """
+        A dedicated, robust helper to load a single image tile from disk.
+        It ensures pixels are actually loaded into memory and returns a valid
+        image datablock, or None if it fails.
+        """
+        tile_image = None
+        try:
+            tile_image = bpy.data.images.load(tile_path, check_existing=True)
 
-            export_lock = False
-            logging.debug("Lock released for export process.")
+            # The most reliable way to check for pixels is to try accessing them.
+            # `has_data` can be misleading. A zero-length pixel array is definitive.
+            if len(tile_image.pixels) > 0:
+                return tile_image # Success on first try
             
+            # If pixels are empty, force a reload from disk.
+            logging.debug(f"Tile '{tile_label}' at '{tile_path}' loaded without data. Forcing reload...")
+            tile_image.reload()
+
+            # Final check. If this fails, the file is unreadable by Blender's scripting API.
+            if len(tile_image.pixels) > 0:
+                return tile_image # Success after reload
+            
+            # If we reach here, it failed.
+            logging.warning(
+                f"CRITICAL: Could not load pixel data for tile '{tile_label}' from path '{tile_path}'. "
+                "The file may be corrupt, have an unsupported format/bit-depth, or have access permission issues. "
+                "Skipping this tile."
+            )
+            bpy.data.images.remove(tile_image)
+            return None
+
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while loading tile '{tile_label}' from '{tile_path}': {e}", exc_info=True)
+            if tile_image:
+                bpy.data.images.remove(tile_image)
+            return None
+
+    def _transform_uvs_for_atlas(self, objects_to_process, processed_tiles):
+        if not objects_to_process or not processed_tiles: return
+        num_tiles = len(processed_tiles)
+        if num_tiles == 0: return
+        logging.info(f"Transforming UVs for {len(objects_to_process)} object(s) to fit {num_tiles}-tile atlas.")
+        tile_number_to_atlas_index = {tile.number: i for i, tile in enumerate(processed_tiles)}
+        for obj in objects_to_process:
+            if not obj.data or not obj.data.uv_layers: continue
+            source_uv_layer = obj.data.uv_layers[0]
+            if not source_uv_layer:
+                logging.warning(f"Object '{obj.name}' has no source UV map. Skipping UV transformation.")
+                continue
+            atlas_uv_map_name = "remix_atlas_uv"
+            if atlas_uv_map_name in obj.data.uv_layers:
+                atlas_uv_layer = obj.data.uv_layers[atlas_uv_map_name]
+                logging.debug(f"Re-using existing atlas UV map '{atlas_uv_map_name}' for object '{obj.name}'.")
+            else:
+                atlas_uv_layer = obj.data.uv_layers.new(name=atlas_uv_map_name)
+                logging.debug(f"Created new atlas UV map '{atlas_uv_map_name}' for object '{obj.name}'.")
+            
+            # THE FIX: This must be set before export
+            obj.data.uv_layers.active = atlas_uv_layer
+            logging.info(f"Set '{atlas_uv_map_name}' as the active UV map for '{obj.name}' for export.")
+
+            for loop_index in range(len(source_uv_layer.data)):
+                original_uv = source_uv_layer.data[loop_index].uv
+                u_original = original_uv.x
+                v_original = original_uv.y
+                tile_u_offset = math.floor(u_original)
+                udim_number = 1001 + tile_u_offset
+                atlas_index = tile_number_to_atlas_index.get(udim_number)
+                if atlas_index is not None:
+                    u_fractional = u_original - tile_u_offset
+                    u_new = (u_fractional + atlas_index) / num_tiles
+                else:
+                    u_new = 0.0
+                    v_original = 0.0
+                atlas_uv_layer.data[loop_index].uv = (u_new, v_original)
+            logging.info(f"Successfully transformed UVs for '{obj.name}'.")
+
+    def _prepare_materials_for_export(self):
+        logging.info("Preparing materials for export by swapping to baked/stitched textures.")
+        context = bpy.context
+        # --- THE FIX: Store original active UV maps before any changes ---
+        self._export_data["original_active_uv_maps"] = {
+            obj.name: obj.data.uv_layers.active.name 
+            for obj in self._export_data["mesh_objects_to_export"] 
+            if obj.data and obj.data.uv_layers.active
+        }
+        self._export_data["original_material_assignments"] = {
+            obj.name: [s.material for s in obj.material_slots]
+            for obj in self._export_data["mesh_objects_to_export"]
+        }
+        self._export_data["baked_materials"] = {}
+        final_export_materials = {}
+        materials_with_udims = set()
+        materials_with_procedurals = set()
+        procedural_bake_info = self._export_data.get('bake_info', {})
+        procedural_material_map = procedural_bake_info.get('material_map', {})
+        for mat_uuid, mat in procedural_material_map.items():
+            materials_with_procedurals.add(mat)
+        for obj in self._export_data["mesh_objects_to_export"]:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if not mat or not mat.use_nodes: continue
+                if any(node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED' for node in mat.node_tree.nodes):
+                    materials_with_udims.add(mat)
+        if materials_with_udims:
+            bake_dir = self._export_data.get('bake_info', {}).get('bake_dir', tempfile.gettempdir())
+            for mat in materials_with_udims:
+                objects_using_mat = [o for o in self._export_data["mesh_objects_to_export"] if mat in [s.material for s in o.material_slots if s.material]]
+                if not objects_using_mat: continue
+                baked_udim_mat, processed_tiles = self._bake_udim_material_to_atlas(context, mat, objects_using_mat, bake_dir)
+                if baked_udim_mat and processed_tiles:
+                    final_export_materials[mat.name] = baked_udim_mat
+                    self._transform_uvs_for_atlas(objects_using_mat, processed_tiles)
+                else:
+                    final_export_materials[mat.name] = mat
+        if materials_with_procedurals:
+            tasks_by_mat_uuid = defaultdict(list)
+            for task in procedural_bake_info.get('tasks', []):
+                tasks_by_mat_uuid[task['material_uuid']].append(task)
+            for mat in materials_with_procedurals:
+                if mat in materials_with_udims: continue
+                mat_uuid = mat.get("uuid")
+                if not mat_uuid or mat_uuid not in tasks_by_mat_uuid: continue
+                baked_proc_mat = bpy.data.materials.new(name=f"{mat.name}__PROC_BAKED")
+                self._export_data["baked_materials"][mat.name] = baked_proc_mat
+                baked_proc_mat.use_nodes = True
+                nt = baked_proc_mat.node_tree
+                for node in nt.nodes: nt.nodes.remove(node)
+                bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+                mat_output = nt.nodes.new('ShaderNodeOutputMaterial')
+                nt.links.new(bsdf.outputs['BSDF'], mat_output.inputs['Surface'])
+                for task in tasks_by_mat_uuid[mat_uuid]:
+                    output_path = task.get('output_path')
+                    socket_name = task.get('target_socket_name')
+                    socket = bsdf.inputs.get(socket_name)
+                    if socket and output_path and os.path.exists(output_path):
+                        img = bpy.data.images.load(output_path, check_existing=True)
+                        is_data = task.get('is_value_bake', False) or task.get('bake_type') == 'NORMAL'
+                        img.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
+                        tex_node = nt.nodes.new('ShaderNodeTexImage')
+                        tex_node.image = img
+                        if task.get('bake_type') == 'NORMAL':
+                            normal_map_node = nt.nodes.new('ShaderNodeNormalMap')
+                            nt.links.new(tex_node.outputs['Color'], normal_map_node.inputs['Color'])
+                            nt.links.new(normal_map_node.outputs['Normal'], socket)
+                        else:
+                            nt.links.new(tex_node.outputs['Color'], socket)
+                final_export_materials[mat.name] = baked_proc_mat
+        logging.info("Assigning temporary baked/stitched materials to objects for export.")
+        for obj in self._export_data["mesh_objects_to_export"]:
+            for slot in obj.material_slots:
+                if slot.material and slot.material.name in final_export_materials:
+                    slot.material = final_export_materials[slot.material.name]
+                    
+          
+    def _restore_original_materials(self):
+        # This function now also handles restoring UV maps
+        logging.debug("Restoring original materials and UV maps.")
+        for obj_name, orig_mats in self._export_data.get("original_material_assignments", {}).items():
+            obj = bpy.data.objects.get(obj_name)
+            if obj:
+                if orig_mats:
+                    for i, original_mat in enumerate(orig_mats):
+                        if i < len(obj.material_slots):
+                            try:
+                                if original_mat and original_mat.name in bpy.data.materials:
+                                    obj.material_slots[i].material = original_mat
+                                elif original_mat is None:
+                                    obj.material_slots[i].material = None
+                                else:
+                                    logging.warning(f"Original material for slot {i} on '{obj.name}' was removed. Cannot restore.")
+                            except ReferenceError:
+                                logging.warning(f"Could not restore original material on '{obj.name}' as its reference was invalid.")
+        
+        # --- THE FIX: Restore original active UV maps and delete the temporary one ---
+        for obj_name, original_uv_map_name in self._export_data.get("original_active_uv_maps", {}).items():
+            obj = bpy.data.objects.get(obj_name)
+            if obj and obj.data:
+                # Delete the temporary atlas UV map
+                temp_uv_map_name = "remix_atlas_uv"
+                if temp_uv_map_name in obj.data.uv_layers:
+                    try:
+                        uv_layer_to_remove = obj.data.uv_layers[temp_uv_map_name]
+                        obj.data.uv_layers.remove(uv_layer_to_remove)
+                        logging.debug(f"Removed temporary UV map '{temp_uv_map_name}' from '{obj.name}'.")
+                    except Exception as e:
+                        logging.warning(f"Could not remove temporary UV map from '{obj.name}': {e}")
+                
+                # Restore the original active UV map
+                if original_uv_map_name and original_uv_map_name in obj.data.uv_layers:
+                    try:
+                        obj.data.uv_layers.active = obj.data.uv_layers[original_uv_map_name]
+                        logging.debug(f"Restored active UV map to '{original_uv_map_name}' for '{obj.name}'.")
+                    except Exception as e:
+                        logging.warning(f"Could not restore active UV map for '{obj.name}': {e}")
+
+        for key, (image_datablock, original_path) in self._export_data.get("original_texture_paths", {}).items():
+            try:
+                if image_datablock and image_datablock.name in bpy.data.images:
+                    image_datablock.filepath = original_path
+            except ReferenceError:
+                pass
+        for mat in self._export_data.get("baked_materials", {}).values():
+            try:
+                if mat and mat.name in bpy.data.materials:
+                    bpy.data.materials.remove(mat)
+            except ReferenceError:
+                logging.debug(f"A temporary baked material was already removed. Skipping explicit removal.")
+                pass
+    
+    def _replace_or_append_on_server(self, context, ingested_usd):
+        """
+        Smarter workflow handler. Automatically detects if an asset with the same
+        base name exists to perform a replace, otherwise appends a new asset.
+        The "Replace Stock Mesh" checkbox now serves as an override to force
+        replacement of the currently selected, unrelated mesh.
+        """
+        addon_prefs = context.preferences.addons[__name__].preferences
+
+        # 1. Determine the base name of the asset being exported to search for it on the server.
+        if addon_prefs.remix_use_custom_name and addon_prefs.remix_base_obj_name:
+            base_name_to_search = addon_prefs.remix_base_obj_name
+        else:
+            # These helpers already exist in your script
+            blend_name = get_blend_filename()
+            base_name_to_search = extract_base_name(blend_name)
+    
+        logging.info(f"Searching for existing asset on server with base name: '{base_name_to_search}'")
+        # 2. Use the existing 'check_blend_file_in_prims' to find if a version is already on the server.
+        # It correctly searches all prim paths for the base name.
+        prim_path_on_server, _ = check_blend_file_in_prims(base_name_to_search, context)
+
+        # 3. DECISION: Enter REPLACE mode if an existing version is found OR if the user manually checks the box.
+        if prim_path_on_server or addon_prefs.remix_replace_stock_mesh:
+        
+            prim_to_replace = prim_path_on_server
+        
+            # If no asset was found by name, but the user explicitly checked the box,
+            # fall back to replacing whatever is currently selected in Remix.
+            if not prim_to_replace:
+                logging.info("No match found by name, but 'Replace' is checked. Replacing current selection.")
+                selected_prims = fetch_selected_mesh_prim_paths()
+                if not selected_prims:
+                    raise RuntimeError("The 'Replace Stock Mesh' option is ticked, but no mesh is selected in Remix.")
+            
+                # Ensure we target a mesh prim, not a co-selected material prim.
+                prim_to_replace = next((p for p in selected_prims if "/meshes/" in p.lower()), None)
+                if not prim_to_replace:
+                        raise RuntimeError("'Replace Stock Mesh' is ticked, but the selection is not a mesh prim.")
+
+            logging.info(f"Entering REPLACE workflow. Target prim: {prim_to_replace}")
+            success, new_ref = replace_mesh_with_put_request(prim_to_replace, ingested_usd, context=context)
+            if not success:
+                raise RuntimeError(f"Failed to replace mesh for prim: {prim_to_replace}")
+        
+            select_mesh_prim_in_remix(new_ref, context)
+            return new_ref
+
+        # 4. If no existing version was found and the box is unchecked, enter APPEND mode.
+        else:
+            logging.info("Entering APPEND workflow (no existing asset found by name).")
+            
+            # --- THE FIX IS HERE ---
+            # Instead of a hardcoded path, we now check for a selection in Remix.
+            selected_prims = fetch_selected_mesh_prim_paths()
+            
+            if selected_prims:
+                # If the user has something selected, use the first selected item as the parent.
+                target_prim_for_append = selected_prims[0]
+                logging.info(f"Appending new mesh under selected prim: {target_prim_for_append}")
+            else:
+                # If nothing is selected, fall back to the safe, top-level directory.
+                target_prim_for_append = "/RootNode/meshes"
+                logging.info(f"No prim selected in Remix. Appending to default location: {target_prim_for_append}")
+            # --- END OF FIX ---
+        
+            success, new_ref = append_mesh_with_post_request(target_prim_for_append, ingested_usd, context)
+            if not success:
+                raise RuntimeError(f"Failed to append mesh under prim: {target_prim_for_append}")
+
+            select_mesh_prim_in_remix(new_ref, context)
+            return new_ref
+
+    def _cleanup(self, context, return_value):
+        """Final cleanup for the operator, called on completion or cancellation."""
+        self._restore_original_materials()
+        
+        if self._export_data.get("normals_were_flipped"):
+            batch_flip_normals_optimized(self._export_data["mesh_objects_to_export"], context)
+        
+        for f in self._export_data.get("temp_files_to_clean", set()):
+            if os.path.exists(f):
+                try: 
+                    if os.path.isdir(f):
+                        shutil.rmtree(f, ignore_errors=True)
+                    else:
+                        os.remove(f)
+                except Exception: pass
+        
+        bake_dir = self._export_data.get('bake_info', {}).get('bake_dir')
+        if bake_dir and os.path.exists(bake_dir):
+            shutil.rmtree(bake_dir, ignore_errors=True)
+            
+        temp_tex_dir = self._export_data.get('temp_texture_dir')
+        if temp_tex_dir and os.path.exists(temp_tex_dir):
+            shutil.rmtree(temp_tex_dir, ignore_errors=True)
+        
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+        self._timer = None
+        context.workspace.status_text_set(None)
+        
+        if export_lock.locked(): export_lock.release()
+        logging.debug("Export lock released.")
+        return return_value
+
+    def cancel(self, context):
+        for worker in self._worker_pool:
+            if worker['process'].poll() is None: worker['process'].kill()
+        return self._cleanup(context, {'CANCELLED'})
+        
 def convert_exr_textures_to_png(context):
     global conversion_count
     try:
@@ -3273,178 +4153,107 @@ def upload_to_api(obj_path, ingest_dir, context):
     try:
         url = addon_prefs.remix_export_url.rstrip('/') + "/model"
         abs_obj_path = os.path.abspath(obj_path).replace('\\', '/')
-
         meshes_subdir = os.path.join(ingest_dir, "meshes").replace('\\', '/')
-        os.makedirs(meshes_subdir, exist_ok=True)
-        logging.debug(f"'meshes' subdirectory ensured at: {meshes_subdir}")
 
-        # This usd_output_path is what we expect the server to create or confirm
-        usd_filename = os.path.splitext(os.path.basename(obj_path))[0] + ".usd"
-        expected_usd_output_path = os.path.join(meshes_subdir, usd_filename).replace('\\', '/')
-        logging.debug(f"Expected USD Output Path by client: {expected_usd_output_path}")
-
+        # This is the correct, full payload structure the server expects.
+        # The dynamic values for input/output paths will be inserted into it.
         payload = {
             "executor": 1,
             "name": "Model(s)",
             "context_plugin": {
                 "name": "AssetImporter",
                 "data": {
-                    "context_name": "ingestcraft",
-                    "input_files": [abs_obj_path],
-                    "output_directory": meshes_subdir, # This is the directory ON THE SERVER
-                    "allow_empty_input_files_list": True,
+                    "allow_empty_input_files_list": True, "bake_material": False, "baking_scales": False,
+                    "channel": "Default", "close_stage_on_exit": True, "context_name": "ingestcraft",
+                    "convert_fbx_to_y_up": False, "convert_fbx_to_z_up": False, "convert_stage_up_y": False,
+                    "convert_stage_up_z": False, "cook_mass_template": True, "create_context_if_not_exist": True,
+                    "create_output_directory_if_missing": True, "create_world_as_default_root_prim": True,
                     "data_flows": [
-                        {
-                            "name": "InOutData",
-                            "push_input_data": True,
-                            "push_output_data": True,
-                            "channel": "write_metadata"
-                        },
-                        {
-                            "name": "InOutData",
-                            "push_output_data": True,
-                            "channel": "ingestion_output"
-                        }
+                        {"channel": "write_metadata", "name": "InOutData", "push_input_data": True, "push_output_data": True},
+                        {"channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True}
                     ],
-                    "output_usd_extension": "usd",
-                    "hide_context_ui": True,
-                    "create_context_if_not_exist": True,
-                    "ignore_unbound_bones": False,
-                    "expose_mass_ui": True,
-                    "expose_mass_queue_action_ui": True,
-                    "cook_mass_template": True,
-                    "close_stage_on_exit": True
+                    "default_output_endpoint": "/stagecraft/assets/default-directory", "disabling_instancing": False,
+                    "embed_mdl_in_usd": True, "embed_textures": True, "export_hidden_props": False,
+                    "export_mdl_gltf_extension": False, "export_preview_surface": False, "export_separate_gltf": False,
+                    "expose_mass_queue_action_ui": True, "expose_mass_ui": True, "full_path_keep": False,
+                    "global_progress_value": 0, "hide_context_ui": True, "ignore_animations": False,
+                    "ignore_camera": False, "ignore_flip_rotations": False, "ignore_light": False,
+                    "ignore_materials": False, "ignore_pivots": False, "ignore_unbound_bones": False,
+                    "input_files": [], "keep_all_materials": False, "merge_all_meshes": False,
+                    "output_directory": "", "output_usd_extension": "usd", "progress": [0, "Initializing", True],
+                    "single_mesh": False, "smooth_normals": True, "support_point_instancer": False,
+                    "use_double_precision_to_usd_transform_op": False, "use_meter_as_world_unit": False
                 }
             },
-            "check_plugins": [ # ... (rest of your payload remains the same)
-                {
-                    "name": "ClearUnassignedMaterial", "selector_plugins": [{"name": "AllMeshes", "data": {"include_geom_subset": True}}], "data": {}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "DefaultMaterial", "selector_plugins": [{"name": "AllMeshes", "data": {}}], "data": {}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "MaterialShaders", "selector_plugins": [{"name": "AllMaterials", "data": {}}], "data": {"shader_subidentifiers": {"AperturePBR_Translucent": "translucent|glass|trans", "AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "ValueMapping", "selector_plugins": [{"name": "AllShaders", "data": {}}], "data": {"attributes": {"inputs:emissive_intensity": [{"operator": "=", "input_value": 10000, "output_value": 1}]}},
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "ConvertToOctahedral", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}],
-                    "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}]}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "ConvertToDDS", "selector_plugins": [{"name": "AllShaders", "data": {}}], "resultor_plugins": [{"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}}],
-                    "data": {"data_flows": [{"name": "InOutData", "push_input_data": True, "push_output_data": True, "channel": "cleanup_files"}, {"name": "InOutData", "push_output_data": True, "channel": "write_metadata"}]}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "RelativeAssetPaths", "selector_plugins": [{"name": "AllPrims", "data": {}}], "data": {}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "RelativeReferences", "selector_plugins": [{"name": "AllPrims", "data": {}}], "data": {}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "DependencyIterator", "data": {"save_all_layers_on_exit": True, "close_dependency_between_round": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "WrapRootPrims", "selector_plugins": [{"name": "Nothing", "data": {}}], "data": {"wrap_prim_name": "XForms"}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "CurrentStage", "data": {"save_on_exit": True, "close_stage_on_exit": False}}
-                },
-                {
-                    "name": "WrapRootPrims", "selector_plugins": [{"name": "Nothing", "data": {}}], "data": {"wrap_prim_name": "ReferenceTarget"}, "stop_if_fix_failed": True,
-                    "context_plugin": {"name": "CurrentStage", "data": {"save_on_exit": True, "close_stage_on_exit": False}}
-                }
+            "check_plugins": [
+                {"name": "ClearUnassignedMaterial", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "include_geom_subset": True, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMeshes"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "DefaultMaterial", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "include_geom_subset": False, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMeshes"}], "data": {"channel": "Default", "context_name": "", "cook_mass_template": False, "default_material_mdl_name": "OmniPBR", "default_material_mdl_url": "OmniPBR.mdl", "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "MaterialShaders", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMaterials"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "shader_subidentifiers": {"AperturePBR_Opacity": ".*", "AperturePBR_Translucent": "translucent|glass|trans"}}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "ValueMapping", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "data": {"attributes": {"inputs:emissive_intensity": [{"input_value": 10000, "operator": "=", "output_value": 1}]}, "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "ConvertToOctahedral", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "data": {"channel": "Default", "conversion_args": {"inputs:normalmap_texture": {"encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal"}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": True, "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "ConvertToDDS", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "data": {"channel": "Default", "conversion_args": {"inputs:diffuse_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:emissive_mask_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:height_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max"]}, "inputs:metallic_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:normalmap_texture": {"args": ["--format", "bc5", "--no-mip-gamma-correct"]}, "inputs:reflectionroughness_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:transmittance_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}, {"channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": True, "save_on_fix_failure": True, "suffix": ".rtex.dds"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "RelativeAssetPaths", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllPrims"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "RelativeReferences", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllPrims"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_dependency_between_round": True, "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_all_layers_on_exit": True}, "name": "DependencyIterator"}},
+                {"name": "WrapRootPrims", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "Nothing"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "set_default_prim": True, "wrap_prim_name": "XForms"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": True}, "name": "CurrentStage"}},
+                {"name": "ApplyUnitScale", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False, "select_session_layer_prims": False}, "name": "RootPrims"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "scale_target": 1}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": True}, "name": "CurrentStage"}},
+                {"name": "WrapRootPrims", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "Nothing"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "set_default_prim": True, "wrap_prim_name": "ReferenceTarget"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": True}, "name": "CurrentStage"}}
             ],
             "resultor_plugins": [
-                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_output": False}},
-                {"name": "FileMetadataWritter", "data": {"channel": "write_metadata"}}
+                {"name": "FileCleanup", "data": {"channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}},
+                {"name": "FileMetadataWritter", "data": {"channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}}
             ]
         }
 
+        # --- Inject dynamic values into the correct payload ---
+        payload["context_plugin"]["data"]["input_files"] = [abs_obj_path]
+        payload["context_plugin"]["data"]["output_directory"] = meshes_subdir
+
         logging.info(f"Uploading OBJ to {url}")
+        # Using the previously corrected make_request_with_retries to get detailed errors
         response = make_request_with_retries('POST', url, json_payload=payload, verify=addon_prefs.remix_verify_ssl, retries=1)
 
-        if response is None:
-            logging.error("Failed to upload OBJ: No response from server.")
-            return None
-
-        if response.status_code == 500:
-            try:
-                response_data_error = response.json()
-                detail = response_data_error.get("detail", "")
-            except Exception:
-                detail = response.text # Fallback to raw text if JSON parsing fails
+        if response is None or response.status_code not in [200, 201, 204]:
+            error_detail = "No response from server (network error)."
+            status_code = "N/A"
+            if response is not None:
+                status_code = response.status_code
+                try:
+                    error_detail = response.json().get("detail", response.text)
+                except json.JSONDecodeError:
+                    error_detail = response.text
             
-            # Check for your specific error message regarding ingest directory
-            if "The validation did not complete successfully" in detail or "ingest_directory" in detail.lower(): # Made check more robust
-                error_msg = "Ingestion failed: Please ensure the Ingest Directory in addon preferences is set correctly within your project structure on the server."
-                logging.error(f"{error_msg} Server detail: {detail}")
+            logging.error(f"Failed to upload OBJ. Status: {status_code}, Response: {error_detail}")
+            if status_code == 500 and "validation did not complete successfully" in error_detail:
+                error_msg = "Ingestion failed: The server validation failed. Check server logs and ensure Ingest Directory is a valid project path."
                 bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_msg, success=False)
-                return None
-            else: # Generic 500 error
-                logging.error(f"Failed to upload OBJ. Status: 500, Response: {detail}")
-                return None
-
-
-        if response.status_code != 200: # Handles other non-500 errors
-            logging.error(f"Failed to upload OBJ. Status: {response.status_code}, Response: {response.text}")
             return None
 
+        # Success path
         response_data = response.json()
         completed_schemas = response_data.get("completed_schemas", [])
         if not completed_schemas:
-            logging.error("No completed schemas found in response.")
+            logging.error("No completed schemas found in successful response.")
             return None
 
-        # --- CORRECTED USD PATH EXTRACTION ---
-        usd_path_from_response = None
+        # Extract the final USD path from the complex response
+        # This logic is based on the structure of the provided payload
+        final_usd_path = None
         try:
-            context_plugin_data = completed_schemas[0].get("context_plugin", {}).get("data", {})
-            data_flows = context_plugin_data.get("data_flows", [])
-            
+            data_flows = completed_schemas[0].get("context_plugin", {}).get("data", {}).get("data_flows", [])
             for flow in data_flows:
-                # Check for flows that are likely to contain the final USD output path
-                if flow.get("push_output_data") and flow.get("output_data"):
-                    if isinstance(flow["output_data"], list) and len(flow["output_data"]) > 0:
-                        potential_path = flow["output_data"][0]
-                        if isinstance(potential_path, str) and potential_path.lower().endswith(".usd"):
-                            # Prefer paths from "ingestion_output" or "write_metadata" if available
-                            if flow.get("channel") in ["ingestion_output", "write_metadata"]:
-                                usd_path_from_response = potential_path.replace('\\', '/')
-                                logging.info(f"Found USD path in data_flows (channel: '{flow.get('channel')}'): {usd_path_from_response}")
-                                break # Prefer this path
-                            elif usd_path_from_response is None: # If not set yet, take any USD path
-                                usd_path_from_response = potential_path.replace('\\', '/')
-                                logging.info(f"Found potential USD path in data_flows (channel: '{flow.get('channel')}'): {usd_path_from_response}")
-            
-            if usd_path_from_response:
-                 # Ensure the path matches what we expect or use the server's authoritative path
-                if os.path.normpath(usd_path_from_response) == os.path.normpath(expected_usd_output_path):
-                    logging.debug(f"API returned USD Path matches expected client path: {usd_path_from_response}")
-                else:
-                    logging.warning(f"API returned USD Path '{usd_path_from_response}' differs from client expected path '{expected_usd_output_path}'. Using API path.")
-                return usd_path_from_response # Return the path from the API response
+                if flow.get("channel") == "ingestion_output" and flow.get("output_data"):
+                    final_usd_path = flow["output_data"][0].replace('\\', '/')
+                    break
+            if final_usd_path:
+                 logging.info(f"Successfully ingested. Server returned USD Path: {final_usd_path}")
+                 return final_usd_path
             else:
-                logging.error("No suitable USD output path found in 'data_flows' in the response.")
+                logging.error("Could not find final USD path in server response's 'ingestion_output' data flow.")
                 return None
-
-        except Exception as e_parse:
-            logging.error(f"Error parsing 'data_flows' for USD path: {e_parse}", exc_info=True)
-            logging.error("No USD path found in the response due to parsing error.")
+        except (IndexError, KeyError) as e_parse:
+            logging.error(f"Error parsing successful response for USD path: {e_parse}", exc_info=True)
             return None
-        # --- END OF CORRECTION ---
 
-    # Removed 'finally: pass' as it's not needed
-    # Errors and None returns are handled above.
-    # If an exception occurs before a return, it will propagate.
-    except requests.exceptions.RequestException as e_req:
-        logging.error(f"Network request failed during API upload: {e_req}", exc_info=True)
-        return None
     except Exception as e_general:
         logging.error(f"An unexpected error occurred in upload_to_api: {e_general}", exc_info=True)
         return None
@@ -3737,7 +4546,6 @@ def mirror_object(obj):
         logging.error(f"Error mirroring object '{obj.name}': {e}")
         print(f"Error mirroring object '{obj.name}': {e}")
         
-
 class OBJECT_OT_show_popup(Operator):
     bl_idname = "object.show_popup"
     bl_label = "Popup Message"
@@ -3916,13 +4724,15 @@ class VIEW3D_PT_remix_ingestor(Panel):
         addon_prefs = context.preferences.addons[__name__].preferences
         layout = self.layout
 
+        # --- Presets Box ---
         presets_box = layout.box()
-        presets_box.label(text="Presets", icon='GROUP')
+        presets_box.label(text="Presets", icon='SETTINGS')
         row = presets_box.row()
         row.prop(addon_prefs, "remix_preset", text="")
 
+        # --- Export Box ---
         export_box = layout.box()
-        export_box.label(text="Export Settings", icon='EXPORT')
+        export_box.label(text="Export & Ingest", icon='EXPORT')
         export_box.prop(addon_prefs, "remix_ingest_directory", text="Ingest Directory")
         export_box.prop(addon_prefs, "remix_use_selection_only", text="Export Selected Objects Only")
 
@@ -3935,50 +4745,49 @@ class VIEW3D_PT_remix_ingestor(Panel):
 
         export_box.prop(addon_prefs, "remix_replace_stock_mesh", text="Replace Stock Mesh")
         export_box.prop(addon_prefs, "flip_faces_export", text="Flip Normals During Export")
-        export_box.prop(addon_prefs, "apply_modifiers", text="Apply Modifiers")
+        export_box.prop(addon_prefs, "apply_modifiers")
+        
         row = export_box.row(align=True)
-        row.label(text="Forward Axis")
-        row.prop(addon_prefs, "obj_export_forward_axis", text="", expand=False)
+        row.label(text="Forward Axis:")
+        row.prop(addon_prefs, "obj_export_forward_axis", text="")
         row = export_box.row(align=True)
-        row.label(text="Up Axis")
-        row.prop(addon_prefs, "obj_export_up_axis", text="", expand=False)
+        row.label(text="Up Axis:")
+        row.prop(addon_prefs, "obj_export_up_axis", text="")
+        
         export_box.prop(addon_prefs, "remix_export_scale", text="Export Scale")
+        export_box.operator("object.export_and_ingest", text="Export and Ingest", icon='PLAY')
 
-        # ------------------------------------------------------------------
-        # New button: Export to Substance
-        # ------------------------------------------------------------------
-        #export_box.operator("export.substance_painter", text="Export to Substance", icon='EXPORT')
-
-        export_box.operator("object.export_and_ingest", text="Export and Ingest")
-
+        # --- Import Box ---
         import_box = layout.box()
         import_box.label(text="USD Import", icon='IMPORT')
         import_box.prop(addon_prefs, "mirror_import", text="Mirror on Import")
-        import_box.prop(addon_prefs, "flip_normals_import", text="Flip Normals During Import")
+        import_box.prop(addon_prefs, "flip_normals_import", text="Flip Normals on Import")
         import_box.prop(addon_prefs, "remix_import_scale", text="Import Scale")
         import_box.prop(addon_prefs, "remix_import_original_textures", text="Import Original Textures")
         
-        # New Dropdown for USD Import Forward Axis
-        #row = import_box.row(align=True)
-        #row.label(text="Forward Axis (USD Source):")
-        #row.prop(addon_prefs, "usd_import_forward_axis", text="")
-
-        import_box.operator("object.import_usd_from_remix", text="Import USD from Remix")
+        import_box.operator("object.import_usd_from_remix", text="Import from Remix")
         import_box.operator("object.import_captures", text="Import USD Captures")
 
-        reset_box = layout.box()
-        reset_box.label(text="Reset Options", icon='FILE_REFRESH')
-        reset_box.operator("object.reset_remix_ingestor_options", text="Reset Options")
+        # --- Utilities Box ---
+        utilities_box = layout.box()
+        utilities_box.label(text="Utilities", icon='TOOL_SETTINGS')
+        utilities_box.operator("system.check_gpu_settings", text="Check GPU Settings", icon='SYSTEM')
+        # The line for the debug operator that caused the error has been REMOVED.
 
+        # --- Reset Box ---
+        reset_box = layout.box()
+        reset_box.operator("object.reset_remix_ingestor_options", text="Reset All Options", icon='FILE_REFRESH')
+
+        # --- Info Box ---
         info_box = layout.box()
         info_row = info_box.row()
-        info_row.operator("object.info_operator", text="Hover for Information", icon='INFO')
+        info_row.operator("object.info_operator", text="Hover for Info", icon='INFO')
 
 classes = [
     RemixIngestorPreferences,
     OBJECT_OT_export_and_ingest,
     OBJECT_OT_import_usd_from_remix,
-    OBJECT_OT_import_captures, # Added new class here
+    OBJECT_OT_import_captures,
     OBJECT_OT_reset_options,
     OBJECT_OT_show_popup,
     VIEW3D_PT_remix_ingestor,
@@ -3986,25 +4795,42 @@ classes = [
     OBJECT_OT_toggle_info_display,
     AssetNumberItem,
     CustomSettingsBackup,
-    EXPORT_OT_SubstancePainterExporter
+    EXPORT_OT_SubstancePainterExporter,
+    SYSTEM_OT_check_gpu_settings,
+    SYSTEM_OT_show_gpu_report,
 ]
 
 def register():
-    setup_logger()
-    for cls in classes:
-        bpy.utils.register_class(cls)
-
-    bpy.types.Scene.remix_custom_settings_backup = bpy.props.PointerProperty(type=CustomSettingsBackup)
-    bpy.types.Scene.remix_asset_number = bpy.props.CollectionProperty(type=AssetNumberItem)
-
+    # Final, complete registration logic
+    global BAKE_WORKER_PY
+    log = logging.getLogger(__name__)
+    try:
+        setup_logger()
+        # Define worker script path relative to this file
+        BAKE_WORKER_PY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "remix_bake_worker.py")
+        if not os.path.exists(BAKE_WORKER_PY):
+            log.critical(f"Bake worker script 'remix_bake_worker.py' NOT FOUND at {BAKE_WORKER_PY}")
+        
+        for cls in classes:
+            bpy.utils.register_class(cls)
+        
+        bpy.types.Scene.remix_custom_settings_backup = PointerProperty(type=CustomSettingsBackup)
+        bpy.types.Scene.remix_asset_number = CollectionProperty(type=AssetNumberItem)
+        log.info("Remix Ingestor addon registration complete.")
+    except Exception as e:
+        log.error(f"Addon registration failed: {e}", exc_info=True)
+        raise
 
 def unregister():
-    del bpy.types.Scene.remix_asset_number
-    del bpy.types.Scene.remix_custom_settings_backup
-
+    log = logging.getLogger(__name__)
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
-
+        try: bpy.utils.unregister_class(cls)
+        except RuntimeError: pass
+    try:
+        del bpy.types.Scene.remix_asset_number
+        del bpy.types.Scene.remix_custom_settings_backup
+    except AttributeError: pass
+    log.info("Remix Ingestor addon unregistered.")
 
 if __name__ == "__main__":
     register()
