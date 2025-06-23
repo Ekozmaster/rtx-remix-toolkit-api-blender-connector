@@ -47,8 +47,8 @@ from collections import defaultdict, deque
 
 # --- Globals & Configuration ---
 log_file_path = ""
-export_lock = Lock() # Use a real lock for thread safety
-remix_import_lock = Lock()
+export_lock = False # Use a simple boolean lock
+remix_import_lock = False # Use a simple boolean lock
 conversion_count = 0
 is_applying_preset = False
 
@@ -3440,10 +3440,12 @@ class OBJECT_OT_export_and_ingest(Operator):
         return {'PASS_THROUGH'}
 
     def execute(self, context):
-        if not export_lock.acquire(blocking=False):
+        global export_lock
+        if export_lock:
             self.report({'INFO'}, "Another export is already in progress.")
             return {'CANCELLED'}
 
+        export_lock = True
         # Reset state for a fresh run
         self._export_data = {
             "mesh_objects_to_export": [], "bake_info": {}, "temp_files_to_clean": set(),
@@ -4023,6 +4025,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _cleanup(self, context, return_value):
         """Final cleanup for the operator, called on completion or cancellation."""
+        global export_lock
         self._restore_original_materials()
         
         if self._export_data.get("normals_were_flipped"):
@@ -4050,7 +4053,7 @@ class OBJECT_OT_export_and_ingest(Operator):
         self._timer = None
         context.workspace.status_text_set(None)
         
-        if export_lock.locked(): export_lock.release()
+        export_lock = False
         logging.debug("Export lock released.")
         return return_value
 
