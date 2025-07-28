@@ -45,6 +45,7 @@ from collections import defaultdict
 from bpy.path import abspath
 import traceback
 from collections import defaultdict, deque 
+import atexit
 
 # --- Globals & Configuration ---
 log_file_path = ""
@@ -52,12 +53,101 @@ export_lock = False # Use a simple boolean lock
 remix_import_lock = False # Use a simple boolean lock
 conversion_count = 0
 is_applying_preset = False
+PSUTIL_INSTALLED = False
+ACTIVE_WORKER_PROCESSES = []
 
 # Baking Worker Configuration
 BAKE_WORKER_PY = None 
 #MAX_CONCURRENT_BAKE_WORKERS = max(1, os.cpu_count() // 2)
 MAX_CONCURRENT_BAKE_WORKERS = 4
 BAKE_BATCH_SIZE_PER_WORKER = 5
+
+def check_psutil():
+    """
+    Checks if psutil is installed and updates the global state.
+    This function is called when the addon is registered.
+    """
+    global PSUTIL_INSTALLED
+    try:
+        import psutil
+        PSUTIL_INSTALLED = True
+        logging.info("Dependency 'psutil' is installed.")
+    except ImportError:
+        PSUTIL_INSTALLED = False
+        logging.warning("Dependency 'psutil' is NOT installed. Dynamic worker functionality will be disabled.")
+
+# Call the check immediately when the script is loaded
+check_psutil()
+
+class REMIX_OT_install_psutil(Operator):
+    """Attempts to install the psutil library using pip."""
+    bl_idname = "remix.install_psutil"
+    bl_label = "Install Dependency (psutil)"
+    bl_description = "Downloads and installs the 'psutil' library required for dynamic resource management. Blender may need to be restarted."
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        try:
+            py_exec = sys.executable
+            # Using 'subprocess.run' is simpler for one-off commands.
+            # It waits for the command to complete.
+            result = subprocess.run(
+                [py_exec, "-m", "pip", "install", "psutil"],
+                capture_output=True,
+                text=True,
+                check=True # This will raise a CalledProcessError if pip fails
+            )
+            logging.info("psutil installation successful:\n" + result.stdout)
+            self.report({'INFO'}, "psutil installed successfully! Please restart Blender.")
+            # Set a flag to show the restart button
+            context.scene.remix_install_complete = True
+
+        except subprocess.CalledProcessError as e:
+            error_message = (
+                "Failed to install psutil. See System Console for details. "
+                f"Error:\n{e.stderr}"
+            )
+            logging.error(error_message)
+            self.report({'ERROR'}, "Installation failed. Check System Console for details.")
+            context.scene.remix_install_complete = False
+        except FileNotFoundError:
+            error_message = "Failed to install psutil: Python executable or pip not found."
+            logging.error(error_message)
+            self.report({'ERROR'}, error_message)
+            context.scene.remix_install_complete = False
+
+        return {'FINISHED'}
+
+
+class REMIX_OT_restart_blender(Operator):
+    """Saves the file and restarts Blender."""
+    bl_idname = "remix.restart_blender"
+    bl_label = "Save and Restart Blender"
+    bl_description = "Saves the current file and restarts Blender to apply changes"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        try:
+            # Get current Blender executable and file path
+            blender_path = bpy.app.binary_path
+            filepath = bpy.data.filepath
+
+            if filepath:
+                # Save the current file before restarting
+                bpy.ops.wm.save_mainfile()
+                subprocess.Popen([blender_path, filepath])
+            else:
+                # If the file is unsaved, just open a new instance
+                subprocess.Popen([blender_path])
+
+            # Quit the current instance
+            bpy.ops.wm.quit_blender()
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not restart Blender: {e}")
+            logging.error(f"Failed to restart Blender: {e}", exc_info=True)
+
+        return {'FINISHED'}
 
 class RemixIngestorPreferences(AddonPreferences):
     bl_idname = __name__ # <--- THIS IS THE CORRECT LINE
@@ -258,6 +348,24 @@ def setup_logger():
 
 def is_blend_file_saved():
     return bool(bpy.data.filepath)
+
+def _kill_all_active_workers():
+    """
+    This function is registered with atexit and runs when Blender closes.
+    It ensures all orphan worker processes are terminated.
+    """
+    if not ACTIVE_WORKER_PROCESSES:
+        return
+
+    logging.info(f"Blender is closing. Terminating {len(ACTIVE_WORKER_PROCESSES)} orphan worker process(es)...")
+    for worker_proc in ACTIVE_WORKER_PROCESSES:
+        if worker_proc and worker_proc.poll() is None:
+            try:
+                logging.debug(f" > Killing orphan PID: {worker_proc.pid}")
+                worker_proc.kill()
+            except Exception as e:
+                logging.error(f"Failed to kill orphan worker PID {worker_proc.pid}: {e}")
+    ACTIVE_WORKER_PROCESSES.clear()
       
 def convert_exr_textures_to_png(context):
     """
@@ -1223,15 +1331,15 @@ def blender_mat_to_remix(mat_name):
     
 def handle_height_textures(context, reference_prim, export_data=None):
     """
-    [DEFINITIVE V4 - DUAL PATH LOGIC]
-    Handles height texture ingestion for both COMPLEX (baked) and SIMPLE (original)
-    materials. It intelligently matches server-side material prims to the
-    corresponding local Blender materials, regardless of whether they were baked or not.
+    [DEFINITIVE V5 - UDIM-AWARE]
+    Handles height texture ingestion for all material types. It can now correctly
+    trace back from a server-side stitched UDIM material name to the original Blender
+    material to find the corresponding height map, fixing the primary bug.
     """
     addon_prefs = context.preferences.addons[__name__].preferences
     
     try:
-        logging.info("--- Starting Corrected Height Texture Processing (Dual Path) ---")
+        logging.info("--- Starting Corrected Height Texture Processing (UDIM-Aware) ---")
 
         bake_info = (export_data or {}).get('bake_info', {})
         height_map_info = bake_info.get('height_map_info', {})
@@ -1243,12 +1351,12 @@ def handle_height_textures(context, reference_prim, export_data=None):
         # 1. Discover all material prims on the server for the newly ingested asset.
         logging.info("Discovering all server-side material prims...")
         
-        # We need to wait a moment for the server to update its state after ingestion.
-        time.sleep(3) # A small delay to ensure the new asset is selectable.
+        # A delay is needed for the server to update its state after ingestion.
+        time.sleep(3) 
         
-        # After creating the asset, we must select it to query its children (materials).
-        # select_mesh_prim_in_remix was already called, but we do it again to be safe.
-        select_mesh_prim_in_remix(reference_prim, context)
+        # Select the asset to query its children (materials).
+        if not select_mesh_prim_in_remix(reference_prim, context):
+             logging.warning("Could not select reference prim before querying materials. Results may be incomplete.")
         time.sleep(1) # Delay after selection
 
         all_selected_prims = fetch_selected_mesh_prim_paths()
@@ -1267,21 +1375,28 @@ def handle_height_textures(context, reference_prim, export_data=None):
         for server_material_prim_path in server_material_prims:
             prim_name_on_server = server_material_prim_path.split('/')[-1]
             original_blender_mat_name = None
+            base_name_from_server = None
 
             # --- START OF THE CRITICAL FIX ---
-            # SCENARIO 1: It's a baked material.
-            if prim_name_on_server.endswith('_BAKED'):
-                remix_friendly_name_part = prim_name_on_server.removesuffix('_BAKED')
-                # Find the original Blender material name that corresponds to this baked name.
-                for key_mat_name in height_map_info.keys():
-                    if blender_mat_to_remix(key_mat_name) == remix_friendly_name_part:
-                        original_blender_mat_name = key_mat_name
-                        break
-            # SCENARIO 2: It's a simple, non-baked material.
+            # Determine the original material's base name from the server prim name.
+            # Case 1: Stitched UDIM material (e.g., 'MyMat__UDIM_STITCHED_001')
+            if '__UDIM_STITCHED' in prim_name_on_server:
+                base_name_from_server = prim_name_on_server.split('__UDIM_STITCHED')[0]
+                logging.debug(f"  > Parsed UDIM material. Base name: '{base_name_from_server}'")
+            # Case 2: Baked material (e.g., 'MyMat_BAKED')
+            elif prim_name_on_server.endswith('_BAKED'):
+                base_name_from_server = prim_name_on_server.removesuffix('_BAKED')
+                logging.debug(f"  > Parsed baked material. Base name: '{base_name_from_server}'")
+            # Case 3: Simple material, name might be directly mapped
             else:
-                # Find the Blender material name that corresponds to the server name directly.
+                base_name_from_server = prim_name_on_server
+                logging.debug(f"  > Treating as simple material. Base name: '{base_name_from_server}'")
+
+            # Now, match the extracted base name against the keys in our height map info dict.
+            if base_name_from_server:
                 for key_mat_name in height_map_info.keys():
-                    if blender_mat_to_remix(key_mat_name) == prim_name_on_server:
+                    # Compare the server-friendly version of the Blender material name.
+                    if blender_mat_to_remix(key_mat_name) == base_name_from_server:
                         original_blender_mat_name = key_mat_name
                         break
             # --- END OF THE CRITICAL FIX ---
@@ -1307,7 +1422,6 @@ def handle_height_textures(context, reference_prim, export_data=None):
 
             logging.info(f"  > Ingesting height texture: {local_texture_path}")
             
-            # This is the standard texture ingestion payload
             ingest_payload = {"executor":1,"name":"Material(s)","context_plugin":{"name":"TextureImporter","data":{"allow_empty_input_files_list":True,"channel":"Default","context_name":"ingestcraft","cook_mass_template":True,"create_context_if_not_exist":True,"create_output_directory_if_missing":True,"data_flows":[{"channel":"Default","name":"InOutData","push_input_data":True,"push_output_data":False}],"default_output_endpoint":"/stagecraft/assets/default-directory","expose_mass_queue_action_ui":False,"expose_mass_ui":True,"global_progress_value":0,"hide_context_ui":True,"input_files":[],"output_directory":"","progress":[0,"Initializing",True]}},"check_plugins":[{"name":"MaterialShaders","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllMaterials"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"ignore_not_convertable_shaders":False,"progress":[0,"Initializing",True],"save_on_fix_failure":True,"shader_subidentifiers":{"AperturePBR_Opacity":".*"}},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToOctahedral","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files_normal","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:normalmap_texture":{"encoding_attr":"inputs:encoding","replace_suffix":"_Normal","suffix":"_OTH_Normal"}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files_normal","name":"InOutData","push_input_data":True,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToDDS","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:diffuse_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:emissive_mask_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:height_texture":{"args":["--format","bc4","--no-mip-gamma-correct","--mip-filter","max"]},"inputs:metallic_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:normalmap_texture":{"args":["--format","bc5","--no-mip-gamma-correct"]},"inputs:reflectionroughness_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:transmittance_texture":{"args":["--format","bc7","--mip-gamma-correct"]}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files","name":"InOutData","push_input_data":True,"push_output_data":True},{"channel":"write_metadata","name":"InOutData","push_input_data":False,"push_output_data":True},{"channel":"ingestion_output","name":"InOutData","push_input_data":False,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True,"suffix":".rtex.dds"},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"MassTexturePreview","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"Nothing"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":True,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}}],"resultor_plugins":[{"name":"FileMetadataWritter","data":{"channel":"write_metadata","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]}}]}
             ingest_payload["context_plugin"]["data"]["input_files"] = [[local_texture_path, "HEIGHT"]]
             ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
@@ -1317,30 +1431,23 @@ def handle_height_textures(context, reference_prim, export_data=None):
                 logging.error(f"  > Failed to ingest height texture. Server responded with status {ingest_response.status_code if ingest_response else 'N/A'}")
                 continue
 
-            # This small delay can be crucial for the server to process the ingested file.
             time.sleep(2)
             
             base_filename = os.path.splitext(os.path.basename(local_texture_path))[0]
-            # The server converts height maps to BC4 format and adds '.h.rtex.dds'
             final_ingested_texture_path_on_server = os.path.join(server_textures_output_dir, f"{base_filename}.h.rtex.dds").replace('\\', '/')
             
-            # Now, assign this newly ingested texture to the correct shader input on the server
             encoded_material_prim = urllib.parse.quote(server_material_prim_path, safe='')
-            # Get the path to the shader prim itself (e.g., /.../Looks/MyMat/Shader)
             textures_on_material_url = f"{stagecraft_api_url_base}/assets/{encoded_material_prim}/textures"
             textures_response = make_request_with_retries('GET', textures_on_material_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
             
             try:
-                # The response gives us the path to the shader input prims
                 textures_data = textures_response.json().get("textures", [])
                 if not textures_data or not textures_data[0]:
                     logging.error(f"  > Server returned an empty texture list for material prim: {server_material_prim_path}. Cannot assign height map.")
                     continue
                 
-                # The first item is usually the main shader's prim path
                 shader_core_input_prim = textures_data[0][0]
                 encoded_shader_core_input = urllib.parse.quote(shader_core_input_prim, safe='')
-                # Ask the server for the specific prim that represents the "HEIGHT" input
                 height_input_query_url = f"{stagecraft_api_url_base}/textures/{encoded_shader_core_input}/material/inputs?texture_type=HEIGHT"
                 
                 height_input_prim_response = make_request_with_retries('GET', height_input_query_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
@@ -1348,14 +1455,12 @@ def handle_height_textures(context, reference_prim, export_data=None):
                     logging.error(f"  > Failed to get the height input prim path from the server.")
                     continue
                 
-                # The response gives us the exact prim path to target with our texture file
                 height_shader_input_target_prim = height_input_prim_response.json().get("prim_paths", [[]])[0]
                 if not height_shader_input_target_prim:
                     logging.error(f"  > Server did not return a valid prim path for the height input.")
                     continue
 
                 logging.info(f"  > Target prim for height assignment: {height_shader_input_target_prim}")
-                # This is the API endpoint for connecting textures to shader inputs
                 update_texture_connection_url = f"{stagecraft_api_url_base}/textures/"
                 put_payload = {"force": False, "textures": [[height_shader_input_target_prim, final_ingested_texture_path_on_server]]}
                 
@@ -3002,23 +3107,32 @@ class OBJECT_OT_import_usd_from_remix(Operator):
 
 class OBJECT_OT_export_and_ingest(Operator):
     bl_idname = "object.export_and_ingest"
-    bl_label = "Export and Ingest (Optimized Bake)"
+    bl_label = "Export and Ingest (Dynamic Workers)"
     bl_options = {'REGISTER', 'UNDO'}
 
-    # --- Operator State Variables for Worker Pool ---
+    # --- Operator State Variables ---
     _timer = None
-    _worker_pool: list = []
+    _op_lock: Lock = None
+    _export_data: dict = {}
+
+    # --- Dynamic Worker Management State ---
+    _worker_slots: list = [] # Replaces _worker_pool. Tracks status of each potential worker.
+    _task_batches: list = [] # Pre-calculated batches of tasks for each worker slot.
     _comm_threads: list = []
-    _task_queue: Queue = None
     _results_queue: Queue = None
     _log_queue: Queue = None
-    _op_lock: Lock = None
     _total_tasks: int = 0
     _finished_tasks: int = 0
     _failed_tasks: int = 0
-    _export_data: dict = {}
+    _resource_check_counter: int = 0
 
-    WORKER_TIMEOUT_SECONDS: int = 180 # Increased timeout for the entire batch
+    # --- Configuration for Dynamic Workers ---
+    MAX_POTENTIAL_WORKERS: int = max(1, os.cpu_count()) # Sane upper limit
+    RESOURCE_CHECK_INTERVAL_SEC: int = 2 # How often to check system resources
+    CPU_HIGH_THRESHOLD: int = 90 # % CPU to trigger worker termination
+    RAM_HIGH_THRESHOLD: int = 90 # % RAM to trigger worker termination
+    CPU_LOW_THRESHOLD: int = 80  # % CPU to allow new worker launch
+    RAM_LOW_THRESHOLD: int = 80  # % RAM to allow new worker launch
 
     def _communication_thread_target(self, worker_process):
         """Dedicated thread to read stdout from a single worker."""
@@ -3037,57 +3151,113 @@ class OBJECT_OT_export_and_ingest(Operator):
         except Exception: pass
 
           
-    def _launch_worker_pool(self, context, tasks, total_tasks):
+          
+    def _launch_new_worker(self, slot_index):
         """
-        [CORRECTED] Launches a pool of persistent workers and sends initial commands.
-        This version correctly passes the 'total_tasks' count to the workers.
+        [FINAL CORRECTED] Launches a worker with the correct Windows process flags
+        to ensure it is terminated when the parent (Blender) closes, and registers
+        it with the atexit handler for graceful shutdown.
         """
-        self._worker_pool = []
-        self._comm_threads = []
-        self._results_queue = Queue()
-        self._log_queue = Queue()
+        if slot_index >= len(self._worker_slots):
+            return
 
-        num_workers = min(MAX_CONCURRENT_BAKE_WORKERS, len(tasks))
-        if num_workers == 0: return True
+        slot = self._worker_slots[slot_index]
+        if slot['process'] is not None and slot['process'].poll() is None:
+            logging.warning(f"Attempted to launch worker for slot {slot_index}, but a process already exists.")
+            return
 
-        logging.info(f"→ Launching a pool of {num_workers} bake workers...")
+        logging.info(f"→ Launching ISOLATED worker for slot {slot_index}...")
+        cmd = [
+            bpy.app.binary_path,
+            "--factory-startup",
+            "--background",
+            "--python", BAKE_WORKER_PY,
+            "--",
+            "--persistent"
+        ]
+    
+        try:
+            # --- THIS IS THE FIX ---
+            creation_flags = 0
+            if sys.platform == "win32":
+                # This flag is crucial. It groups the new process with its own
+                # children, allowing terminate() to work reliably and preventing orphans
+                # if the main Blender process is killed forcefully.
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            # --- END OF FIX ---
 
-        for i in range(num_workers):
-            cmd = [bpy.app.binary_path, "--background", "--python", BAKE_WORKER_PY, "--", "--persistent"]
-            try:
-                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                worker = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    creationflags=flags, text=True, encoding='utf-8', bufsize=1
-                )
-                self._worker_pool.append(worker)
+            worker = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=creation_flags, # Use the new flags here
+                text=True,
+                encoding='utf-8',
+                bufsize=1
+            )
+        
+            # Add the newly created process to our global registry for atexit.
+            ACTIVE_WORKER_PROCESSES.append(worker)
+        
+            slot['process'] = worker
+            slot['status'] = 'launching'
 
-                comm_thread = threading.Thread(target=self._communication_thread_target, args=(worker,), daemon=True)
-                log_thread = threading.Thread(target=self._log_thread_target, args=(worker,), daemon=True)
-                comm_thread.start()
-                log_thread.start()
-                self._comm_threads.extend([comm_thread, log_thread])
+            comm_thread = threading.Thread(target=self._communication_thread_target, args=(worker,), daemon=True)
+            log_thread = threading.Thread(target=self._log_thread_target, args=(worker,), daemon=True)
+            comm_thread.start()
+            log_thread.start()
+            self._comm_threads.extend([comm_thread, log_thread])
 
-                logging.info(f"  > Worker {i+1}/{num_workers} launched with PID {worker.pid}")
-            except Exception as e:
-                logging.error(f"Could not launch bake worker {i+1}: {e}", exc_info=True)
-                return False
-
-        # --- THE FIX IS HERE ---
-        # Use the 'total_tasks' variable that was passed into this function.
-        load_command = json.dumps({
-            "action": "load_blend",
-            "blend_file": abspath(bpy.data.filepath),
-            "total_tasks": total_tasks
-        }) + "\n"
-        # --- END OF FIX ---
-
-        for worker in self._worker_pool:
+            load_command = json.dumps({
+                "action": "load_blend",
+                "blend_file": abspath(bpy.data.filepath),
+                "total_tasks": self._total_tasks
+            }) + "\n"
             worker.stdin.write(load_command)
             worker.stdin.flush()
-    
-        return True
 
+        except Exception as e:
+            logging.error(f"Could not launch worker for slot {slot_index}: {e}", exc_info=True)
+            slot['status'] = 'failed'
+        
+    def _terminate_worker(self, slot_index):
+        """
+        [CORRECTED] Terminates a worker and REMOVES it from the global
+        atexit registry to prevent double-killing.
+        """
+        if slot_index >= len(self._worker_slots):
+            return
+
+        slot = self._worker_slots[slot_index]
+        worker = slot.get('process')
+
+        if worker and worker.poll() is None:
+            logging.warning(f"Terminating worker in slot {slot_index} (PID: {worker.pid}).")
+            try:
+                worker.terminate()
+                worker.wait(timeout=2)
+            except (subprocess.TimeoutExpired, Exception):
+                worker.kill()
+            finally:
+                # --- THIS IS THE FIX ---
+                # Remove the now-dead process from the global registry.
+                if worker in ACTIVE_WORKER_PROCESSES:
+                    ACTIVE_WORKER_PROCESSES.remove(worker)
+                # --- END OF FIX ---
+            
+                slot['process'] = None
+                slot['status'] = 'suspended'
+          
+    def _material_uses_udims(self, mat):
+        """Checks if a material uses any UDIM (tiled) image textures."""
+        if not mat or not mat.use_nodes:
+            return False
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
+                return True
+        return False
+    
     def _realize_geonodes_object_non_destructively(self, context, obj):
         """
         [DEFINITIVE V7 - CORRECTED MATERIAL ASSIGNMENT] Realizes a generator and
@@ -3439,15 +3609,13 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [CORRECTED V4 - TASK DATA STRUCTURE FIX]
-        This version changes the task generation logic. Instead of creating one task
-        per material with a list of objects, it creates one task per object-material
-        combination. This resolves the `KeyError: 'object_name'` in the worker by
-        sending the data in the exact format the worker expects.
+        [UDIM-BAKE V7 - DYNAMIC ATLAS RESOLUTION]
+        This definitive version calculates the required bake resolution dynamically when
+        a procedural UDIM material is detected. It determines the tile count and size,
+        then sets the bake task's resolution to match the full atlas dimensions,
+        preventing resolution loss from "squishing" the bake into a fixed-size texture.
         """
         tasks = []
-        height_map_info = {}
-
         if not is_blend_file_saved():
             raise RuntimeError("Blend file must be saved to create a bake/temp directory.")
 
@@ -3456,96 +3624,128 @@ class OBJECT_OT_export_and_ingest(Operator):
         os.makedirs(bake_dir, exist_ok=True)
         export_data['temp_files_to_clean'].add(bake_dir)
 
-        # 1. Unconditionally check ALL materials for displacement maps first.
-        # This logic is correct and remains unchanged.
-        logging.info("Running dedicated check for displacement maps...")
-        all_materials_on_export_objects = {
-            s.material for o in objects_to_process for s in o.material_slots if s.material
+        bake_info = {
+            'tasks': [],
+            'bake_dir': bake_dir,
+            'height_map_info': {},
+            'udim_materials': set()
         }
-        for mat in all_materials_on_export_objects:
-            if not mat or not mat.use_nodes: continue
-            output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-            if not output_node or not output_node.inputs['Displacement'].is_linked: continue
-            
-            disp_socket = output_node.inputs['Displacement']
-            link = disp_socket.links[0]
-            prev_node = link.from_node
-            if prev_node.type == 'DISPLACEMENT' and prev_node.inputs['Height'].is_linked:
-                link = prev_node.inputs['Height'].links[0]
-                prev_node = link.from_node
-        
-            if prev_node.type == 'TEX_IMAGE' and prev_node.image:
-                image = prev_node.image
-                if image.filepath and os.path.exists(abspath(image.filepath)):
-                    height_map_info[mat.name] = abspath(image.filepath)
-                elif image.has_data:
-                    temp_dir_disp = os.path.join(os.path.dirname(blend_fp), f"remix_temp_disp_{uuid.uuid4().hex[:6]}")
-                    os.makedirs(temp_dir_disp, exist_ok=True)
-                    export_data['temp_files_to_clean'].add(temp_dir_disp)
-                    safe_name = "".join(c for c in image.name if c.isalnum()).strip()
-                    temp_path = os.path.join(temp_dir_disp, f"{safe_name}.png")
-                    image.save_render(temp_path)
-                    height_map_info[mat.name] = temp_path
+        export_data['bake_info'] = bake_info
 
-        # ---> START OF THE FIX: RESTRUCTURED BAKE TASK GENERATION <---
-        UNIVERSAL_BAKE_CHANNELS = [
-            ("Base Color", 'DIFFUSE', False), ("Metallic", 'EMIT', True),
-            ("Roughness", 'ROUGHNESS', True), ("Normal", 'NORMAL', False),
-            ("Emission", 'EMIT', False)
-        ]
-        
-        materials_to_bake = set()
-        logging.info("Identifying complex materials and generating bake tasks per object...")
-
+        objects_by_mat = defaultdict(list)
+        all_materials = set()
         for obj in objects_to_process:
-            if not obj.material_slots:
-                continue
-            
-            for slot in obj.material_slots:
-                mat = slot.material
-                if not mat or not mat.use_nodes:
-                    continue
+            if obj.type == 'MESH':
+                for slot in obj.material_slots:
+                    if slot.material:
+                        objects_by_mat[slot.material].append(obj)
+                        all_materials.add(slot.material)
 
-                if not self._is_simple_pbr_setup(mat):
-                    materials_to_bake.add(mat.name)
-                    if "uuid" not in mat: mat["uuid"] = str(uuid.uuid4())
-                    mat_uuid = mat["uuid"]
-                    
-                    for socket_name, bake_type, is_value_bake in UNIVERSAL_BAKE_CHANNELS:
-                        # Output filename is unique per MATERIAL, so bakes can be reused by the worker.
-                        safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '.'))
-                        output_filename = f"{safe_mat_name}_{bake_type}.png"
+        UNIVERSAL_BAKE_CHANNELS = [
+            ("Base Color",     'DIFFUSE',   False,    True),
+            ("Metallic",       'EMIT',      True,     False),
+            ("Roughness",      'ROUGHNESS', True,     False),
+            ("Normal",         'NORMAL',    False,    False),
+            ("Emission Color", 'EMIT',      False,    True),
+            ("Displacement",   'EMIT',      True,     False)
+        ]
+
+        logging.info("Identifying materials to bake (Complex or UDIM)...")
+        for mat in all_materials:
+            if not mat.use_nodes:
+                continue
+
+            is_complex = not self._is_simple_pbr_setup(mat)
+            uses_udims = self._material_uses_udims(mat)
+
+            if is_complex or uses_udims:
+                log_reason = "complex procedural setup" if is_complex else "UDIM textures"
+                if is_complex and uses_udims:
+                    log_reason = "complex setup and UDIM textures"
+                logging.info(f"  - Queuing bake for material '{mat.name}' (Reason: {log_reason}).")
+
+                # --- DYNAMIC RESOLUTION CALCULATION FOR UDIM BAKE ---
+                bake_resolution_x = 2048 # Default bake width
+                bake_resolution_y = 2048 # Default bake height
+
+                if uses_udims:
+                    # Find the UDIM node to inspect its properties.
+                    udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
+                    if udim_node:
+                        tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
+                        num_tiles = len(tiles)
+                        tile_width, tile_height = udim_node.image.size
+
+                        # Handle edge case where Blender hasn't loaded tile dimensions yet
+                        if (tile_width == 0 or tile_height == 0) and tiles:
+                            logging.warning(f" > Tile dimensions for '{udim_node.image.name}' are not loaded. Reading from first tile on disk...")
+                            first_tile_path = abspath(udim_node.image.filepath_raw.replace('<UDIM>', str(tiles[0].number)))
+                            if os.path.exists(first_tile_path):
+                                temp_tile_img = self._load_tile_robustly(first_tile_path, tiles[0].label)
+                                if temp_tile_img:
+                                    tile_width, tile_height = temp_tile_img.size
+                                    bpy.data.images.remove(temp_tile_img)
+
+                        # Calculate the final atlas resolution for the bake
+                        if num_tiles > 0 and tile_width > 0:
+                            bake_resolution_x = tile_width * num_tiles
+                            bake_resolution_y = tile_height
+                            logging.info(f"   - Using dynamic atlas resolution for bake: {bake_resolution_x}x{bake_resolution_y}")
+                        else:
+                             logging.warning(f"   - Could not determine UDIM atlas dimensions for '{mat.name}'. Falling back to default {bake_resolution_x}x{bake_resolution_y} bake.")
+                    else:
+                        logging.warning(f"   - Material '{mat.name}' flagged with UDIMs but no UDIM texture node was found. Using default resolution.")
+
+
+                uv_layer_for_bake = objects_by_mat[mat][0].data.uv_layers[0].name
+                if uses_udims:
+                    bake_info['udim_materials'].add(mat.name)
+                    udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
+                    if udim_node:
+                        tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
+                        self._transform_uvs_for_atlas(objects_by_mat[mat], tiles)
+                        uv_layer_for_bake = "remix_atlas_uv"
+
+                if "uuid" not in mat:
+                    mat["uuid"] = str(uuid.uuid4())
+                mat_uuid = mat["uuid"]
+
+                for obj in objects_by_mat[mat]:
+                    for socket_name, bake_type, is_value_bake, is_color_data in UNIVERSAL_BAKE_CHANNELS:
+                        final_bake_type = bake_type
+                        # When baking a UDIM material's base color, it must be an EMIT bake
+                        if uses_udims and bake_type == 'DIFFUSE':
+                            final_bake_type = 'EMIT'
+
+                        safe_socket_name = "".join(c for c in socket_name if c.isalnum())
+                        output_filename = f"{mat.name}_{safe_socket_name}_baked.png"
                         output_path = os.path.join(bake_dir, output_filename)
 
-                        # Create a task for THIS specific object.
+                        if socket_name == "Displacement":
+                            bake_info['height_map_info'][mat.name] = output_path
+                            logging.info(f"   - Registered baked height map for '{mat.name}' at: {output_path}")
+
                         task = {
                             "material_name": mat.name,
                             "material_uuid": mat_uuid,
                             "object_name": obj.name,
-                            "bake_type": bake_type,
+                            "bake_type": final_bake_type,
                             "output_path": output_path,
                             "target_socket_name": socket_name,
                             "is_value_bake": is_value_bake,
-                            "resolution_x": 2048, # Correct key
-                            "resolution_y": 2048  # Correct key
+                            "is_color_data": is_color_data,
+                            # Use the new dynamic dimensions in the bake task
+                            "resolution_x": bake_resolution_x,
+                            "resolution_y": bake_resolution_y,
+                            "uv_layer": uv_layer_for_bake
                         }
-                        # --- END OF FIX ---
                         tasks.append(task)
-                        logging.debug(f"  + Task: Bake '{bake_type}' for Obj '{obj.name}' using Mat '{mat.name}'")
-        
-        if materials_to_bake:
-            logging.info(f"Generated {len(tasks)} bake tasks for {len(materials_to_bake)} complex material(s).")
-        # ---> END OF THE FIX <---
 
-        # 3. Store all collected info
-        export_data['bake_info'] = {
-            'tasks': tasks,
-            'material_map': {}, # This is deprecated by the new structure but kept for compatibility
-            'bake_dir': bake_dir,
-            'height_map_info': height_map_info
-        }
-        
-        return tasks, {}, bake_dir, height_map_info
+        bake_info['tasks'] = tasks
+        if tasks:
+            logging.info(f"Generated {len(tasks)} bake tasks.")
+
+        return tasks, bake_info.get('material_map',{}), bake_dir, bake_info.get('height_map_info',{})
         
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
@@ -3653,99 +3853,168 @@ class OBJECT_OT_export_and_ingest(Operator):
         logging.info("Texture validation successful. All textures are either on disk or packed.")
         return True
 
+          
     def modal(self, context, event):
+        """
+        [DEFINITIVE V3 - Corrected Terminate After Task]
+        This is the complete and corrected modal loop. It implements the robust
+        resource manager that flags workers for termination but allows them to finish
+        their current task. The critical bug where successfully completed tasks were
+        requeued has been fixed by calling the worker handler with `requeue_task=False`
+        after a graceful shutdown.
+        """
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
 
         with self._op_lock:
-            # First tick initialization
+            # First-tick initialization
             if not hasattr(self, '_initialized'):
                 self._initialized = True
-                self._ready_workers = 0
-                self._tasks_dispatched = False
-                
-                # ---> START OF FIX 1.A: INITIALIZE THE GLOBAL COUNTER <---
-                self._dispatched_task_index = 0 
-                # ---> END OF FIX 1.A <---
-
-                self._total_tasks = self._task_queue.qsize()
-
                 logging.info(f"Saving blend file for {self._total_tasks} bake tasks...")
                 bpy.ops.wm.save_mainfile()
             
-                if not self._launch_worker_pool(context, list(self._task_queue.queue), self._total_tasks):
-                    self.report({'ERROR'}, "Failed to launch the bake worker pool.")
-                    return self._cleanup(context, {'CANCELLED'})
+                self._master_task_queue = collections.deque(
+                    task for batch in self._task_batches for task in batch
+                )
             
+                num_to_launch = min(len(self._worker_slots), MAX_CONCURRENT_BAKE_WORKERS)
+                for i in range(num_to_launch):
+                    if self._worker_slots[i]['status'] == 'idle':
+                        self._launch_new_worker(i)
                 return {'PASS_THROUGH'}
 
-            # Process Logs & Results
+            # --- Phase 1: Process Logs & Results ---
             try:
-                while not self._log_queue.empty(): print(self._log_queue.get_nowait())
+                while not self._log_queue.empty():
+                    print(self._log_queue.get_nowait())
             except Empty: pass
 
             try:
                 while not self._results_queue.empty():
                     result_line = self._results_queue.get_nowait()
-                    result = json.loads(result_line)
-                    status = result.get("status")
-                    if status == "ready": self._ready_workers += 1
-                    elif status in ["success", "failure"]:
-                        self._finished_tasks += 1
-                        if status == "failure": self._failed_tasks += 1
-                    elif status == "error":
-                        self._finished_tasks += 1; self._failed_tasks += 1
-            except (Empty, json.JSONDecodeError): pass
-
-            # Dispatch Tasks
-            if not self._tasks_dispatched and self._worker_pool and self._ready_workers >= len(self._worker_pool):
-                logging.info(f"All {len(self._worker_pool)} workers are ready. Dispatching tasks...")
-                worker_idx = 0
-                while not self._task_queue.empty():
                     try:
-                        task = self._task_queue.get_nowait()
-                        worker = self._worker_pool[worker_idx % len(self._worker_pool)]
-                        
-                        # ---> START OF FIX 1.B: INJECT THE GLOBAL TASK NUMBER <---
-                        self._dispatched_task_index += 1
-                        task['global_task_number'] = self._dispatched_task_index
-                        # ---> END OF FIX 1.B <---
-                        
-                        worker.stdin.write(json.dumps(task) + "\n")
-                        worker.stdin.flush()
-                        worker_idx += 1
-                    except (IOError, BrokenPipeError):
-                        return self._cleanup(context, {'CANCELLED'})
-                    except Empty:
-                        break
-                self._tasks_dispatched = True
+                        result = json.loads(result_line)
+                        status = result.get("status")
+                        worker_pid = result.get("pid")
+                        slot_index = -1
+                        if worker_pid:
+                            for i, s in enumerate(self._worker_slots):
+                                if s.get('process') and s['process'].pid == worker_pid:
+                                    slot_index = i; break
+                        if slot_index == -1: continue
 
-            # Monitor for Crashes and Completion
-            for worker in self._worker_pool:
-                if worker.poll() is not None:
-                    self.report({'ERROR'}, "A bake worker process crashed.")
-                    return self._cleanup(context, {'CANCELLED'})
+                        slot = self._worker_slots[slot_index]
 
-            if self._tasks_dispatched:
-                if self._total_tasks > 0:
-                    progress = (self._finished_tasks / self._total_tasks) * 100
-                    status_text = f"Baking... {self._finished_tasks}/{self._total_tasks} ({progress:.0f}%)"
-                    if self._failed_tasks > 0: status_text += f" - FAILED: {self._failed_tasks}"
-                    context.workspace.status_text_set(status_text)
-            
-                if self._finished_tasks >= self._total_tasks:
-                    if self._failed_tasks > 0:
-                        self.report({'ERROR'}, f"{self._failed_tasks} bake task(s) failed.")
-                        return self._cleanup(context, {'CANCELLED'})
+                        if status == "ready":
+                            slot['status'] = 'ready'
+                            logging.info(f"Worker in slot {slot_index} (PID: {worker_pid}) is now READY.")
+                    
+                        elif status in ["success", "failure"]:
+                            self._finished_tasks += 1
+                            if status == "failure": self._failed_tasks += 1
+                        
+                            # Check if this worker was flagged for termination
+                            if slot.get('flagged_for_termination'):
+                                logging.warning(f"Worker {slot_index} finished its task and is now being terminated as flagged.")
+                                # THIS IS THE FIX: Terminate the worker, but DO NOT requeue its successfully completed task.
+                                self._handle_failed_worker(slot_index, requeue_task=False)
+                            else:
+                                # If not flagged, it's ready for another task
+                                slot['status'] = 'ready'
+                            
+                        elif status == "error":
+                            logging.error(f"Worker in slot {slot_index} reported a critical error: {result.get('details', 'N/A')}")
+                            # Terminate immediately on critical error and requeue its task by default.
+                            self._handle_failed_worker(slot_index)
+                    except (json.JSONDecodeError, KeyError): pass
+            except Empty: pass
+
+            # --- Phase 2: Resilient Task Dispatching ---
+            for i, slot in enumerate(self._worker_slots):
+                if slot['status'] == 'ready':
+                    if self._master_task_queue:
+                        task_to_dispatch = self._master_task_queue.popleft()
+                        try:
+                            slot['process'].stdin.write(json.dumps(task_to_dispatch) + "\n")
+                            slot['process'].stdin.flush()
+                            slot['status'] = 'running'
+                            slot['current_task'] = task_to_dispatch
+                        except (IOError, BrokenPipeError):
+                            logging.error(f"Pipe to worker {i} was broken. Requeueing task.")
+                            self._master_task_queue.appendleft(task_to_dispatch)
+                            self._handle_failed_worker(i)
                     else:
-                        logging.info("All bake tasks completed successfully.")
-                        self._finalize_export(context)
-                        # --- THIS IS THE FIX FOR THE FINAL REPORT ---
-                        self.report({'INFO'}, f"Export complete. Baked {self._total_tasks} textures.")
-                        return self._cleanup(context, {'FINISHED'})
+                        slot['status'] = 'finished'
 
-        return {'PASS_THROUGH'}
+            # --- Phase 3: Dynamic Worker Management & Monitoring ---
+            self._resource_check_counter += 1
+            if (self._resource_check_counter * 0.1) >= self.RESOURCE_CHECK_INTERVAL_SEC:
+                self._resource_check_counter = 0
+                if PSUTIL_INSTALLED:
+                    import psutil
+                    cpu_usage = psutil.cpu_percent()
+                    ram_usage = psutil.virtual_memory().percent
+
+                    if cpu_usage < self.CPU_LOW_THRESHOLD and ram_usage < self.RAM_LOW_THRESHOLD:
+                        for i, slot in enumerate(self._worker_slots):
+                            if slot['status'] in ['idle', 'suspended']:
+                                self._launch_new_worker(i)
+                                slot['flagged_for_termination'] = False # Clear flag on relaunch
+                                break
+                
+                    elif cpu_usage > self.CPU_HIGH_THRESHOLD or ram_usage > self.RAM_HIGH_THRESHOLD:
+                        for i, slot in reversed(list(enumerate(self._worker_slots))):
+                            if slot['status'] == 'running' and not slot.get('flagged_for_termination'):
+                                logging.warning(f"High resource usage detected. Flagging worker {i} for termination after its current task.")
+                                slot['flagged_for_termination'] = True
+                                break
+
+            # Monitor for unexpected crashes
+            for i, slot in enumerate(self._worker_slots):
+                if slot.get('process') and slot['process'].poll() is not None and slot['status'] == 'running':
+                    logging.error(f"Worker in slot {i} (PID: {slot['process'].pid}) has crashed unexpectedly!")
+                    # A real crash, so we DO want to requeue the task.
+                    self._handle_failed_worker(i, requeue_task=True)
+            
+            # --- Phase 4: UI Update & Completion Check ---
+            if self._total_tasks > 0:
+                progress = (self._finished_tasks / self._total_tasks) * 100
+                status_text = f"Baking... {self._finished_tasks}/{self._total_tasks} ({progress:.0f}%)"
+                if self._failed_tasks > 0: status_text += f" - FAILED: {self._failed_tasks}"
+                active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'launching'])
+                status_text += f" | Active: {active_workers} | Queued: {len(self._master_task_queue)}"
+                context.workspace.status_text_set(status_text)
+        
+            if self._finished_tasks >= self._total_tasks:
+                if self._failed_tasks > 0:
+                    self.report({'ERROR'}, f"{self._failed_tasks} bake task(s) failed. See console.")
+                    return self._cleanup(context, {'CANCELLED'})
+                else:
+                    logging.info("All bake tasks completed successfully.")
+                    self._finalize_export(context)
+                    self.report({'INFO'}, f"Export complete. Baked {self._total_tasks} textures.")
+                    return self._cleanup(context, {'FINISHED'})
+
+            return {'PASS_THROUGH'}
+        
+    def _handle_failed_worker(self, slot_index, requeue_task=True):
+        """
+        Helper function to terminate a worker. Can optionally requeue the task
+        it was working on.
+        """
+        if slot_index >= len(self._worker_slots): return
     
+        slot = self._worker_slots[slot_index]
+    
+        # Requeue the task it was working on, ONLY if requested.
+        if requeue_task and 'current_task' in slot and slot['current_task']:
+            task = slot['current_task']
+            self._master_task_queue.appendleft(task) # Put it back at the front of the line
+            logging.warning(f"Requeueing task '{task.get('bake_type')}' for material '{task.get('material_name')}' from failed worker {slot_index}.")
+    
+        slot['current_task'] = None
+        self._terminate_worker(slot_index) # This sets status to 'suspended'
+       
     def _is_geonodes_generator(self, obj):
         """
         Detects if an object is a complex Geometry Nodes generator that needs realization.
@@ -3776,114 +4045,136 @@ class OBJECT_OT_export_and_ingest(Operator):
         return False
 
     def execute(self, context):
+        if not PSUTIL_INSTALLED:
+            self.report({'ERROR'}, "Dependency 'psutil' is not installed. Please install it from the addon panel.")
+            return {'CANCELLED'}
+
         global export_lock
         if export_lock:
             self.report({'INFO'}, "Another export is already in progress.")
             return {'CANCELLED'}
 
         export_lock = True
-    
-        # --- Full State Initialization ---
+
+        # ---> START OF THE FIX: Ensure all necessary keys are initialized. <---
         self._timer = None
-        self._worker_pool = []
+        self._op_lock = Lock()
+        self._export_data = {
+            "objects_for_export": [], 
+            "bake_info": {}, 
+            "temp_files_to_clean": set(),
+            "original_material_assignments": {}, 
+            "temp_materials_for_cleanup": [],
+            "normals_were_flipped": False, 
+            "temp_realized_object_names": []
+        }
+        # ---> END OF THE FIX <---
+        self._task_batches = []
+        self._worker_slots = []
         self._comm_threads = []
-        self._task_queue = Queue()
         self._results_queue = Queue()
         self._log_queue = Queue()
-        self._op_lock = Lock()
         self._total_tasks = 0
         self._finished_tasks = 0
         self._failed_tasks = 0
-        self._realization_cache = {}
-        self._export_data = {
-            "objects_for_export": [], "bake_info": {}, "temp_files_to_clean": set(),
-            "original_material_assignments": {}, "temp_materials_for_cleanup": [],
-            "normals_were_flipped": False, "temp_realized_object_names": []
-        }
+        self._resource_check_counter = 0
 
         try:
-            # ---> START OF THE FIX <---
-            # Run the direct EXR to PNG conversion before any other logic.
+            # The rest of the function remains the same...
             logging.info("Checking for EXR textures to convert before export...")
             success, _ = convert_exr_textures_to_png(context)
             if not success:
-                raise RuntimeError("Failed to convert EXR textures to PNG. Aborting export.")
-            # ---> END OF THE FIX <---
+                raise RuntimeError("Failed to convert EXR textures to PNG.")
 
             addon_prefs = context.preferences.addons[__name__].preferences
-
-
             if not is_blend_file_saved():
-                raise RuntimeError("Please save the .blend file at least once before exporting.")
+                raise RuntimeError("Please save the .blend file before exporting.")
 
-            # --- THIS IS YOUR CORRECT OBJECT SELECTION AND FILTERING LOGIC ---
-        
             initial_selection = {
                 o for o in (context.selected_objects if addon_prefs.remix_use_selection_only else context.scene.objects)
-                # --- MODIFIED LINE: Added 'and not o.hide_render' to filter out objects disabled in renders ---
                 if o.type in {'MESH', 'CURVE'} and o.visible_get() and not o.hide_render
             }
 
             if not initial_selection:
-                raise RuntimeError("No suitable visible objects (Mesh, Curve) found to export.")
-        
+                raise RuntimeError("No suitable visible objects found to export.")
+
             final_export_list = set(initial_selection)
             generators_found = {obj for obj in initial_selection if self._is_geonodes_generator(obj)}
+            
             source_objects_to_exclude = set()
+            if generators_found:
+                logging.info(f"Found {len(generators_found)} Geometry Node generator(s) that require realization.")
+                for gen_obj in generators_found:
+                    ivy_modifier = next((m for m in gen_obj.modifiers if m.type == 'NODES' and 'Baga_Ivy_Generator' in m.name), None)
+                    if ivy_modifier:
+                        leaf_coll_input = ivy_modifier.get("Input_24")
+                        flower_coll_input = ivy_modifier.get("Input_21")
+                        if leaf_coll_input and isinstance(leaf_coll_input, bpy.types.Collection):
+                            source_objects_to_exclude.update(leaf_coll_input.objects)
+                        if flower_coll_input and isinstance(flower_coll_input, bpy.types.Collection):
+                            source_objects_to_exclude.update(flower_coll_input.objects)
 
-            for gen_obj in generators_found:
-                # Specialized logic to find source collections from Baga Ivy
-                ivy_modifier = next((m for m in gen_obj.modifiers if m.type == 'NODES' and 'Baga_Ivy_Generator' in m.name), None)
-                if ivy_modifier:
-                    # These are specific input names from the Baga Ivy addon
-                    leaf_coll = ivy_modifier.get("Input_24")
-                    flower_coll = ivy_modifier.get("Input_21")
-                    if leaf_coll and isinstance(leaf_coll, bpy.types.Collection):
-                        source_objects_to_exclude.update(leaf_coll.objects)
-                    if flower_coll and isinstance(flower_coll, bpy.types.Collection):
-                        source_objects_to_exclude.update(flower_coll.objects)
+                    realized_objects = self._realize_geonodes_object_non_destructively(context, gen_obj)
+                    final_export_list.update(realized_objects)
 
-                # Realize the generator into temporary meshes
-                realized_objects = self._realize_geonodes_object_non_destructively(context, gen_obj)
-                final_export_list.update(realized_objects)
-
-            # Use set logic to remove the original generator and its source meshes
             final_export_list -= generators_found
             final_export_list -= source_objects_to_exclude
-    
-            # The final list for processing contains ONLY the desired mesh objects
+
             self._export_data["objects_for_export"] = [o for o in final_export_list if o and o.type == 'MESH']
-    
+
             if not self._export_data["objects_for_export"]:
                 raise RuntimeError("Processing resulted in no valid mesh objects to export.")
-        
-            logging.info(f"Final, CORRECTED object list for processing: {[o.name for o in self._export_data['objects_for_export']]}")
 
-            # --- End of Corrected Object Selection ---
+            logging.info(f"Final object list for processing: {[o.name for o in self._export_data['objects_for_export']]}")
 
-            if not self._validate_textures(context, self._export_data["objects_for_export"]):
-                raise RuntimeError("Texture validation failed.")
-        
-            tasks, _, _, _ = self.collect_bake_tasks(
-                context, 
-                self._export_data["objects_for_export"], 
-                self._export_data
+            if not self._validate_textures(context, self._export_data["objects_for_export"]): raise RuntimeError("Texture validation failed.")
+
+            all_tasks, _, _, _ = self.collect_bake_tasks(
+                context, self._export_data["objects_for_export"], self._export_data
             )
+            self._total_tasks = len(all_tasks)
 
-            if not tasks:
-                logging.info("No complex materials found. Finalizing export directly.")
+            any_udims_found = False
+            for obj in self._export_data["objects_for_export"]:
+                for slot in obj.material_slots:
+                    if slot.material and slot.material.use_nodes:
+                        for node in slot.material.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
+                                any_udims_found = True
+                                break
+                    if any_udims_found: break
+                if any_udims_found: break
+            
+            if not all_tasks and not any_udims_found:
+                logging.info("No complex materials or UDIMs found. Finalizing export directly with simple textures.")
                 self._finalize_export(context)
                 return self._cleanup(context, {'FINISHED'})
 
-            for task in tasks:
-                self._task_queue.put(task)
-        
-            logging.info(f"Saving blend file with temporary meshes for {len(tasks)} bake tasks...")
-            bpy.ops.wm.save_mainfile()
-    
-            self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
-            context.window_manager.modal_handler_add(self)
-            return {'RUNNING_MODAL'}
+            if all_tasks:
+                logging.info(f"Found {self._total_tasks} bake tasks. Starting worker pool...")
+                for i, task in enumerate(all_tasks):
+                    task['global_task_number'] = i + 1
+
+                num_batches = min(self._total_tasks, MAX_CONCURRENT_BAKE_WORKERS)
+                self._task_batches = [[] for _ in range(num_batches)]
+                for i, task in enumerate(all_tasks):
+                    self._task_batches[i % num_batches].append(task)
+
+                self._worker_slots = [{
+                    'process': None, 
+                    'status': 'idle', 
+                    'batch_index': i,
+                    'flagged_for_termination': False # <-- ADD THIS LINE
+                } for i in range(num_batches)]
+
+                self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+                context.window_manager.modal_handler_add(self)
+                return {'RUNNING_MODAL'}
+            
+            else:
+                logging.info("No bake tasks, but UDIMs found. Proceeding directly to finalization for stitching.")
+                self._finalize_export(context)
+                return self._cleanup(context, {'FINISHED'})
 
         except Exception as e:
             logging.error(f"Export failed during setup: {e}", exc_info=True)
@@ -3892,33 +4183,40 @@ class OBJECT_OT_export_and_ingest(Operator):
             
     def _finalize_export(self, context):
         """
-        [DEFINITIVE V6 - FINALIZATION LOGIC CORRECTED]
-        This version fixes the root cause of the extra meshes. It no longer attempts
-        to re-process or convert objects. It takes the final, pre-processed list
-        of meshes passed from the execute() method and uses it directly for all
-        subsequent steps (material prep, normal flipping, and OBJ export).
+        [DEFINITIVE V10 - CONTEXT PASSING FIX]
+        This version corrects the NameError by correctly passing the 'context'
+        object to the material preparation function.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
 
         try:
             logging.info("--- Finalizing Export ---")
 
-            # --- THE CORE FIX ---
-            # Use the already finalized list of meshes directly. Do NOT re-iterate or convert anything.
-            # This list was correctly built by the execute() method.
             final_meshes_for_obj = self._export_data.get("objects_for_export", [])
 
             if not final_meshes_for_obj:
                 raise RuntimeError("Final object list for export is empty.")
 
-            logging.info(f" > Finalizing with {len(final_meshes_for_obj)} pre-processed mesh objects: {[o.name for o in final_meshes_for_obj]}")
-            # --- END OF CORE FIX ---
+            logging.info(f" > Finalizing with {len(final_meshes_for_obj)} mesh objects: {[o.name for o in final_meshes_for_obj]}")
 
-            # Only run material preparation if there were bake tasks.
-            if self._total_tasks > 0:
-                self._prepare_materials_for_export(objects_to_process=final_meshes_for_obj)
+            any_udims_found = False
+            for obj in final_meshes_for_obj:
+                for slot in obj.material_slots:
+                    if slot.material and slot.material.use_nodes:
+                        for node in slot.material.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
+                                any_udims_found = True
+                                break
+                    if any_udims_found: break
+                if any_udims_found: break
+
+            if self._total_tasks > 0 or any_udims_found:
+                logging.info(f"Preparing materials for export (Bakes: {self._total_tasks > 0}, UDIMs: {any_udims_found}).")
+                # ---> THE FIX IS HERE <---
+                self._prepare_materials_for_export(context, objects_to_process=final_meshes_for_obj)
+                # ---> END OF FIX <---
             else:
-                logging.info(" > No bake tasks were run. Skipping material preparation to export original state.")
+                logging.info(" > No bakes or UDIMs. Skipping material preparation to export original state.")
 
             if addon_prefs.flip_faces_export:
                 logging.info("Applying 'Flip Normals' to final export meshes as requested.")
@@ -3927,8 +4225,14 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             base_name, asset_number = get_asset_number(context)
             obj_filename = f"{base_name}_{asset_number}.obj"
-            temp_dir = tempfile.gettempdir()
-            exported_obj_path = os.path.join(temp_dir, obj_filename)
+            
+            temp_asset_dir = os.path.join(tempfile.gettempdir(), f"remix_export_{base_name}_{asset_number}")
+            if os.path.exists(temp_asset_dir):
+                shutil.rmtree(temp_asset_dir)
+            os.makedirs(temp_asset_dir, exist_ok=True)
+            self._export_data["temp_files_to_clean"].add(temp_asset_dir)
+            
+            exported_obj_path = os.path.join(temp_asset_dir, obj_filename)
 
             logging.info("Preparing selection for OBJ exporter...")
             bpy.ops.object.select_all(action='DESELECT')
@@ -3945,20 +4249,17 @@ class OBJECT_OT_export_and_ingest(Operator):
             bpy.ops.wm.obj_export(
                 filepath=exported_obj_path,
                 check_existing=True,
-                # Force this to True, as we have manually created the exact selection we want.
                 export_selected_objects=True, 
                 forward_axis=addon_prefs.obj_export_forward_axis,
                 up_axis=addon_prefs.obj_export_up_axis,
                 global_scale=addon_prefs.remix_export_scale,
                 apply_modifiers=addon_prefs.apply_modifiers,
                 export_materials=True,
-                path_mode='ABSOLUTE',
+                path_mode='COPY',
                 export_pbr_extensions=True
             )
 
-            logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
-            self._export_data["temp_files_to_clean"].add(exported_obj_path)
-            self._export_data["temp_files_to_clean"].add(exported_obj_path.replace('.obj', '.mtl'))
+            logging.info(f"Exported to temporary OBJ with copied textures: {exported_obj_path}")
 
             ingested_usd = upload_to_api(exported_obj_path, addon_prefs.remix_ingest_directory, context)
             if not ingested_usd:
@@ -4033,6 +4334,11 @@ class OBJECT_OT_export_and_ingest(Operator):
 
           
     def _bake_udim_material_to_atlas(self, context, mat, objects_using_mat, bake_dir):
+        """
+        [DEFINITIVE V13 - KEYERROR FIX]
+        Removes the erroneous line that tried to access the non-existent
+        'baked_materials' key in the export data dictionary.
+        """
         if not mat or not mat.use_nodes:
             return None, None
         logging.info(f"--- Starting NON-BAKING UDIM Stitch for Material: '{mat.name}' ---")
@@ -4053,7 +4359,13 @@ class OBJECT_OT_export_and_ingest(Operator):
             return mat, None
 
         final_stitched_mat = bpy.data.materials.new(name=f"{mat.name}__UDIM_STITCHED")
-        self._export_data["baked_materials"][mat.name] = final_stitched_mat
+        
+        # ---> THIS LINE CAUSED THE ERROR AND IS NOW REMOVED <---
+        # self._export_data["baked_materials"][mat.name] = final_stitched_mat
+        
+        # This is the correct way to track the temporary material for cleanup
+        self._export_data["temp_materials_for_cleanup"].append(final_stitched_mat)
+        
         final_stitched_mat.use_nodes = True
         nt = final_stitched_mat.node_tree
         for node in nt.nodes: nt.nodes.remove(node)
@@ -4229,118 +4541,92 @@ class OBJECT_OT_export_and_ingest(Operator):
                 atlas_uv_layer.data[loop_index].uv = (u_new, v_original)
             logging.info(f"Successfully transformed UVs for '{obj.name}'.")
 
-    def _prepare_materials_for_export(self, objects_to_process):
+    def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [DEFINITIVELY CORRECTED V10 - NON-DESTRUCTIVE SIMPLE PATH]
-        This version correctly handles the two material pathways:
-        1.  For complex materials, it builds a new baked material from textures.
-        2.  For simple materials, IT DOES NOTHING, leaving the original material
-            in place to ensure the OBJ/MTL exports with valid, unchanged references
-            that the server validator expects. This fixes the ingestion failure for simple assets.
+        [UDIM-BAKE V2] Prepares final materials. It now builds new materials from
+        baked textures for both complex and UDIM-based sources. For UDIMs, it adds
+        a UV Map node pointing to the generated atlas map.
         """
-        logging.info("Building final export materials from baked textures...")
+        logging.info("Preparing final export materials (handling bakes and simple materials)...")
 
-        # Backup original materials for cleanup (this is still needed to restore state)
         self._export_data["original_material_assignments"] = {
-            obj.name: [s.material for s in obj.material_slots]
-            for obj in objects_to_process
+            obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process
         }
-        self._export_data["temp_materials_for_cleanup"] = []
-
-        # Prepare data for quick lookups
+    
         bake_info = self._export_data.get('bake_info', {})
         baked_tasks_by_mat_uuid = defaultdict(list)
         for task in bake_info.get('tasks', []):
             baked_tasks_by_mat_uuid[task.get("material_uuid")].append(task)
-
-        # A cache to ensure we only process each original material once.
-        # Key: original_mat.name, Value: the material to be used for export (either baked or original)
+    
+        # Map of original material name -> final material to be assigned
         processed_materials_map = {}
+        all_original_materials = {s.material for o in objects_to_process for s in o.material_slots if s.material}
 
-        for obj in objects_to_process:
-            if not obj.material_slots:
-                logging.debug(f" > Object '{obj.name}' has no material slots, skipping.")
+        for original_mat in all_original_materials:
+            if original_mat.name in processed_materials_map:
                 continue
 
-            logging.info(f" > Preparing materials for object: '{obj.name}'")
-            for slot in obj.material_slots:
-                original_mat = slot.material
-                if not original_mat:
-                    continue
+            export_mat_to_assign = original_mat # Default to original
+            mat_uuid = original_mat.get("uuid")
+            tasks_for_this_mat = baked_tasks_by_mat_uuid.get(mat_uuid, [])
+        
+            # Check if any bake tasks for this material succeeded
+            successful_bake_files = [t for t in tasks_for_this_mat if os.path.exists(t.get("output_path"))]
 
-                # If we've already decided what to do with this material, just assign it and continue.
-                if original_mat.name in processed_materials_map:
-                    slot.material = processed_materials_map[original_mat.name]
-                    continue
-
-                # --- This is the decision point for the material ---
-                export_mat_to_assign = None
-                mat_uuid = original_mat.get("uuid")
-                tasks_for_this_mat = baked_tasks_by_mat_uuid.get(mat_uuid, [])
+            # If the material was baked (either complex or UDIM)
+            if mat_uuid and successful_bake_files:
+                logging.info(f"   - Building new baked material for '{original_mat.name}'...")
+                baked_mat = bpy.data.materials.new(name=f"{original_mat.name}_BAKED")
+                self._export_data["temp_materials_for_cleanup"].append(baked_mat)
+                baked_mat.use_nodes = True
+                nt = baked_mat.node_tree
+                # Clear default nodes
+                for node in nt.nodes: nt.nodes.remove(node)
             
-                successful_bake_files = [
-                    task for task in tasks_for_this_mat
-                    if task.get("output_path") and os.path.exists(task.get("output_path"))
-                ]
+                bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+                out = nt.nodes.new('ShaderNodeOutputMaterial')
+                nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+            
+                uv_map_node = None
+                # If this was a UDIM bake, create a UV Map node to point to the atlas
+                if original_mat.name in bake_info.get('udim_materials', set()):
+                    uv_map_node = nt.nodes.new('ShaderNodeUVMap')
+                    uv_map_node.uv_map = "remix_atlas_uv"
 
-                # --- PATH 1: Complex material with successful bakes ---
-                if mat_uuid and successful_bake_files:
-                    logging.info(f"   - Building new baked material for '{original_mat.name}'...")
-                    baked_mat = bpy.data.materials.new(name=f"{original_mat.name}_BAKED")
-                    baked_mat.use_nodes = True
-                    nt = baked_mat.node_tree
-                    for node in nt.nodes: nt.nodes.remove(node)
-                    bsdf = nt.nodes.new(type='ShaderNodeBsdfPrincipled')
-                    output_node = nt.nodes.new(type='ShaderNodeOutputMaterial')
-                    nt.links.new(bsdf.outputs['BSDF'], output_node.inputs['Surface'])
-
-                    unique_texture_tasks = {os.path.basename(task['output_path']): task for task in successful_bake_files}.values()
-
-                    for i, task in enumerate(unique_texture_tasks):
-                        tex_node = nt.nodes.new(type='ShaderNodeTexImage')
-                        tex_node.image = bpy.data.images.load(task["output_path"], check_existing=True)
-                        tex_node.location = (-600, i * -300)
-                        socket_name = task.get("target_socket_name")
-                        socket_map = {"Emission": "Emission Color", "Base Color": "Base Color"}
-                        target_socket_name = socket_map.get(socket_name, socket_name)
-
-                        if task.get("is_value_bake") or task['bake_type'] in ['NORMAL', 'ROUGHNESS']:
-                            tex_node.image.colorspace_settings.name = 'Non-Color'
-
-                        if target_socket_name == "Normal":
-                            normal_map_node = nt.nodes.new('ShaderNodeNormalMap')
-                            normal_map_node.location = (-300, i * -300)
-                            nt.links.new(tex_node.outputs['Color'], normal_map_node.inputs['Color'])
-                            nt.links.new(normal_map_node.outputs['Normal'], bsdf.inputs['Normal'])
-                        elif target_socket_name == "Displacement":
-                            disp_node = nt.nodes.new('ShaderNodeDisplacement')
-                            nt.links.new(tex_node.outputs['Color'], disp_node.inputs['Height'])
-                            nt.links.new(disp_node.outputs['Displacement'], output_node.inputs['Displacement'])
-                        else:
-                            target_socket = bsdf.inputs.get(target_socket_name)
-                            if target_socket:
-                                nt.links.new(tex_node.outputs['Color'], target_socket)
+                # Use a dict to get one unique texture per bake type
+                unique_textures = {os.path.basename(t['output_path']): t for t in successful_bake_files}.values()
+                for task in unique_textures:
+                    tex_node = nt.nodes.new('ShaderNodeTexImage')
+                    tex_node.image = bpy.data.images.load(task["output_path"], check_existing=True)
                 
-                    export_mat_to_assign = baked_mat
-                    # Add this newly created baked material to the cleanup list.
-                    self._export_data["temp_materials_for_cleanup"].append(baked_mat)
+                    if uv_map_node: # If it's a UDIM bake, connect the UVs
+                        nt.links.new(uv_map_node.outputs['UV'], tex_node.inputs['Vector'])
 
-                # --- PATH 2: Simple material (no bakes) or failed bakes ---
-                else:
-                    if mat_uuid and tasks_for_this_mat:
-                        logging.warning(f"   - All bakes for '{original_mat.name}' were skipped or failed. Using original material for export.")
+                    if task.get("is_value_bake") or task['bake_type'] == 'NORMAL':
+                        tex_node.image.colorspace_settings.name = 'Non-Color'
+                
+                    target_name = task.get("target_socket_name")
+                    if target_name == "Normal":
+                        norm_map = nt.nodes.new('ShaderNodeNormalMap')
+                        nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
+                        nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
                     else:
-                        logging.info(f"   - Material '{original_mat.name}' is simple. Using original for export.")
-                
-                    # THE FIX: The material to use is the original one. No copy is made.
-                    export_mat_to_assign = original_mat
-                    # DO NOT add the original material to the cleanup list.
+                        socket_name = {"Emission": "Emission Color"}.get(target_name, target_name)
+                        if bsdf.inputs.get(socket_name):
+                            nt.links.new(tex_node.outputs['Color'], bsdf.inputs[socket_name])
+            
+                export_mat_to_assign = baked_mat
+            else:
+                logging.info(f"   - Material '{original_mat.name}' is simple. Using original for export.")
 
-                # Assign the chosen material and cache the decision.
-                if export_mat_to_assign:
-                    slot.material = export_mat_to_assign
-                    processed_materials_map[original_mat.name] = export_mat_to_assign
-                    
+            processed_materials_map[original_mat.name] = export_mat_to_assign
+
+        # Final pass to assign the newly created/chosen materials
+        for obj in objects_to_process:
+            for slot in obj.material_slots:
+                if slot.material and slot.material.name in processed_materials_map:
+                    slot.material = processed_materials_map[slot.material.name]
+                
     def _replace_or_append_on_server(self, context, ingested_usd):
         """
         Smarter workflow handler. Automatically detects if an asset with the same
@@ -4416,32 +4702,42 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _cleanup(self, context, return_value):
         """
-        [DEFINITIVE V5 - SIMPLIFIED CLEANUP & FINAL SAVE]
-        Handles all post-operation cleanup tasks. This version specifically targets and
-        deletes the single bake directory generated by the process, along with any loose
-        temporary files. It also performs a final save if the operation succeeded.
+        [DEFINITIVE V6 - CORRECTED CLEANUP]
+        Handles all post-operation cleanup tasks. This version correctly references
+        _worker_slots instead of the old _worker_pool.
         """
         global export_lock
-        
-        # --- 1. SHUTDOWN EXTERNAL PROCESSES ---
-        if self._worker_pool:
-            logging.info(f"Shutting down {len(self._worker_pool)} worker processes...")
-            for worker in self._worker_pool:
-                if worker.poll() is None:
-                    try: worker.terminate()
-                    except Exception: pass
-            for worker in self._worker_pool:
-                try: worker.wait(timeout=2)
-                except subprocess.TimeoutExpired: worker.kill()
-        
-        for thread in self._comm_threads:
-            if thread.is_alive(): thread.join(timeout=1)
 
-        self._worker_pool.clear()
-        self._comm_threads.clear()
+        # --- 1. SHUTDOWN EXTERNAL PROCESSES ---
+        # ---> THIS IS THE FIX: Use self._worker_slots, not self._worker_pool <---
+        if hasattr(self, '_worker_slots') and self._worker_slots:
+            logging.info(f"Shutting down {len(self._worker_slots)} worker process(es)...")
+            # We iterate over the 'process' object within each slot dictionary
+            for slot in self._worker_slots:
+                worker = slot.get('process')
+                if worker and worker.poll() is None:
+                    try:
+                        worker.terminate()
+                    except Exception as e:
+                        logging.warning(f"Could not terminate worker PID {worker.pid}: {e}")
+            
+            # Wait for them to terminate
+            for slot in self._worker_slots:
+                worker = slot.get('process')
+                if worker and worker.poll() is None:
+                    try:
+                        worker.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+        # ---> END OF FIX <---
+
+        if hasattr(self, '_comm_threads'):
+            for thread in self._comm_threads:
+                if thread.is_alive():
+                    thread.join(timeout=1)
+            self._comm_threads.clear()
         
         # --- 2. RESTORE BLENDER SCENE STATE ---
-        # This part remains the same as it handles in-memory Blender data.
         if self._export_data.get("normals_were_flipped"):
             objects_that_were_flipped = self._export_data.get("objects_for_export", [])
             if objects_that_were_flipped:
@@ -4473,27 +4769,20 @@ class OBJECT_OT_export_and_ingest(Operator):
                         bpy.data.meshes.remove(mesh_data)
                 except Exception: pass
         
-        # --- 4. CLEANUP DISK (SIMPLIFIED) AND UI ---
-        
-        # ---> THIS IS THE SIMPLIFIED DELETION LOGIC <---
-        # It removes all files and folders that were added to the cleanup list.
-        # This correctly handles the generated bake folder and any other temp files.
+        # --- 4. CLEANUP DISK AND UI ---
         for path_to_clean in self._export_data.get("temp_files_to_clean", set()):
             if not os.path.exists(path_to_clean):
                 continue
-            
             try:
                 if os.path.isdir(path_to_clean):
-                    logging.info(f"Removing temporary directory: {path_to_clean}")
                     shutil.rmtree(path_to_clean)
                 else:
-                    logging.info(f"Removing temporary file: {path_to_clean}")
                     os.remove(path_to_clean)
             except Exception as e:
                 logging.warning(f"Could not remove temporary path '{path_to_clean}': {e}")
-        # ---> END OF SIMPLIFIED DELETION LOGIC <---
 
-        if self._timer: context.window_manager.event_timer_remove(self._timer)
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
         self._timer = None
         context.workspace.status_text_set(None)
         
@@ -5112,6 +5401,32 @@ class VIEW3D_PT_remix_ingestor(Panel):
     bl_category = 'Remix Ingestor'
 
     def draw(self, context):
+        layout = self.layout
+        
+        # --- NEW: Conditional UI based on psutil installation ---
+        if not PSUTIL_INSTALLED:
+            box = layout.box()
+            box.label(text="Dependency Required", icon='ERROR')
+            
+            col = box.column(align=True)
+            col.label(text="The 'psutil' library is needed for")
+            col.label(text="dynamic resource management.")
+
+            # Show install button only if the installation hasn't been completed in this session
+            if not getattr(context.scene, 'remix_install_complete', False):
+                 box.operator("remix.install_psutil", text="Install psutil", icon='CONSOLE')
+            else:
+                 info_box = box.box()
+                 info_box.label(text="Installation successful!", icon='CHECKMARK')
+                 info_box.label(text="Please restart Blender now.")
+                 box.operator("remix.restart_blender", text="Save and Restart Blender", icon='RECOVER_LAST')
+            
+            # Stop drawing the rest of the panel
+            return
+        # --- End of new conditional UI ---
+
+
+        # --- Main Addon UI (only drawn if psutil is installed) ---
         addon_prefs = context.preferences.addons[__name__].preferences
         layout = self.layout
 
@@ -5189,38 +5504,82 @@ classes = [
     EXPORT_OT_SubstancePainterExporter,
     SYSTEM_OT_check_gpu_settings,
     SYSTEM_OT_show_gpu_report,
+    # --- The new operators for the installation UI ---
+    REMIX_OT_install_psutil,
+    REMIX_OT_restart_blender,
 ]
-
+     
+      
 def register():
-    # Final, complete registration logic
     global BAKE_WORKER_PY
     log = logging.getLogger(__name__)
+
+    check_psutil()
+
     try:
         setup_logger()
-        # Define worker script path relative to this file
         BAKE_WORKER_PY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "remix_bake_worker.py")
         if not os.path.exists(BAKE_WORKER_PY):
             log.critical(f"Bake worker script 'remix_bake_worker.py' NOT FOUND at {BAKE_WORKER_PY}")
-        
+
         for cls in classes:
             bpy.utils.register_class(cls)
-        
+
         bpy.types.Scene.remix_custom_settings_backup = PointerProperty(type=CustomSettingsBackup)
         bpy.types.Scene.remix_asset_number = CollectionProperty(type=AssetNumberItem)
-        log.info("Remix Ingestor addon registration complete.")
+        bpy.types.Scene.remix_install_complete = BoolProperty(
+            name="Remix Install Complete",
+            description="Tracks if the psutil installation has been attempted.",
+            default=False
+        )
+        
+        # --- THIS IS THE FIX ---
+        # Register our global cleanup function to run when Blender exits.
+        atexit.register(_kill_all_active_workers)
+        # --- END OF FIX ---
+        
+        log.info("Remix Ingestor addon registration complete with orphan process handler.")
     except Exception as e:
         log.error(f"Addon registration failed: {e}", exc_info=True)
         raise
 
 def unregister():
     log = logging.getLogger(__name__)
+
+    # --- THIS IS THE FIX ---
+    # First, gracefully shut down any workers that might be running
+    # and clear the global registry. This effectively disables the atexit handler.
+    _kill_all_active_workers()
+
+    # The atexit documentation notes that unregistering can be problematic.
+    # The safest method is to ensure the registered function does nothing
+    # after the module is unlinked, which is what clearing the list achieves.
+    # For good measure, we can try to unregister it, but we'll wrap it in a
+    # try...except block as it's not guaranteed to exist or work in all
+    # Blender shutdown scenarios.
+    try:
+        import atexit
+        # This is a less-common function and was only added in Python 3.9
+        # so we check for its existence before calling.
+        if hasattr(atexit, 'unregister'):
+            atexit.unregister(_kill_all_active_workers)
+            log.info("atexit handler for orphan processes has been unregistered.")
+    except Exception as e:
+        log.warning(f"Could not explicitly unregister atexit handler: {e}")
+    # --- END OF FIX ---
+
     for cls in reversed(classes):
-        try: bpy.utils.unregister_class(cls)
-        except RuntimeError: pass
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
     try:
         del bpy.types.Scene.remix_asset_number
         del bpy.types.Scene.remix_custom_settings_backup
-    except AttributeError: pass
+        del bpy.types.Scene.remix_install_complete
+    except (AttributeError, TypeError):
+        pass
+        
     log.info("Remix Ingestor addon unregistered.")
 
 if __name__ == "__main__":
