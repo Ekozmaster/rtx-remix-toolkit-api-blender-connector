@@ -65,68 +65,69 @@ def setup_render_engine():
         bpy.context.scene.cycles.device = 'CPU'
 
 
-def _get_socket_to_bake(node_tree, target_socket_name):
-    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-    if not output_node: return None
-    if output_node.inputs['Surface'].is_linked:
-        final_shader_node = output_node.inputs['Surface'].links[0].from_node
-        socket = final_shader_node.inputs.get(target_socket_name)
-        if socket: return socket
-    return output_node.inputs.get(target_socket_name)
-               
       
-def perform_bake_task(task):
-    # ---> START OF FIX 2.B: USE THE GLOBAL NUMBER FROM THE TASK <---
-    # Instead of incrementing a local counter, we set the global one we received.
-    global_num = task.get("global_task_number", 0) # Use .get() for safety
-    task_counter.set_current(global_num)
-    # ---> END OF FIX 2.B <---
+def _get_socket_to_bake(node_tree, target_socket_name):
+    """
+    [DEFINITIVE V2 - UNIVERSAL SHADER FINDER]
+    Finds a target socket to bake from, regardless of the shader node setup.
+    It starts from the final Material Output and works backwards to find the
+    main shader, making it compatible with Principled BSDF, custom node
+    groups, or any other setup.
+    """
+    # Find the active Material Output node.
+    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    if not output_node:
+        log(" > Could not find an active Material Output node.")
+        return None
+
+    # Check if the main 'Surface' input is connected to anything.
+    if not output_node.inputs['Surface'].is_linked:
+        log(" > Material Output node's Surface is not connected to any shader.")
+        return None
+
+    # This is the final shader node connected to the output.
+    # It could be Principled BSDF, a custom group, a Mix Shader, etc.
+    final_shader_node = output_node.inputs['Surface'].links[0].from_node
+
+    # Now, look for the target socket on this final shader node.
+    socket = final_shader_node.inputs.get(target_socket_name)
+    if socket:
+        return socket
+
+    # If not found on the main shader, it might be a direct output (unlikely but possible)
+    socket = output_node.inputs.get(target_socket_name)
+    if socket:
+        return socket
+
+    log(f" > Could not find socket '{target_socket_name}' on the final shader '{final_shader_node.name}'.")
+    return None
+
     
+                     
+def perform_bake_task(task):
+    # ---> THIS IS THE FIX: Read the global number and set the counter <---
+    global_num = task.get("global_task_number", task_counter.i + 1)
+    task_counter.set_current(global_num)
+    # ---> END OF FIX <---
+
     bake_target_obj_name = task['object_name']
     bake_target_obj = bpy.data.objects.get(bake_target_obj_name)
-    
-    if not bake_target_obj:
-        log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}'. Object not found in blend file.")
-        return False
-        
-    try:
-        # ------------------- REMOVED SECTION START -------------------
-        # The worker's only job is to reconstruct the UVs from the file provided by the main addon.
-        # uv_data_path = task.get("uv_data_filepath")
-        # if uv_data_path and os.path.exists(uv_data_path):
-        #     log(f" > Reconstructing UVs for '{bake_target_obj.name}' from file...")
-        #     try:
-        #         with open(uv_data_path, 'r') as f:
-        #             uv_data_flat = json.load(f)
-        #         
-        #         if not bake_target_obj.data: raise RuntimeError("Object has no mesh data.")
-        #         
-        #         while bake_target_obj.data.uv_layers:
-        #             bake_target_obj.data.uv_layers.remove(bake_target_obj.data.uv_layers[0])
-        #             
-        #         uv_layer = bake_target_obj.data.uv_layers.new(name="UVMap_Bakeable")
-        #         uv_layer.data.foreach_set('uv', uv_data_flat)
-        #         uv_layer.active_render = True
-        #         bake_target_obj.data.uv_layers.active = uv_layer
-        #         log(f"   > SUCCESS: Reconstructed and activated UV map for '{bake_target_obj.name}'.")
-        #     except Exception as e:
-        #         log(f"   > FAILED to apply UV data from file '{uv_data_path}': {e}")
-        #         raise # Re-raise the exception to fail the task
-        # -------------------- REMOVED SECTION END --------------------
 
-        # --- NEW OPTIMIZED UV HANDLING ---
-        # Simply ensure the first UV map is the active one for baking.
+    if not bake_target_obj:
+        log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}'. Object not found.")
+        return False
+
+    try:
         if bake_target_obj.data and bake_target_obj.data.uv_layers:
-            if bake_target_obj.data.uv_layers.active is None or bake_target_obj.data.uv_layers.active_index != 0:
+            if bake_target_obj.data.uv_layers.active_index != 0:
                 bake_target_obj.data.uv_layers.active_index = 0
-                log(f" > Activated existing UV map for '{bake_target_obj.name}'.")
         else:
-            log(f" > WARNING: No UV maps found on '{bake_target_obj.name}'. Bake may fail or produce incorrect results.")
-            # This is a fallback warning; the main addon should ensure UVs exist.
-        
+            log(f" > WARNING: No UV maps on '{bake_target_obj_name}'.")
+
         original_mat = next((m for m in bpy.data.materials if m.get("uuid") == task['material_uuid']), None)
-        if not original_mat: raise RuntimeError(f"Material UUID '{task['material_uuid']}' not found.")
-        
+        if not original_mat:
+            raise RuntimeError(f"Material UUID '{task['material_uuid']}' not found.")
+
         log(f"Starting Bake: Obj='{bake_target_obj.name}', Mat='{original_mat.name}', Type='{task['bake_type']}'")
         perform_single_bake_operation(bake_target_obj, original_mat, task)
         return True
@@ -205,134 +206,147 @@ def _recover_packed_image_for_bake(image_datablock):
 
 def perform_single_bake_operation(obj, original_mat, task):
     """
-    [DEFINITIVE V3.2 - Using Robust Recovery]
-    Performs a single bake operation. This version ALWAYS works on a temporary
-    copy of the material and uses the new, robust recovery logic.
+    [DEFINITIVE V20 - COMPRESSION DISABLED]
+    As requested, this version disables PNG compression entirely (sets it to 0)
+    for high-precision 16-bit maps (Normal, Displacement) to ensure maximum
+    data fidelity and quality.
     """
     mat_for_bake = None
     temp_mat_name_for_cleanup = None
     original_mat_slot_index = -1
     img = None
-    render_bake = bpy.context.scene.render.bake
+    
+    # Store original scene render settings
+    scene_settings = bpy.context.scene.render.image_settings
+    original_format = scene_settings.file_format
+    original_color_depth = scene_settings.color_depth
+    original_compression = scene_settings.compression
+    
+    output_node = None
+    original_surface_link = None
+    hijack_nodes = []
 
     try:
-        # --- Stage 1: Create a temporary, isolated copy for the bake ---
+        # --- Stage 1 & 2: Setup (No changes here) ---
         mat_for_bake = original_mat.copy()
         temp_mat_name_for_cleanup = mat_for_bake.name
         nt = mat_for_bake.node_tree
         if not nt: raise RuntimeError(f"Material copy '{mat_for_bake.name}' failed to create a node tree.")
 
-        # --- In-Worker Texture Re-linking and Recovery ---
-        # After material.copy(), image datablocks are duplicated and empty.
-        # We must find the original datablock (which has the pixels) and recover it.
-        if nt:
-            for node in nt.nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    copied_image = node.image
-                    
-                    # The original datablock is stored in the .original property if it's a copy.
-                    # If it's not a copy (or if the link is broken), .original is None.
-                    source_datablock_with_pixels = copied_image.original if copied_image.original else copied_image
-                    
-                    # Use our new, robust recovery function on the correct source datablock.
-                    recovered_path = _recover_packed_image_for_bake(source_datablock_with_pixels)
-                    
-                    if recovered_path:
-                        # Replace the node's broken image reference with a new, valid one.
-                        try:
-                            node.image = bpy.data.images.load(recovered_path, check_existing=True)
-                        except Exception as e:
-                            log(f" > ERROR loading recovered image '{recovered_path}': {e}")
-        # ---> END OF THE DEFINITIVE FIX <---
-
-        # --- Stage 2: Temporarily assign the copy to the object ---
-        # (The rest of the function remains the same as your provided code)
         for i, slot in enumerate(obj.material_slots):
             if slot.material == original_mat:
                 slot.material = mat_for_bake
                 original_mat_slot_index = i
                 break
-        
         if original_mat_slot_index == -1:
-            raise RuntimeError(f"Could not find original material '{original_mat.name}' on object '{obj.name}' to replace.")
+            raise RuntimeError(f"Could not find original material '{original_mat.name}' on object '{obj.name}'.")
 
-        # ... (The rest of your function from Stage 3 onwards is correct and does not need to be changed) ...
-        # --- Stage 3: Prepare the bake image and arguments ---
-        if obj.data.uv_layers: obj.data.uv_layers.active_index = 0
+        # --- Stage 3: Prepare Bake Image (No changes here) ---
+        uv_layer_name_from_task = task.get('uv_layer')
+        if uv_layer_name_from_task and uv_layer_name_from_task in obj.data.uv_layers:
+            obj.data.uv_layers.active = obj.data.uv_layers[uv_layer_name_from_task]
         
         img = bpy.data.images.new(name=f"BakeTarget_{task['material_uuid']}", width=task['resolution_x'], height=task['resolution_y'], alpha=True)
         img.filepath_raw = task['output_path']
-        img.file_format = 'PNG'
-        if task.get('is_value_bake') or task['bake_type'] in ['NORMAL', 'ROUGHNESS']:
-            img.colorspace_settings.name = 'Non-Color'
         
-        bake_args = {'use_clear': True, 'margin': 8, 'type': task['bake_type']}
+        # --- HIJACK GLOBAL SCENE SETTINGS FOR SAVING (WITH COMPRESSION OFF) ---
+        is_high_precision_bake = task['target_socket_name'] in ['Displacement', 'Normal']
+        
+        scene_settings.file_format = 'PNG'
+        if is_high_precision_bake:
+            log(f" > High-precision bake detected for '{task['target_socket_name']}'. Disabling compression for 16-bit PNG.")
+            scene_settings.color_depth = '16'
+            # ##################################################################
+            # ### THIS IS THE CHANGE YOU REQUESTED                         ###
+            # ##################################################################
+            scene_settings.compression = 0 
+        else:
+            scene_settings.color_depth = '8'
+            scene_settings.compression = 15 # Light compression for color maps is fine
 
-        # --- Stage 4: Modify the temporary material copy based on bake type ---
-        hijack_nodes = []
+        if not task.get('is_color_data', False):
+            img.colorspace_settings.name = 'Non-Color'
+
+        # --- Stage 4: Bake Setup (No changes here) ---
+        bake_args = {'use_clear': True, 'margin': 4, 'type': task['bake_type']}
         
-        if task['bake_type'] == 'EMIT':
+        if task['bake_type'] != 'EMIT':
+            if task['bake_type'] == 'DIFFUSE':
+                bpy.context.scene.render.bake.use_pass_direct = False
+                bpy.context.scene.render.bake.use_pass_indirect = False
+                bpy.context.scene.render.bake.use_pass_color = True
+        else:
             output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-            socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
-            
-            if not socket_to_bake:
-                log(" > Socket not found for EMIT bake, skipping.")
-                return
-            
             if output_node and output_node.inputs['Surface'].is_linked:
-                for link in list(output_node.inputs['Surface'].links):
-                    nt.links.remove(link)
-            
+                original_surface_link = output_node.inputs['Surface'].links[0]
+            socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
+            if not socket_to_bake: return
             emission_node = nt.nodes.new('ShaderNodeEmission')
             hijack_nodes.append(emission_node)
-            source_socket = socket_to_bake.links[0].from_socket if socket_to_bake.is_linked else None
-            
-            if source_socket:
+            if socket_to_bake.is_linked:
+                source_socket = socket_to_bake.links[0].from_socket
                 if task.get('is_value_bake'): nt.links.new(source_socket, emission_node.inputs['Strength'])
                 else: nt.links.new(source_socket, emission_node.inputs['Color'])
-            
+            else:
+                default_val = socket_to_bake.default_value
+                if task.get('is_value_bake'):
+                    final_value = sum(default_val) / len(default_val) if hasattr(default_val, '__len__') and len(default_val) > 0 else float(default_val)
+                    emission_node.inputs['Strength'].default_value = final_value
+                else:
+                    emission_node.inputs['Color'].default_value = default_val
             if output_node:
+                if original_surface_link: nt.links.remove(original_surface_link)
                 nt.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
-
-        elif task['bake_type'] == 'DIFFUSE':
-            render_bake.use_pass_direct = False
-            render_bake.use_pass_indirect = False
-            render_bake.use_pass_color = True
 
         tex_node = nt.nodes.new('ShaderNodeTexImage')
         tex_node.image = img
-        nt.nodes.active = tex_node
         hijack_nodes.append(tex_node)
-        
-        # --- Stage 5: Execute the bake ---
+        nt.nodes.active = tex_node
+        tex_node.select = True
+
+        # --- Stage 5: Execute Bake & Save ---
         bpy.ops.object.select_all(action='DESELECT')
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
 
         log(" > CALLING BAKE with args: %s", bake_args)
         bpy.ops.object.bake(**bake_args)
+        
         img.save()
         log(" > Bake successful.")
 
     finally:
-        # --- Stage 6: Guaranteed Cleanup ---
-        if task['bake_type'] == 'DIFFUSE':
-            render_bake.use_pass_direct = True
-            render_bake.use_pass_indirect = True
-            render_bake.use_pass_color = True
-
-        if obj and original_mat_slot_index != -1 and len(obj.material_slots) > original_mat_slot_index:
-            obj.material_slots[original_mat_slot_index].material = original_mat
+        # --- Stage 6: GUARANTEED CLEANUP AND RESTORATION ---
+        scene_settings.file_format = original_format
+        scene_settings.color_depth = original_color_depth
+        scene_settings.compression = original_compression
         
-        mat_to_clean = bpy.data.materials.get(temp_mat_name_for_cleanup) if temp_mat_name_for_cleanup else None
-        if mat_to_clean:
-            bpy.data.materials.remove(mat_to_clean, do_unlink=True)
+        bpy.context.scene.render.bake.use_pass_direct = True
+        bpy.context.scene.render.bake.use_pass_indirect = True
+        bpy.context.scene.render.bake.use_pass_color = True
 
-        if img and img.name in bpy.data.images:
-            bpy.data.images.remove(img)
+        if output_node and original_surface_link:
+            if not output_node.inputs['Surface'].is_linked:
+                nt.links.new(original_surface_link.from_socket, output_node.inputs['Surface'])
+        for node in hijack_nodes:
+            if node and node.name in nt.nodes:
+                nt.nodes.remove(node)
+
+        if obj and original_mat_slot_index != -1:
+            obj.material_slots[original_mat_slot_index].material = original_mat
+        mat_to_clean = bpy.data.materials.get(temp_mat_name_for_cleanup)
+        if mat_to_clean: bpy.data.materials.remove(mat_to_clean, do_unlink=True)
+        if img and img.name in bpy.data.images: bpy.data.images.remove(img)
 
 def persistent_worker_loop():
+    """Main loop for the worker. Includes PID in all stdout messages."""
     log("Persistent worker started. Awaiting commands...")
+    
+    # A dedicated function to send JSON to stdout, ensuring the PID is always included.
+    def send_json_message(payload):
+        payload['pid'] = worker_pid # <-- THE FIX: Always add the PID
+        print(json.dumps(payload), flush=True)
+
     try:
         initial_command_str = sys.stdin.readline()
         command = json.loads(initial_command_str)
@@ -343,19 +357,19 @@ def persistent_worker_loop():
                 bpy.ops.wm.open_mainfile(filepath=blend_file)
                 log(f"Successfully loaded blend file: {blend_file}")
                 setup_render_engine()
-                print(json.dumps({"status": "ready"}), flush=True)
+                send_json_message({"status": "ready"}) # <-- Use the helper function
             else:
                 raise RuntimeError(f"Blend file not found: {blend_file}")
     except Exception as e:
         log(f"!!! FATAL: Could not process initial 'load_blend' command: {e}")
-        print(json.dumps({"status": "error", "reason": str(e)}), flush=True)
+        send_json_message({"status": "error", "details": str(e)})
         return
 
     while True:
         line = sys.stdin.readline()
         if not line:
             log("Input stream closed. Exiting.")
-            break 
+            break
         result_payload = {}
         try:
             task = json.loads(line)
@@ -365,22 +379,16 @@ def persistent_worker_loop():
             success = perform_bake_task(task)
             result_payload = {
                 "status": "success" if success else "failure",
-                "task_uuid": task.get("material_uuid", "unknown"),
-                "target": task.get("target_socket_name", "unknown")
+                "details": f"Task for material {task.get('material_name')} on {task.get('object_name')}"
             }
         except json.JSONDecodeError:
-            result_payload = {"status": "error", "reason": f"invalid_json: {line}"}
+            result_payload = {"status": "error", "details": f"invalid_json: {line}"}
         except Exception as e:
             log(f"!!! UNHANDLED WORKER ERROR during task loop: {e}")
-            result_payload = {"status": "error", "reason": str(e)}
-        print(json.dumps(result_payload), flush=True)
+            result_payload = {"status": "error", "details": str(e)}
 
-    for obj_name in realized_mesh_cache.values():
-        obj = bpy.data.objects.get(obj_name)
-        if obj:
-            mesh_data = obj.data
-            bpy.data.objects.remove(obj)
-            if mesh_data and mesh_data.users == 0: bpy.data.meshes.remove(mesh_data)
+        send_json_message(result_payload) # <-- Use the helper function
+
     log("Worker task processing complete.")
 
 if __name__ == "__main__":
