@@ -3694,12 +3694,12 @@ class OBJECT_OT_export_and_ingest(Operator):
         # --- START OF THE FIX ---
         # Displacement is now part of the standard channels to check for every complex material.
         UNIVERSAL_BAKE_CHANNELS = [
-            ("Base Color", 'DIFFUSE', False, True),
+            ("Base Color", 'EMIT', False, True), # <-- CHANGED from 'DIFFUSE' to 'EMIT'
             ("Metallic", 'EMIT', True, False),
-            ("Roughness", 'ROUGHNESS', True, False),
-            ("Normal", 'NORMAL', False, False),
+            ("Roughness", 'EMIT', True, False),
+            ("Normal", 'NORMAL', False, False),  # Normal remains 'NORMAL'
             ("Emission Color", 'EMIT', False, True),
-            ("Displacement", 'EMIT', True, False) # Added Displacement here
+            ("Displacement", 'EMIT', True, False)
         ]
         # --- END OF THE FIX ---
 
