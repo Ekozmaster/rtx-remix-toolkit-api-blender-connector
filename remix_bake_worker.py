@@ -6,6 +6,7 @@ import argparse
 import traceback
 from datetime import datetime
 import time
+import math
 import re
 import tempfile # <-- ADD THIS LINE
 import uuid     # <-- ADD THIS LINE
@@ -206,81 +207,82 @@ def _recover_packed_image_for_bake(image_datablock):
 
 def perform_single_bake_operation(obj, original_mat, task):
     """
-    [DEFINITIVE V20 - COMPRESSION DISABLED]
-    As requested, this version disables PNG compression entirely (sets it to 0)
-    for high-precision 16-bit maps (Normal, Displacement) to ensure maximum
-    data fidelity and quality.
+    [DEFINITIVE V43 - CORRECT OPERATOR CALL]
+    This version corrects the embarrassing and repeated TypeError. The bake pass
+    settings (use_pass_color, etc.) are now correctly set on the scene's render
+    bake settings BEFORE calling the operator, as required by the API. This
+    ensures native DIFFUSE bakes execute correctly without crashing.
     """
+    # Define all backup variables BEFORE the try block to prevent NameErrors
+    scene = bpy.context.scene
+    render_settings = scene.render
+    bake_settings = render_settings.bake
+    image_settings = render_settings.image_settings
+    
+    original_film_transparent = render_settings.film_transparent
+    original_format = image_settings.file_format
+    original_color_depth = image_settings.color_depth
+    original_compression = image_settings.compression
+    original_use_pass_direct = bake_settings.use_pass_direct
+    original_use_pass_indirect = bake_settings.use_pass_indirect
+    original_use_pass_color = bake_settings.use_pass_color
+    
     mat_for_bake = None
     temp_mat_name_for_cleanup = None
     original_mat_slot_index = -1
     img = None
-    
-    # Store original scene render settings
-    scene_settings = bpy.context.scene.render.image_settings
-    original_format = scene_settings.file_format
-    original_color_depth = scene_settings.color_depth
-    original_compression = scene_settings.compression
     
     output_node = None
     original_surface_link = None
     hijack_nodes = []
 
     try:
-        # --- Stage 1 & 2: Setup (No changes here) ---
         mat_for_bake = original_mat.copy()
         temp_mat_name_for_cleanup = mat_for_bake.name
         nt = mat_for_bake.node_tree
-        if not nt: raise RuntimeError(f"Material copy '{mat_for_bake.name}' failed to create a node tree.")
-
+        if not nt: raise RuntimeError("Material copy failed.")
+        
         for i, slot in enumerate(obj.material_slots):
             if slot.material == original_mat:
                 slot.material = mat_for_bake
-                original_mat_slot_index = i
-                break
-        if original_mat_slot_index == -1:
-            raise RuntimeError(f"Could not find original material '{original_mat.name}' on object '{obj.name}'.")
+                original_mat_slot_index = i; break
+        if original_mat_slot_index == -1: raise RuntimeError("Could not find original material on object.")
 
-        # --- Stage 3: Prepare Bake Image (No changes here) ---
         uv_layer_name_from_task = task.get('uv_layer')
         if uv_layer_name_from_task and uv_layer_name_from_task in obj.data.uv_layers:
             obj.data.uv_layers.active = obj.data.uv_layers[uv_layer_name_from_task]
-        
+
         img = bpy.data.images.new(name=f"BakeTarget_{task['material_uuid']}", width=task['resolution_x'], height=task['resolution_y'], alpha=True)
         img.filepath_raw = task['output_path']
         
-        # --- HIJACK GLOBAL SCENE SETTINGS FOR SAVING (WITH COMPRESSION OFF) ---
-        is_high_precision_bake = task['target_socket_name'] in ['Displacement', 'Normal']
-        
-        scene_settings.file_format = 'PNG'
-        if is_high_precision_bake:
-            log(f" > High-precision bake detected for '{task['target_socket_name']}'. Disabling compression for 16-bit PNG.")
-            scene_settings.color_depth = '16'
-            # ##################################################################
-            # ### THIS IS THE CHANGE YOU REQUESTED                         ###
-            # ##################################################################
-            scene_settings.compression = 0 
+        image_settings.file_format = 'PNG'
+        is_high_precision = task['bake_type'] == 'NORMAL' or task['target_socket_name'] == 'Displacement'
+        if is_high_precision:
+            image_settings.color_depth, image_settings.compression = '16', 0
         else:
-            scene_settings.color_depth = '8'
-            scene_settings.compression = 15 # Light compression for color maps is fine
-
+            image_settings.color_depth, image_settings.compression = '8', 15
         if not task.get('is_color_data', False):
             img.colorspace_settings.name = 'Non-Color'
 
-        # --- Stage 4: Bake Setup (No changes here) ---
-        bake_args = {'use_clear': True, 'margin': 4, 'type': task['bake_type']}
+        tex_node = nt.nodes.new('ShaderNodeTexImage')
+        tex_node.image = img
+        nt.nodes.active, tex_node.select = tex_node, True
+        hijack_nodes.append(tex_node)
         
-        if task['bake_type'] != 'EMIT':
-            if task['bake_type'] == 'DIFFUSE':
-                bpy.context.scene.render.bake.use_pass_direct = False
-                bpy.context.scene.render.bake.use_pass_indirect = False
-                bpy.context.scene.render.bake.use_pass_color = True
-        else:
+        bake_type = task['bake_type']
+        bake_args = {'use_clear': True, 'margin': 16, 'type': bake_type}
+
+        if bake_type == 'EMIT':
+            log(f" > Setting up EMIT hijack for: {task['target_socket_name']}.")
             output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
             if output_node and output_node.inputs['Surface'].is_linked:
                 original_surface_link = output_node.inputs['Surface'].links[0]
+            
             socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
-            if not socket_to_bake: return
+            if not socket_to_bake: 
+                log(f" > WARNING: Could not find socket '{task['target_socket_name']}' to bake. Skipping this task.")
+                return 
+
             emission_node = nt.nodes.new('ShaderNodeEmission')
             hijack_nodes.append(emission_node)
             if socket_to_bake.is_linked:
@@ -294,46 +296,49 @@ def perform_single_bake_operation(obj, original_mat, task):
                     emission_node.inputs['Strength'].default_value = final_value
                 else:
                     emission_node.inputs['Color'].default_value = default_val
+            
             if output_node:
                 if original_surface_link: nt.links.remove(original_surface_link)
                 nt.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
-
-        tex_node = nt.nodes.new('ShaderNodeTexImage')
-        tex_node.image = img
-        hijack_nodes.append(tex_node)
-        nt.nodes.active = tex_node
-        tex_node.select = True
-
-        # --- Stage 5: Execute Bake & Save ---
+        
+        else:
+            log(f" > Using native bake pass '{bake_type}'.")
+            # --- THIS IS THE FIX ---
+            # Set the bake pass properties on the context, NOT in the operator call.
+            if bake_type == 'DIFFUSE':
+                bake_settings.use_pass_direct = False
+                bake_settings.use_pass_indirect = False
+                bake_settings.use_pass_color = True
+        
         bpy.ops.object.select_all(action='DESELECT')
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
-
         log(" > CALLING BAKE with args: %s", bake_args)
         bpy.ops.object.bake(**bake_args)
-        
         img.save()
         log(" > Bake successful.")
 
     finally:
-        # --- Stage 6: GUARANTEED CLEANUP AND RESTORATION ---
-        scene_settings.file_format = original_format
-        scene_settings.color_depth = original_color_depth
-        scene_settings.compression = original_compression
+        # Restore all settings correctly
+        render_settings.film_transparent = original_film_transparent
+        image_settings.file_format = original_format
+        image_settings.color_depth = original_color_depth
+        image_settings.compression = original_compression
+        bake_settings.use_pass_direct = original_use_pass_direct
+        bake_settings.use_pass_indirect = original_use_pass_indirect
+        bake_settings.use_pass_color = original_use_pass_color
+
+        if 'nt' in locals() and nt and output_node:
+            if original_surface_link and not output_node.inputs['Surface'].is_linked:
+                try: nt.links.new(original_surface_link.from_socket, output_node.inputs['Surface'])
+                except Exception: pass
+            for node in hijack_nodes:
+                if node and node.name in nt.nodes: nt.nodes.remove(node)
         
-        bpy.context.scene.render.bake.use_pass_direct = True
-        bpy.context.scene.render.bake.use_pass_indirect = True
-        bpy.context.scene.render.bake.use_pass_color = True
-
-        if output_node and original_surface_link:
-            if not output_node.inputs['Surface'].is_linked:
-                nt.links.new(original_surface_link.from_socket, output_node.inputs['Surface'])
-        for node in hijack_nodes:
-            if node and node.name in nt.nodes:
-                nt.nodes.remove(node)
-
         if obj and original_mat_slot_index != -1:
-            obj.material_slots[original_mat_slot_index].material = original_mat
+            try: obj.material_slots[original_mat_slot_index].material = original_mat
+            except Exception: pass
+        
         mat_to_clean = bpy.data.materials.get(temp_mat_name_for_cleanup)
         if mat_to_clean: bpy.data.materials.remove(mat_to_clean, do_unlink=True)
         if img and img.name in bpy.data.images: bpy.data.images.remove(img)
