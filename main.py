@@ -46,6 +46,7 @@ from bpy.path import abspath
 import traceback
 from collections import defaultdict, deque 
 import atexit
+import hashlib
 
 # --- Globals & Configuration ---
 log_file_path = ""
@@ -54,7 +55,13 @@ remix_import_lock = False # Use a simple boolean lock
 conversion_count = 0
 is_applying_preset = False
 PSUTIL_INSTALLED = False
+PILLOW_INSTALLED = False
 ACTIVE_WORKER_PROCESSES = []
+TEMP_FILES_FOR_ATEXIT_CLEANUP = []
+TEMP_DIR_PREFIX = "remix_ingestor_temp_"
+# Define the custom paths here to be used by all functions
+CUSTOM_COLLECT_PATH = os.path.join(tempfile.gettempdir(), "remix_collect")
+CUSTOM_FINALIZE_PATH = os.path.join(tempfile.gettempdir(), "remix_finalize")
 
 # Baking Worker Configuration
 BAKE_WORKER_PY = None 
@@ -62,22 +69,128 @@ BAKE_WORKER_PY = None
 MAX_CONCURRENT_BAKE_WORKERS = 4
 BAKE_BATCH_SIZE_PER_WORKER = 5
 
-def check_psutil():
-    """
-    Checks if psutil is installed and updates the global state.
-    This function is called when the addon is registered.
-    """
-    global PSUTIL_INSTALLED
+def check_dependencies():
+    """Checks if psutil and Pillow are installed and updates the global state."""
+    global PSUTIL_INSTALLED, PILLOW_INSTALLED
     try:
         import psutil
         PSUTIL_INSTALLED = True
         logging.info("Dependency 'psutil' is installed.")
     except ImportError:
         PSUTIL_INSTALLED = False
-        logging.warning("Dependency 'psutil' is NOT installed. Dynamic worker functionality will be disabled.")
+        logging.warning("Dependency 'psutil' is NOT installed.")
+    try:
+        from PIL import Image
+        PILLOW_INSTALLED = True
+        logging.info("Dependency 'Pillow' is installed.")
+    except ImportError:
+        PILLOW_INSTALLED = False
+        logging.warning("Dependency 'Pillow' is NOT installed.")
+
+class REMIX_OT_install_dependency(Operator):
+    """Attempts to install a specified Python library using pip."""
+    bl_idname = "remix.install_dependency"
+    bl_label = "Install Dependency"
+    bl_description = "Downloads and installs a required library. Blender may need to be restarted."
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    dependency: StringProperty(
+        name="Dependency Name",
+        description="The name of the library to install (e.g., 'psutil', 'Pillow')",
+        default=""
+    )
+
+    def execute(self, context):
+        if not self.dependency:
+            self.report({'ERROR'}, "No dependency specified.")
+            return {'CANCELLED'}
+
+        try:
+            py_exec = sys.executable
+            # Ensure pip is available and updated
+            subprocess.run([py_exec, "-m", "ensurepip"], check=True, capture_output=True)
+            subprocess.run([py_exec, "-m", "pip", "install", "--upgrade", "pip"], check=True, capture_output=True)
+            # Install the dependency
+            result = subprocess.run(
+                [py_exec, "-m", "pip", "install", self.dependency],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            logging.info(f"{self.dependency} installation successful:\n" + result.stdout)
+            self.report({'INFO'}, f"{self.dependency} installed successfully! Please restart Blender to apply.")
+            context.scene.remix_install_complete = True # Generic flag for restart button
+
+        except subprocess.CalledProcessError as e:
+            error_message = (f"Failed to install {self.dependency}. See System Console for details. Error:\n{e.stderr}")
+            logging.error(error_message)
+            self.report({'ERROR'}, "Installation failed. Check System Console.")
+            context.scene.remix_install_complete = False
+        except FileNotFoundError:
+            error_message = f"Failed to install {self.dependency}: Python executable not found."
+            logging.error(error_message)
+            self.report({'ERROR'}, error_message)
+            context.scene.remix_install_complete = False
+
+        check_dependencies() # Re-check after installation attempt
+        return {'FINISHED'}
 
 # Call the check immediately when the script is loaded
-check_psutil()
+check_dependencies()
+
+def cleanup_orphan_directories():
+    """
+    [DEFINITIVE FIX] Scans the specific custom directories for orphaned temp folders
+    left over from previous crashed sessions and deletes them.
+    """
+    if not PSUTIL_INSTALLED:
+        logging.warning("Orphan cleanup skipped: 'psutil' is not installed.")
+        return
+
+    import psutil
+    # List of all base paths that the addon might create temp folders in.
+    paths_to_scan = [CUSTOM_COLLECT_PATH, CUSTOM_FINALIZE_PATH]
+    
+    logging.info(f"Startup cleanup: Scanning custom paths for orphan directories...")
+
+    for base_path in paths_to_scan:
+        if not os.path.exists(base_path):
+            continue # Skip if the base directory (e.g., 'collect') doesn't even exist.
+
+        logging.debug(f" > Scanning: {base_path}")
+        try:
+            for dirname in os.listdir(base_path):
+                if dirname.startswith(TEMP_DIR_PREFIX):
+                    orphan_path = os.path.join(base_path, dirname)
+                    lock_file_path = os.path.join(orphan_path, 'blender.lock')
+
+                    if not os.path.exists(lock_file_path):
+                        logging.warning(f"Found temp dir '{orphan_path}' without a lock file. Deleting.")
+                        try:
+                            shutil.rmtree(orphan_path)
+                        except Exception as e:
+                            logging.error(f"Failed to delete orphaned dir '{orphan_path}': {e}")
+                        continue
+
+                    try:
+                        with open(lock_file_path, 'r') as f:
+                            pid = int(f.read().strip())
+
+                        # Check if the process ID from the lock file is still running
+                        if not psutil.pid_exists(pid):
+                            logging.info(f"Found orphan directory from dead process (PID: {pid}). Deleting: {orphan_path}")
+                            shutil.rmtree(orphan_path)
+                        else:
+                            logging.debug(f"Skipping temp directory '{orphan_path}' as it belongs to a running process (PID: {pid}).")
+
+                    except (ValueError, FileNotFoundError) as e:
+                        logging.error(f"Error processing lock file for '{orphan_path}'. Deleting directory. Reason: {e}")
+                        try:
+                            shutil.rmtree(orphan_path)
+                        except Exception as e_del:
+                            logging.error(f"Could not delete corrupted temp dir '{orphan_path}': {e_del}")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during orphan cleanup scan for '{base_path}': {e}")
 
 class REMIX_OT_install_psutil(Operator):
     """Attempts to install the psutil library using pip."""
@@ -351,21 +464,39 @@ def is_blend_file_saved():
 
 def _kill_all_active_workers():
     """
+    [FIXED FOR FILE CLEANUP]
     This function is registered with atexit and runs when Blender closes.
-    It ensures all orphan worker processes are terminated.
+    It ensures all orphan worker processes are terminated AND removes any
+    temporary files that were registered in the global list, covering crashes.
     """
-    if not ACTIVE_WORKER_PROCESSES:
-        return
+    # --- 1. Terminate Worker Processes ---
+    if ACTIVE_WORKER_PROCESSES:
+        logging.info(f"Blender is closing. Terminating {len(ACTIVE_WORKER_PROCESSES)} orphan worker process(es)...")
+        for worker_proc in ACTIVE_WORKER_PROCESSES:
+            if worker_proc and worker_proc.poll() is None:
+                try:
+                    logging.debug(f" > Killing orphan PID: {worker_proc.pid}")
+                    worker_proc.kill()
+                except Exception as e:
+                    logging.error(f"Failed to kill orphan worker PID {worker_proc.pid}: {e}")
+        ACTIVE_WORKER_PROCESSES.clear()
 
-    logging.info(f"Blender is closing. Terminating {len(ACTIVE_WORKER_PROCESSES)} orphan worker process(es)...")
-    for worker_proc in ACTIVE_WORKER_PROCESSES:
-        if worker_proc and worker_proc.poll() is None:
+    # --- 2. Clean Up Registered Temporary Files ---
+    if TEMP_FILES_FOR_ATEXIT_CLEANUP:
+        logging.info(f"Performing atexit cleanup for {len(TEMP_FILES_FOR_ATEXIT_CLEANUP)} registered temp files/dirs...")
+        for path_to_clean in TEMP_FILES_FOR_ATEXIT_CLEANUP:
+            if not path_to_clean or not os.path.exists(path_to_clean):
+                continue
             try:
-                logging.debug(f" > Killing orphan PID: {worker_proc.pid}")
-                worker_proc.kill()
+                if os.path.isdir(path_to_clean):
+                    shutil.rmtree(path_to_clean)
+                    logging.debug(f" > atexit: Removed temp directory: {path_to_clean}")
+                else:
+                    os.remove(path_to_clean)
+                    logging.debug(f" > atexit: Removed temp file: {path_to_clean}")
             except Exception as e:
-                logging.error(f"Failed to kill orphan worker PID {worker_proc.pid}: {e}")
-    ACTIVE_WORKER_PROCESSES.clear()
+                logging.error(f"atexit cleanup failed for '{path_to_clean}': {e}")
+        TEMP_FILES_FOR_ATEXIT_CLEANUP.clear()
       
 def convert_exr_textures_to_png(context): # <--- CONTEXT IS NOW PASSED IN
     """
@@ -1364,158 +1495,174 @@ def blender_mat_to_remix(mat_name):
     """
     return mat_name.replace(" ", "_").replace(".", "_")
     
-def handle_height_textures(context, reference_prim, export_data=None):
+def handle_special_texture_assignments(self, context, reference_prim, export_data=None):
     """
-    [DEFINITIVE V5 - UDIM-AWARE]
-    Handles height texture ingestion for all material types. It can now correctly
-    trace back from a server-side stitched UDIM material name to the original Blender
-    material to find the corresponding height map, fixing the primary bug.
+    [UPDATED - MORE ROBUST]
+    This function handles the assignment of any "special" textures (like height,
+    emissive, etc.). This version includes a more robust material matching logic
+    with a final fallback check to ensure simple material names are always found,
+    making the assignment process more reliable.
     """
     addon_prefs = context.preferences.addons[__name__].preferences
     
     try:
-        logging.info("--- Starting Corrected Height Texture Processing (UDIM-Aware) ---")
+        logging.info("--- Starting Special Texture Assignment (Robust Match) ---")
 
         bake_info = (export_data or {}).get('bake_info', {})
-        height_map_info = bake_info.get('height_map_info', {})
+        special_texture_info = bake_info.get('special_texture_info', {})
 
-        if not height_map_info:
-            logging.info("No height maps (baked or original) were found to process.")
+        if not special_texture_info:
+            logging.info("No special textures (height, emissive, etc.) were found to process.")
             return {'FINISHED'}
 
-        # 1. Discover all material prims on the server for the newly ingested asset.
+        # These sleeps are likely here to wait for server processing.
+        # They are kept as they appear necessary for your setup.
         logging.info("Discovering all server-side material prims...")
-        
-        # A delay is needed for the server to update its state after ingestion.
-        time.sleep(3) 
-        
-        # Select the asset to query its children (materials).
+        time.sleep(3)
         if not select_mesh_prim_in_remix(reference_prim, context):
-             logging.warning("Could not select reference prim before querying materials. Results may be incomplete.")
-        time.sleep(1) # Delay after selection
-
+             logging.warning("Could not select reference prim before querying materials.")
+        time.sleep(1)
         all_selected_prims = fetch_selected_mesh_prim_paths()
         server_material_prims = [p for p in all_selected_prims if '/Looks/' in p]
 
         if not server_material_prims:
-            logging.warning(
-                "Could not discover any server-side material prims for the new asset. "
-                "This can happen if the server is slow to update. Cannot assign height maps."
-            )
+            logging.warning("Could not discover any server-side material prims. Cannot assign special textures.")
             return {'FINISHED'}
-        
-        logging.info(f"Found {len(server_material_prims)} material prims on server: {[p.split('/')[-1] for p in server_material_prims]}")
+        logging.info(f"Found {len(server_material_prims)} material prims on server.")
 
-        # 2. Iterate through each material prim found on the SERVER.
         for server_material_prim_path in server_material_prims:
             prim_name_on_server = server_material_prim_path.split('/')[-1]
-            original_blender_mat_name = None
+            
             base_name_from_server = None
-
-            # --- START OF THE CRITICAL FIX ---
-            # Determine the original material's base name from the server prim name.
-            # Case 1: Stitched UDIM material (e.g., 'MyMat__UDIM_STITCHED_001')
             if '__UDIM_STITCHED' in prim_name_on_server:
                 base_name_from_server = prim_name_on_server.split('__UDIM_STITCHED')[0]
-                logging.debug(f"  > Parsed UDIM material. Base name: '{base_name_from_server}'")
-            # Case 2: Baked material (e.g., 'MyMat_BAKED')
             elif prim_name_on_server.endswith('_BAKED'):
-                base_name_from_server = prim_name_on_server.removesuffix('_BAKED')
-                logging.debug(f"  > Parsed baked material. Base name: '{base_name_from_server}'")
-            # Case 3: Simple material, name might be directly mapped
+                potential_base = prim_name_on_server.removesuffix('_BAKED')
+                base_name_from_server = potential_base
             else:
                 base_name_from_server = prim_name_on_server
-                logging.debug(f"  > Treating as simple material. Base name: '{base_name_from_server}'")
 
-            # Now, match the extracted base name against the keys in our height map info dict.
+            original_blender_mat_key = None 
+            original_blender_mat_name = None 
+            
             if base_name_from_server:
-                for key_mat_name in height_map_info.keys():
-                    # Compare the server-friendly version of the Blender material name.
-                    if blender_mat_to_remix(key_mat_name) == base_name_from_server:
-                        original_blender_mat_name = key_mat_name
+                # Your existing complex matching logic (kept intact)
+                for key in special_texture_info.keys():
+                    mat_name_to_check = None
+                    expected_baked_name = None
+
+                    if isinstance(key, tuple):
+                        obj_name, mat_name = key
+                        mat_name_to_check = mat_name
+                        safe_obj_name = "".join(c for c in obj_name if c.isalnum() or c in ('_', '-')).strip()
+                        safe_mat_name = "".join(c for c in mat_name if c.isalnum() or c in ('_', '-')).strip()
+                        expected_baked_name = f"{safe_obj_name}_{safe_mat_name}"
+                    
+                    elif isinstance(key, str):
+                        mat_name_to_check = key
+                        expected_baked_name = blender_mat_to_remix(mat_name_to_check)
+
+                    if expected_baked_name and (expected_baked_name == base_name_from_server or blender_mat_to_remix(mat_name_to_check) == base_name_from_server):
+                        original_blender_mat_key = key
+                        original_blender_mat_name = mat_name_to_check
                         break
-            # --- END OF THE CRITICAL FIX ---
             
-            if not original_blender_mat_name:
-                logging.debug(f"  > Server prim '{prim_name_on_server}' did not match any local materials with a height map. Skipping.")
+            # --- THIS IS THE CRUCIAL UPDATE ---
+            # If the complex logic above failed, try a simple direct name match as a fallback.
+            if not original_blender_mat_key:
+                for key in special_texture_info.keys():
+                     # Get the raw material name, whether the key is a string or a tuple
+                     mat_name = key[1] if isinstance(key, tuple) else key
+                     if mat_name == prim_name_on_server:
+                         original_blender_mat_key = key
+                         original_blender_mat_name = mat_name
+                         logging.debug(f"  > Matched server prim '{prim_name_on_server}' via direct name fallback.")
+                         break
+            # --- END OF UPDATE ---
+            
+            if not original_blender_mat_key:
+                logging.debug(f"  > Server prim '{prim_name_on_server}' did not match any local materials with special textures. Skipping.")
                 continue
 
-            local_texture_path = height_map_info.get(original_blender_mat_name)
-
-            if not local_texture_path or not os.path.exists(local_texture_path):
-                logging.error(f"  > Matched server prim for '{original_blender_mat_name}', but its local height map was not found at: {local_texture_path}. Skipping.")
-                continue
+            texture_list_for_mat = special_texture_info.get(original_blender_mat_key, [])
             
-            logging.info(f"Processing height map for server prim: '{prim_name_on_server}' (from Blender material: '{original_blender_mat_name}')")
-
-            # 3. Ingest the height texture and assign it on the server.
-            # (The rest of this function's logic for upload and assignment is correct and remains unchanged)
-            ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
-            server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
-            base_api_url = addon_prefs.remix_export_url.rstrip('/')
-            stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
-
-            logging.info(f"  > Ingesting height texture: {local_texture_path}")
-            
-            ingest_payload = {"executor":1,"name":"Material(s)","context_plugin":{"name":"TextureImporter","data":{"allow_empty_input_files_list":True,"channel":"Default","context_name":"ingestcraft","cook_mass_template":True,"create_context_if_not_exist":True,"create_output_directory_if_missing":True,"data_flows":[{"channel":"Default","name":"InOutData","push_input_data":True,"push_output_data":False}],"default_output_endpoint":"/stagecraft/assets/default-directory","expose_mass_queue_action_ui":False,"expose_mass_ui":True,"global_progress_value":0,"hide_context_ui":True,"input_files":[],"output_directory":"","progress":[0,"Initializing",True]}},"check_plugins":[{"name":"MaterialShaders","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllMaterials"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"ignore_not_convertable_shaders":False,"progress":[0,"Initializing",True],"save_on_fix_failure":True,"shader_subidentifiers":{"AperturePBR_Opacity":".*"}},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToOctahedral","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files_normal","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:normalmap_texture":{"encoding_attr":"inputs:encoding","replace_suffix":"_Normal","suffix":"_OTH_Normal"}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files_normal","name":"InOutData","push_input_data":True,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToDDS","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:diffuse_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:emissive_mask_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:height_texture":{"args":["--format","bc4","--no-mip-gamma-correct","--mip-filter","max"]},"inputs:metallic_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:normalmap_texture":{"args":["--format","bc5","--no-mip-gamma-correct"]},"inputs:reflectionroughness_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:transmittance_texture":{"args":["--format","bc7","--mip-gamma-correct"]}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files","name":"InOutData","push_input_data":True,"push_output_data":True},{"channel":"write_metadata","name":"InOutData","push_input_data":False,"push_output_data":True},{"channel":"ingestion_output","name":"InOutData","push_input_data":False,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True,"suffix":".rtex.dds"},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"MassTexturePreview","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"Nothing"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":True,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}}],"resultor_plugins":[{"name":"FileMetadataWritter","data":{"channel":"write_metadata","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]}}]}
-            ingest_payload["context_plugin"]["data"]["input_files"] = [[local_texture_path, "HEIGHT"]]
-            ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
-
-            ingest_response = make_request_with_retries('POST', f"{base_api_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl)
-            if not ingest_response or ingest_response.status_code >= 400:
-                logging.error(f"  > Failed to ingest height texture. Server responded with status {ingest_response.status_code if ingest_response else 'N/A'}")
+            if not texture_list_for_mat:
                 continue
 
-            time.sleep(2)
-            
-            base_filename = os.path.splitext(os.path.basename(local_texture_path))[0]
-            final_ingested_texture_path_on_server = os.path.join(server_textures_output_dir, f"{base_filename}.h.rtex.dds").replace('\\', '/')
-            
-            encoded_material_prim = urllib.parse.quote(server_material_prim_path, safe='')
-            textures_on_material_url = f"{stagecraft_api_url_base}/assets/{encoded_material_prim}/textures"
-            textures_response = make_request_with_retries('GET', textures_on_material_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
-            
-            try:
-                textures_data = textures_response.json().get("textures", [])
-                if not textures_data or not textures_data[0]:
-                    logging.error(f"  > Server returned an empty texture list for material prim: {server_material_prim_path}. Cannot assign height map.")
+            logging.info(f"Processing {len(texture_list_for_mat)} special textures for server prim: '{prim_name_on_server}' (from Blender material: '{original_blender_mat_name}')")
+
+            for texture_data in texture_list_for_mat:
+                local_texture_path = texture_data.get('path')
+                server_texture_type = texture_data.get('type')
+
+                if not local_texture_path or not os.path.exists(local_texture_path) or not server_texture_type:
+                    logging.error(f"  > Matched server prim for '{original_blender_mat_name}', but its local texture data is incomplete or file not found. Skipping this texture.")
                     continue
                 
-                shader_core_input_prim = textures_data[0][0]
-                encoded_shader_core_input = urllib.parse.quote(shader_core_input_prim, safe='')
-                height_input_query_url = f"{stagecraft_api_url_base}/textures/{encoded_shader_core_input}/material/inputs?texture_type=HEIGHT"
+                logging.info(f"  - Processing texture type '{server_texture_type}' from path: {os.path.basename(local_texture_path)}")
                 
-                height_input_prim_response = make_request_with_retries('GET', height_input_query_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
-                if not height_input_prim_response or height_input_prim_response.status_code >= 400:
-                    logging.error(f"  > Failed to get the height input prim path from the server.")
-                    continue
-                
-                height_shader_input_target_prim = height_input_prim_response.json().get("prim_paths", [[]])[0]
-                if not height_shader_input_target_prim:
-                    logging.error(f"  > Server did not return a valid prim path for the height input.")
-                    continue
+                ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
+                server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
+                base_api_url = addon_prefs.remix_export_url.rstrip('/')
+                stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
+                ingest_payload = {"executor":1,"name":"Material(s)","context_plugin":{"name":"TextureImporter","data":{"allow_empty_input_files_list":True,"channel":"Default","context_name":"ingestcraft","cook_mass_template":True,"create_context_if_not_exist":True,"create_output_directory_if_missing":True,"data_flows":[{"channel":"Default","name":"InOutData","push_input_data":True,"push_output_data":False}],"default_output_endpoint":"/stagecraft/assets/default-directory","expose_mass_queue_action_ui":False,"expose_mass_ui":True,"global_progress_value":0,"hide_context_ui":True,"input_files":[],"output_directory":"","progress":[0,"Initializing",True]}},"check_plugins":[{"name":"MaterialShaders","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllMaterials"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"ignore_not_convertable_shaders":False,"progress":[0,"Initializing",True],"save_on_fix_failure":True,"shader_subidentifiers":{"AperturePBR_Opacity":".*"}},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToOctahedral","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files_normal","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:normalmap_texture":{"encoding_attr":"inputs:encoding","replace_suffix":"_Normal","suffix":"_OTH_Normal"}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files_normal","name":"InOutData","push_input_data":True,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"ConvertToDDS","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"AllShaders"}],"resultor_plugins":[{"data":{"channel":"cleanup_files","cleanup_input":True,"cleanup_output":False,"cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]},"name":"FileCleanup"}],"data":{"channel":"Default","conversion_args":{"inputs:diffuse_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:emissive_mask_texture":{"args":["--format","bc7","--mip-gamma-correct"]},"inputs:height_texture":{"args":["--format","bc4","--no-mip-gamma-correct","--mip-filter","max"]},"inputs:metallic_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:normalmap_texture":{"args":["--format","bc5","--no-mip-gamma-correct"]},"inputs:reflectionroughness_texture":{"args":["--format","bc4","--no-mip-gamma-correct"]},"inputs:transmittance_texture":{"args":["--format","bc7","--mip-gamma-correct"]}},"cook_mass_template":False,"data_flows":[{"channel":"cleanup_files","name":"InOutData","push_input_data":True,"push_output_data":True},{"channel":"write_metadata","name":"InOutData","push_input_data":False,"push_output_data":True},{"channel":"ingestion_output","name":"InOutData","push_input_data":False,"push_output_data":True}],"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"replace_udim_textures_by_empty":False,"save_on_fix_failure":True,"suffix":".rtex.dds"},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}},{"name":"MassTexturePreview","selector_plugins":[{"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"select_from_root_layer_only":False},"name":"Nothing"}],"data":{"channel":"Default","cook_mass_template":False,"expose_mass_queue_action_ui":True,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True],"save_on_fix_failure":True},"stop_if_fix_failed":True,"context_plugin":{"data":{"channel":"Default","close_stage_on_exit":False,"cook_mass_template":False,"create_context_if_not_exist":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"hide_context_ui":False,"progress":[0,"Initializing",True],"save_on_exit":False},"name":"CurrentStage"}}],"resultor_plugins":[{"name":"FileMetadataWritter","data":{"channel":"write_metadata","cook_mass_template":False,"expose_mass_queue_action_ui":False,"expose_mass_ui":False,"global_progress_value":0,"progress":[0,"Initializing",True]}}]}
+                ingest_payload["context_plugin"]["data"]["input_files"] = [[local_texture_path, server_texture_type.upper()]]
+                ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
 
-                logging.info(f"  > Target prim for height assignment: {height_shader_input_target_prim}")
-                update_texture_connection_url = f"{stagecraft_api_url_base}/textures/"
-                put_payload = {"force": False, "textures": [[height_shader_input_target_prim, final_ingested_texture_path_on_server]]}
-                
-                put_response = make_request_with_retries('PUT', update_texture_connection_url, json_payload=put_payload, headers={"accept": "application/lightspeed.remix.service+json; version=1.0", "Content-Type": "application/lightspeed.remix.service+json; version=1.0"}, verify=addon_prefs.remix_verify_ssl)
-                if not put_response or put_response.status_code >= 400:
-                    logging.error(f"  > Failed to update shader with height texture.")
+                ingest_response = make_request_with_retries('POST', f"{base_api_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl)
+                if not ingest_response or ingest_response.status_code >= 400:
+                    logging.error(f"  > Failed to ingest special texture. Server responded with status {ingest_response.status_code if ingest_response else 'N/A'}")
                     continue
 
-                logging.info(f"  > Successfully assigned height texture for material '{original_blender_mat_name}'.")
+                time.sleep(2)
+                
+                base_filename = os.path.splitext(os.path.basename(local_texture_path))[0]
+                final_ingested_texture_path_on_server = os.path.join(server_textures_output_dir, f"{base_filename}.{server_texture_type[0].lower()}.rtex.dds").replace('\\', '/')
+                
+                try:
+                    encoded_material_prim = urllib.parse.quote(server_material_prim_path, safe='')
+                    textures_on_material_url = f"{stagecraft_api_url_base}/assets/{encoded_material_prim}/textures"
+                    textures_response = make_request_with_retries('GET', textures_on_material_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
+                    
+                    textures_data = textures_response.json().get("textures", [])
+                    if not textures_data or not textures_data[0]:
+                        logging.error(f"  > Server returned an empty texture list for material prim: {server_material_prim_path}.")
+                        continue
+                    
+                    shader_core_input_prim = textures_data[0][0]
+                    encoded_shader_core_input = urllib.parse.quote(shader_core_input_prim, safe='')
+                    input_prim_query_url = f"{stagecraft_api_url_base}/textures/{encoded_shader_core_input}/material/inputs?texture_type={server_texture_type.upper()}"
+                    
+                    input_prim_response = make_request_with_retries('GET', input_prim_query_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
+                    if not input_prim_response or input_prim_response.status_code >= 400:
+                        logging.error(f"  > Failed to get the '{server_texture_type}' input prim path from the server.")
+                        continue
+                    
+                    shader_input_target_prim = input_prim_response.json().get("prim_paths", [[]])[0]
+                    if not shader_input_target_prim:
+                        logging.error(f"  > Server did not return a valid prim path for the '{server_texture_type}' input.")
+                        continue
 
-            except (IndexError, KeyError, TypeError, json.JSONDecodeError) as e:
-                logging.error(f"  > Could not parse a valid shader prim or response for '{server_material_prim_path}': {e}", exc_info=True)
-                logging.error(f"  > Full server response was: {textures_response.text if textures_response else 'No Response'}")
-                continue
+                    logging.info(f"  > Target prim for '{server_texture_type}' assignment: {shader_input_target_prim}")
+                    update_texture_connection_url = f"{stagecraft_api_url_base}/textures/"
+                    put_payload = {"force": False, "textures": [[shader_input_target_prim, final_ingested_texture_path_on_server]]}
+                    
+                    put_response = make_request_with_retries('PUT', update_texture_connection_url, json_payload=put_payload, headers={"accept": "application/lightspeed.remix.service+json; version=1.0", "Content-Type": "application/lightspeed.remix.service+json; version=1.0"}, verify=addon_prefs.remix_verify_ssl)
+                    if not put_response or put_response.status_code >= 400:
+                        logging.error(f"  > Failed to update shader with '{server_texture_type}' texture.")
+                        continue
 
-        logging.info("--- Finished Height Texture Processing ---")
+                    logging.info(f"  > Successfully assigned '{server_texture_type}' texture for material '{original_blender_mat_name}'.")
+
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError) as e:
+                    logging.error(f"  > Could not parse a valid shader prim or response for '{server_material_prim_path}': {e}", exc_info=True)
+                    continue
+
+        logging.info("--- Finished Special Texture Assignment ---")
         return {'FINISHED'}
 
     except Exception as e:
-        logging.error(f"A critical error occurred in handle_height_textures: {e}", exc_info=True)
+        logging.error(f"A critical error occurred in handle_special_texture_assignments: {e}", exc_info=True)
         return {'CANCELLED'}
         
 def trim_prim_path(prim_path, segments_to_trim=0):
@@ -3292,6 +3439,39 @@ class OBJECT_OT_export_and_ingest(Operator):
             if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
                 return True
         return False
+
+          
+    def _hash_and_rename_file(self, file_path):
+        """
+        Calculates the SHA1 hash of a file's content, renames the file to include
+        the hash, and returns the new file path.
+        """
+        if not os.path.exists(file_path):
+            return file_path # Return original if file doesn't exist
+
+        hasher = hashlib.sha1()
+        try:
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(8192): # Read in 8k chunks
+                    hasher.update(chunk)
+            
+            # Get the first 8 characters of the hex digest for a shorter hash
+            file_hash = hasher.hexdigest()[:8].upper()
+
+            # Construct the new filename
+            directory, filename = os.path.split(file_path)
+            name, ext = os.path.splitext(filename)
+            new_filename = f"{name}_{file_hash}{ext}"
+            new_filepath = os.path.join(directory, new_filename)
+
+            # Rename the file
+            os.rename(file_path, new_filepath)
+            logging.info(f"Hashed and renamed '{filename}' to '{new_filename}'")
+            
+            return new_filepath
+        except Exception as e:
+            logging.error(f"Failed to hash and rename file '{file_path}': {e}", exc_info=True)
+            return file_path # Return original path on failure
     
     def _realize_geonodes_object_non_destructively(self, context, obj):
         """
@@ -3401,28 +3581,24 @@ class OBJECT_OT_export_and_ingest(Operator):
             if original_active and original_active.name in bpy.data.objects:
                 context.view_layer.objects.active = original_active
           
-    def _prepare_and_validate_textures(self, context, objects_to_export):
+          
+    def _validate_textures(self, context, objects_to_export):
         """
-        [DEFINITIVE V9 - BRUTE-FORCE READ] This version attempts to force Blender to
-        evaluate and load pixels into memory before checking the .has_data property.
-        This is the most aggressive attempt to access pixel data that is visible in the
-        viewport but not immediately available to the Python API.
+        [DEFINITIVE V11 - NON-DESTRUCTIVE VALIDATION]
+        Performs a READ-ONLY check on all textures. It ensures that for every
+        image used, Blender either knows its file path on disk OR has the pixel
+        data packed in memory. It does NOT modify any image datablocks.
+        The worker is now responsible for handling the unpacking of in-memory data.
         """
-        logging.info("Starting BRUTE-FORCE texture recovery (Forcing Pixel Read)...")
-
-        temp_texture_dir = os.path.join(tempfile.gettempdir(), f"remix_recovered_textures_{uuid.uuid4().hex[:8]}")
-        os.makedirs(temp_texture_dir, exist_ok=True)
-        self._export_data['temp_texture_dir'] = temp_texture_dir
-        self._export_data['temp_files_to_clean'].add(temp_texture_dir)
-
+        logging.info("Starting non-destructive texture validation...")
+    
         has_unrecoverable_textures = False
         processed_materials = set()
-        recovered_image_cache = {}
 
         def get_all_image_nodes_recursive(node_tree):
             for node in node_tree.nodes:
                 if node.type == 'TEX_IMAGE' and node.image:
-                    yield node
+                    yield node.image
                 elif node.type == 'GROUP' and node.node_tree:
                     yield from get_all_image_nodes_recursive(node.node_tree)
 
@@ -3434,62 +3610,32 @@ class OBJECT_OT_export_and_ingest(Operator):
                 mat = slot.material
                 if not mat or not mat.use_nodes or mat in processed_materials:
                     continue
-        
+            
                 processed_materials.add(mat)
-                for node in get_all_image_nodes_recursive(mat.node_tree):
-                    original_image = node.image
-                    if not original_image:
+                for image in get_all_image_nodes_recursive(mat.node_tree):
+                    if not image:
                         continue
-
-                    # --- THE BRUTE-FORCE METHOD ---
-                    # Step 1: Attempt to access pixels to force a load, even if has_data is initially false.
-                    try:
-                        _ = len(original_image.pixels)
-                    except RuntimeError:
-                        # This error occurs if the image is truly unloaded with no source.
-                        # We can safely assume there's no data.
-                        pass
-            
-                    # Step 2: Now, after attempting a read, check has_data again.
-                    if original_image.has_data:
-                        if original_image.name in recovered_image_cache:
-                            node.image = recovered_image_cache[original_image.name]
-                            continue
-
-                        logging.warning(f"Image '{original_image.name}' has data in memory. Performing recovery.")
                 
-                        try:
-                            safe_name = "".join(c for c in original_image.name if c.isalnum() or c in ('_', '.', '-')).strip()
-                            new_image_name = f"{safe_name}_{uuid.uuid4().hex[:6]}_Recovered"
-                            recovery_path = os.path.join(temp_texture_dir, f"{new_image_name}.png")
-                    
-                            new_image = bpy.data.images.new(
-                                name=new_image_name,
-                                width=original_image.size[0],
-                                height=original_image.size[1],
-                                alpha=(original_image.depth // 8 >= 4)
-                            )
-                    
-                            new_image.pixels = original_image.pixels[:]
-                            new_image.filepath_raw = recovery_path
-                            new_image.file_format = 'PNG'
-                            new_image.save()
+                    # Try to force a pixel read to update the has_data flag
+                    try:
+                        _ = len(image.pixels)
+                    except RuntimeError:
+                        pass # This is expected if data is truly missing
 
-                            node.image = new_image
-                            recovered_image_cache[original_image.name] = new_image
-                            self._export_data['temp_files_to_clean'].add(recovery_path)
-                    
-                            logging.info(f" > Successfully recovered '{original_image.name}' from memory to new datablock '{new_image.name}'")
+                    filepath = ""
+                    try:
+                        if image.filepath_from_user():
+                            filepath = abspath(image.filepath_from_user())
+                    except Exception:
+                        filepath = ""
 
-                        except Exception as e:
-                            self.report({'ERROR'}, f"Failed recovery for '{original_image.name}': {e}")
-                            logging.error(f"Could not save in-memory data for '{original_image.name}': {e}", exc_info=True)
-                            return False
-            
-                    # Step 3: If, after all that, there's still no data, it is truly unrecoverable.
-                    else:
+                    # The core validation: A texture is valid if it has a path OR has packed data.
+                    is_valid_on_disk = os.path.exists(filepath)
+                    has_packed_data = image.has_data
+
+                    if not is_valid_on_disk and not has_packed_data:
                         logging.error(
-                            f"UNRECOVERABLE: Image '{original_image.name}' in material '{mat.name}' has NO pixel data in memory, AND its source file is missing. The addon cannot proceed."
+                            f"UNRECOVERABLE: Image '{image.name}' in material '{mat.name}' has NO pixel data in memory, AND its source file is missing. The addon cannot proceed."
                         )
                         has_unrecoverable_textures = True
 
@@ -3497,7 +3643,7 @@ class OBJECT_OT_export_and_ingest(Operator):
             self.report({'ERROR'}, "Unrecoverable textures found. Export aborted. See System Console.")
             return False
 
-        logging.info("Texture preparation and validation successful.")
+        logging.info("Texture validation successful. All textures are either on disk or packed.")
         return True
 
     def _validate_and_recover_image_source(self, image_datablock, temp_dir):
@@ -3552,11 +3698,14 @@ class OBJECT_OT_export_and_ingest(Operator):
                 return False # This is a critical failure
         
         return True
-                                        
+                                              
+          
+          
     def _is_simple_pbr_setup(self, mat):
         """
-        [CORRECTED V6 - LOGGING FIX] Determines if a material is a "simple" PBR setup.
-        This version fixes a TypeError in the logging statement when comparing float values.
+        [CORRECTED V7 - ALPHA AWARE - COMPLETE] Determines if a material is a "simple" PBR setup.
+        It now correctly identifies materials that use the Alpha channel as complex,
+        triggering a bake for transparency. This is the full, unabridged function.
         """
         if not mat or not mat.use_nodes or not mat.node_tree:
             return False
@@ -3568,13 +3717,25 @@ class OBJECT_OT_export_and_ingest(Operator):
         temp_mat = bpy.data.materials.new(name="__temp_default_bsdf")
         temp_mat.use_nodes = True
         default_bsdf = temp_mat.node_tree.nodes.new('ShaderNodeBsdfPrincipled')
-    
+
         try:
+            # --- NEW: Explicitly check the Alpha socket first ---
+            alpha_socket = bsdf.inputs.get("Alpha")
+            if alpha_socket:
+                # If Alpha is linked or its value is not 1.0, it needs baking.
+                if alpha_socket.is_linked or not math.isclose(alpha_socket.default_value, 1.0, rel_tol=1e-5):
+                    logging.info(f"Material '{mat.name}' is complex. Reason: Alpha channel is used (Value: {alpha_socket.default_value:.3f} or Linked).")
+                    return False
+            # --- END OF NEW CHECK ---
+
             sockets_to_check = {}
             for socket in default_bsdf.inputs:
                 if socket.type in ('VALUE', 'VECTOR', 'RGBA') and not socket.hide_value:
+                    # We already checked alpha, so skip it here.
+                    if socket.name == "Alpha":
+                        continue
                     sockets_to_check[socket.name] = socket.default_value if socket.type == 'VALUE' else socket.default_value[:]
-        
+    
             for socket_name, default_value in sockets_to_check.items():
                 socket = bsdf.inputs.get(socket_name)
                 if not socket:
@@ -3582,25 +3743,24 @@ class OBJECT_OT_export_and_ingest(Operator):
 
                 # CONDITION 1: Check connected nodes
                 if socket.is_linked:
-                    # ... (this part is correct, no changes needed) ...
                     link = socket.links[0]
                     source_node = link.from_node
 
                     if source_node.type == 'TEX_IMAGE':
                         continue
-                
+            
                     if socket_name == "Normal" and source_node.type == 'NORMAL_MAP':
                         color_input = source_node.inputs.get('Color')
                         if color_input and color_input.is_linked and color_input.links[0].from_node.type == 'TEX_IMAGE':
                             continue
-                
+            
                     logging.info(f"Material '{mat.name}' is complex. Reason: Input '{socket_name}' is driven by a non-texture node ('{source_node.type}').")
                     return False
 
                 # CONDITION 2: Check unconnected sockets for default values
                 else:
                     current_value = socket.default_value
-                
+            
                     is_different = False
                     if isinstance(default_value, (float, int)):
                         if not math.isclose(current_value, default_value, rel_tol=1e-5):
@@ -3615,14 +3775,11 @@ class OBJECT_OT_export_and_ingest(Operator):
                             is_different = True
 
                     if is_different:
-                        # --- START OF THE FIX ---
-                        # Format the log message safely, without calling list() on floats
                         current_val_str = f"[{', '.join(f'{v:.3f}' for v in current_value)}]" if hasattr(current_value, '__iter__') else f"{current_value:.3f}"
                         default_val_str = f"[{', '.join(f'{v:.3f}' for v in default_value)}]" if hasattr(default_value, '__iter__') else f"{default_value:.3f}"
                         logging.info(f"Material '{mat.name}' is complex. Reason: Unconnected input '{socket_name}' has non-default value ({current_val_str} vs default {default_val_str}).")
-                        # --- END OF THE FIX ---
                         return False
-        
+    
             # Special check for the Normal socket
             normal_socket = bsdf.inputs.get("Normal")
             if normal_socket and normal_socket.is_linked:
@@ -3641,7 +3798,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         logging.info(f"Material '{mat.name}' has a simple PBR setup. Baking will be skipped.")
         return True
-
+    
     def _find_largest_texture_resolution_recursive(self, node_tree, visited_groups=None):
         """
         Recursively traverses a node tree, including nested groups, to find the
@@ -3666,160 +3823,213 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [V11 - 100% COMPLETE & STRUCTURALLY CORRECT]
-        This is the final, complete function. It contains no omitted code.
-        It iterates directly through the final export objects to analyze only the materials
-        attached to them, preventing crashes and unnecessary processing of proxy materials.
-        It fully integrates:
-        1. Guaranteed Displacement Map detection (simple and procedural).
-        2. Dynamic Bake Resolution based on the largest input texture.
-        3. UDIM-aware atlas resolution and UV transformation logic.
+        [DEFINITIVE V7 - PID LOCK FILE]
+        Also creates its bake directory with the unique prefix and a PID lock file.
         """
         tasks = []
         if not is_blend_file_saved():
             raise RuntimeError("Blend file must be saved to create a bake/temp directory.")
 
-        blend_fp = abspath(bpy.data.filepath)
-        bake_dir = os.path.join(os.path.dirname(blend_fp), f"remix_baked_textures_{uuid.uuid4().hex[:8]}")
+        # ################################################################## #
+        # THIS IS THE THIRD CRITICAL CHANGE                                  #
+        # Create the bake dir with the unique prefix and write the lock file.#
+        # ################################################################## #
+        base_bake_path = CUSTOM_COLLECT_PATH
+        os.makedirs(base_bake_path, exist_ok=True)
+
+        # Create a uniquely named sub-folder inside the custom base path
+        bake_dir_name = f"{TEMP_DIR_PREFIX}baked_textures_{uuid.uuid4().hex[:8]}"
+        bake_dir = os.path.join(base_bake_path, bake_dir_name)
         os.makedirs(bake_dir, exist_ok=True)
+        
+        # Write the lock file with the current process ID
+        try:
+            with open(os.path.join(bake_dir, 'blender.lock'), 'w') as f:
+                f.write(str(os.getpid()))
+        except Exception as e:
+            raise RuntimeError(f"Could not create .lock file for bake directory, aborting: {e}")
+
         export_data['temp_files_to_clean'].add(bake_dir)
 
         bake_info = {
-            'tasks': [], 'bake_dir': bake_dir, 'height_map_info': {}, 'udim_materials': set()
+            'tasks': [], 'bake_dir': bake_dir, 'special_texture_info': defaultdict(list),
+            'udim_materials': set()
         }
         export_data['bake_info'] = bake_info
 
-        processed_materials = set()
-    
-        # --- START OF THE FIX ---
-        # Displacement is now part of the standard channels to check for every complex material.
-        UNIVERSAL_BAKE_CHANNELS = [
-            ("Base Color", 'EMIT', False, True), # <-- CHANGED from 'DIFFUSE' to 'EMIT'
+        SPECIAL_TEXTURE_MAP = {
+            "Displacement": "HEIGHT",
+            "Emission Color": "EMISSIVE",
+            "Anisotropy": "ANISOTROPY",
+            "Transmission": "TRANSMITTANCE",
+            "Subsurface Radius": "MEASUREMENT_DISTANCE",
+            "Subsurface Scale": "SINGLE_SCATTERING",
+            "Alpha": "OPACITY"
+        }
+        CORE_PBR_CHANNELS = [
+            ("Base Color", 'EMIT', False, True),
             ("Metallic", 'EMIT', True, False),
             ("Roughness", 'EMIT', True, False),
-            ("Normal", 'NORMAL', False, False),  # Normal remains 'NORMAL'
-            ("Emission Color", 'EMIT', False, True),
-            ("Displacement", 'EMIT', True, False)
+            ("Normal", 'NORMAL', False, False),
         ]
-        # --- END OF THE FIX ---
+        OPTIONAL_CHANNELS = [
+            ("Alpha", 'EMIT', True, False),
+            ("Displacement", 'EMIT', True, False),
+            ("Emission Color", 'EMIT', False, True),
+            ("Anisotropy", 'EMIT', True, False),
+            ("Transmission", 'EMIT', True, False),
+            ("Subsurface Radius", 'EMIT', False, True),
+            ("Subsurface Scale", 'EMIT', True, False)
+        ]
 
         DEFAULT_BAKE_RESOLUTION = 2048
 
-        logging.info("Analyzing materials on FINAL export objects for baking and height maps...")
-    
+        logging.info("Analyzing materials using corrected replication strategy...")
+
+        processed_object_material_pairs = set()
+
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data or not obj.data.uv_layers:
                 continue
-            
+
             for slot in obj.material_slots:
                 mat = slot.material
-                if not mat or not mat.use_nodes or mat in processed_materials:
+                if not mat or not mat.use_nodes:
                     continue
 
-                processed_materials.add(mat)
-                mat_needs_baking = False
+                # --- THIS IS THE CRITICAL FIX ---
+                # This check MUST come first to prevent processing the same material multiple times
+                # if it's in multiple slots on the same object.
+                if (obj.name, mat.name) in processed_object_material_pairs:
+                    continue
+                processed_object_material_pairs.add((obj.name, mat.name))
+                # --- END OF FIX ---
+
+                handled_by_direct_ingest = set()
             
                 output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-                if output_node and output_node.inputs['Displacement'].is_linked:
-                    source_node = self._find_ultimate_source_node(output_node.inputs['Displacement'])
-                    if source_node and source_node.image and source_node.image.filepath:
-                        filepath = abspath(source_node.image.filepath)
-                        if os.path.exists(filepath) and not self._material_uses_udims(mat):
-                            logging.info(f"  - SUCCESS: Found direct Displacement texture for '{mat.name}': {os.path.basename(filepath)}")
-                            bake_info['height_map_info'][mat.name] = filepath
-                    else:
-                        mat_needs_baking = True
-                        logging.info(f"  - Found procedural or UDIM Displacement on '{mat.name}'. It will be baked.")
+                bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+                # Master list of all special sockets for direct ingestion
+                special_sockets_to_check = {
+                    "Displacement": (output_node, "HEIGHT"),
+                    "Emission Color": (bsdf, "EMISSIVE"),
+                    "Transmission": (bsdf, "TRANSMITTANCE"),
+                    "Anisotropy": (bsdf, "ANISOTROPY"),
+                    # Alpha is intentionally excluded here to let the albedo combination logic handle it
+                    "Subsurface Radius": (bsdf, "MEASUREMENT_DISTANCE"),
+                    "Subsurface Scale": (bsdf, "SINGLE_SCATTERING")
+                }
+
+                for socket_name, (node_to_check, server_type) in special_sockets_to_check.items():
+                    if not node_to_check: continue
+                    socket = node_to_check.inputs.get(socket_name)
+
+                    if socket and socket.is_linked:
+                        source_node = self._find_ultimate_source_node(socket)
+                        if source_node and source_node.image and source_node.image.filepath and not self._material_uses_udims(mat):
+                            filepath = abspath(source_node.image.filepath)
+                            if os.path.exists(filepath):
+                                logging.info(f"  > DIRECT INGEST: Found texture for '{socket_name}' on '{mat.name}'. Queuing.")
+                                bake_info['special_texture_info'][(obj.name, mat.name)].append({'path': filepath, 'type': server_type})
+                                handled_by_direct_ingest.add(socket_name)
+            
+                # --- Logic for actual baking (now runs only once per material) ---
+                final_shader_node = None
+                if output_node and output_node.inputs['Surface'].is_linked:
+                    final_shader_node = output_node.inputs['Surface'].links[0].from_node
 
                 is_complex = not self._is_simple_pbr_setup(mat)
                 uses_udims = self._material_uses_udims(mat)
-                if is_complex or uses_udims:
-                    mat_needs_baking = True
 
-                if not mat_needs_baking:
-                    logging.info(f"  - Material '{mat.name}' is simple and requires no baking.")
+                if not (is_complex or uses_udims):
                     continue
 
                 log_reason_parts = []
-                if is_complex: log_reason_parts.append("complex procedural setup")
+                if is_complex: log_reason_parts.append("complex setup")
                 if uses_udims: log_reason_parts.append("UDIM textures")
-                if output_node and output_node.inputs['Displacement'].is_linked and not is_complex and not uses_udims:
-                     log_reason_parts.append("procedural displacement")
-                logging.info(f"  - Queuing bake tasks for material '{mat.name}' (Reason: {', '.join(log_reason_parts)}).")
+                logging.info(f"  - Queuing BAKE tasks for material '{mat.name}' on object '{obj.name}' (Reason: {', '.join(log_reason_parts)}).")
 
                 bake_resolution_x, bake_resolution_y = DEFAULT_BAKE_RESOLUTION, DEFAULT_BAKE_RESOLUTION
-                max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
-                if max_w > 0: bake_resolution_x = max_w
-                if max_h > 0: bake_resolution_y = max_h
-                if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {bake_resolution_x}x{bake_resolution_y}.")
-                else: logging.info(f"   - No input textures. Using default {DEFAULT_BAKE_RESOLUTION}px bake.")
-            
-                if uses_udims:
-                    udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
-                    if udim_node and udim_node.image:
-                        tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
-                        if tiles:
-                            num_tiles = len(tiles)
-                            tile_width, tile_height = udim_node.image.size
-                            if tile_width == 0 or tile_height == 0:
-                                first_tile_path = abspath(udim_node.image.filepath_raw.replace('<UDIM>', str(tiles[0].number)))
-                                if os.path.exists(first_tile_path):
-                                    temp_img = self._load_tile_robustly(first_tile_path, tiles[0].label)
-                                    if temp_img:
-                                        tile_width, tile_height = temp_img.size
-                                        bpy.data.images.remove(temp_img)
-                            if num_tiles > 0 and tile_width > 0:
-                                bake_resolution_x = tile_width * num_tiles
-                                bake_resolution_y = tile_height
-                                logging.info(f"   - UDIMs detected. Overriding resolution to {bake_resolution_x}x{bake_resolution_y} for atlas.")
+                uv_layer_for_bake = obj.data.uv_layers.active.name if obj.data.uv_layers.active else obj.data.uv_layers[0].name
 
-                uv_layer_for_bake = obj.data.uv_layers[0].name
                 if uses_udims:
-                    bake_info['udim_materials'].add(mat.name)
-                    udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
-                    if udim_node:
-                        tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
-                        objects_using_mat = [o for o in objects_to_process if mat in [s.material for s in o.material_slots]]
-                        self._transform_uvs_for_atlas(objects_using_mat, tiles)
-                        uv_layer_for_bake = "remix_atlas_uv"
-            
+                    if mat.name not in bake_info['udim_materials']:
+                        bake_info['udim_materials'].add(mat.name)
+                        udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
+                        if udim_node and udim_node.image:
+                            tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
+                            if tiles:
+                                tile_width, tile_height = udim_node.image.size
+                                if tile_width == 0 or tile_height == 0:
+                                    first_tile_path = abspath(udim_node.image.filepath_raw.replace('<UDIM>', str(tiles[0].number)))
+                                    if os.path.exists(first_tile_path):
+                                        temp_img = self._load_tile_robustly(first_tile_path, tiles[0].label)
+                                        if temp_img:
+                                            tile_width, tile_height = temp_img.size
+                                            bpy.data.images.remove(temp_img)
+                                if len(tiles) > 0 and tile_width > 0:
+                                    bake_resolution_x = tile_width * len(tiles)
+                                    bake_resolution_y = tile_height
+                                    logging.info(f"   - UDIMs detected. Setting bake resolution to {bake_resolution_x}x{bake_resolution_y} for atlas.")
+                                    objects_using_mat = [o for o in objects_to_process if mat in [s.material for s in o.material_slots]]
+                                    self._transform_uvs_for_atlas(objects_using_mat, tiles)
+                                    uv_layer_for_bake = "remix_atlas_uv"
+                else:
+                    max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
+                    if max_w > 0: bake_resolution_x = max_w
+                    if max_h > 0: bake_resolution_y = max_h
+                    if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {bake_resolution_x}x{bake_resolution_y}.")
+
                 mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-            
-                objects_for_this_mat_bake = [o for o in objects_to_process if mat in [s.material for s in o.material_slots]]
-                for bake_obj in objects_for_this_mat_bake:
-                    for socket_name, bake_type, is_value, is_color in UNIVERSAL_BAKE_CHANNELS:
-                    
-                        # --- START OF THE FIX ---
-                        # Only create a task for a channel if it's actually used in the material.
-                        # For Displacement, we check the final material output node.
-                        if socket_name == "Displacement":
-                            if not (output_node and output_node.inputs['Displacement'].is_linked):
-                                continue # Skip creating a task if displacement isn't used.
-                        # --- END OF THE FIX ---
 
-                        final_bake_type = bake_type
-                        if uses_udims and bake_type == 'DIFFUSE': final_bake_type = 'EMIT'
-                    
-                        output_filename = f"{mat.name.replace('/', '_')}_{socket_name.replace(' ', '')}_baked.png"
-                        output_path = os.path.join(bake_dir, output_filename)
-                    
-                        if socket_name == "Displacement":
-                            bake_info['height_map_info'][mat.name] = output_path
-                            logging.info(f"   - Registered BAKED height map for '{mat.name}' at: {output_path}")
+                task_templates = list(CORE_PBR_CHANNELS)
 
-                        tasks.append({
-                            "material_name": mat.name, "material_uuid": mat_uuid, "object_name": bake_obj.name,
-                            "bake_type": final_bake_type, "output_path": output_path, "target_socket_name": socket_name,
-                            "is_value_bake": is_value, "is_color_data": is_color,
-                            "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
-                            "uv_layer": uv_layer_for_bake
+                for channel_name, bake_type, is_val, is_color in OPTIONAL_CHANNELS:
+                    if channel_name in handled_by_direct_ingest:
+                        continue
+
+                    if channel_name == "Displacement":
+                        socket = output_node.inputs.get(channel_name) if output_node else None
+                    else:
+                        socket = final_shader_node.inputs.get(channel_name) if final_shader_node else None
+
+                    if (socket and socket.is_linked) or \
+                       (channel_name == "Alpha" and socket and not math.isclose(socket.default_value, 1.0)):
+                        task_templates.append((channel_name, bake_type, is_val, is_color))
+
+                for channel_name, bake_type, is_val, is_color in task_templates:
+                    safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
+                    safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
+                    safe_socket_name = channel_name.replace(' ', '')
+                    if uses_udims:
+                        output_filename = f"{safe_mat_name}_{safe_socket_name}_baked.png"
+                    else:
+                        output_filename = f"{safe_obj_name}_{safe_mat_name}_{safe_socket_name}_baked.png"
+
+                    output_path = os.path.join(bake_dir, output_filename)
+
+                    if channel_name in SPECIAL_TEXTURE_MAP and channel_name != "Alpha":
+                        bake_info['special_texture_info'][(obj.name, mat.name)].append({
+                            'path': output_path, 'type': SPECIAL_TEXTURE_MAP[channel_name]
                         })
 
-        bake_info['tasks'] = tasks
-        if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} total bake tasks.")
-        if bake_info['height_map_info']: logging.info(f"Found {len(bake_info['height_map_info'])} height maps to process.")
+                    tasks.append({
+                        "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
+                        "bake_type": 'EMIT' if uses_udims and bake_type == 'DIFFUSE' else bake_type,
+                        "output_path": output_path, "target_socket_name": channel_name,
+                        "is_value_bake": is_val, "is_color_data": is_color,
+                        "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
+                        "uv_layer": uv_layer_for_bake
+                    })
 
-        return tasks, bake_info.get('material_map',{}), bake_dir, bake_info.get('height_map_info',{})
+        bake_info['tasks'] = tasks
+        if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} total BAKE tasks for procedural/UDIM materials.")
+    
+        total_special_maps = sum(len(v) for v in bake_info['special_texture_info'].values())
+        if total_special_maps > 0: logging.info(f"Found a total of {total_special_maps} special maps to be ingested (some may be from bakes).")
+
+        return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
     
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
@@ -4089,12 +4299,13 @@ class OBJECT_OT_export_and_ingest(Operator):
         slot['current_task'] = None
         self._terminate_worker(slot_index) # This sets status to 'suspended'
        
+          
     def _is_geonodes_generator(self, obj):
         """
+        [MODIFIED FROM ADDON 2]
         Detects if an object is a complex Geometry Nodes generator that needs realization.
         The primary heuristic is checking if materials are set inside the node tree
-        that are not present in the object's actual material slots. This is a tell-tale
-        sign of generators like Baga Ivy.
+        that are not present in the object's actual material slots.
         """
         if not hasattr(obj, 'modifiers'):
             return False
@@ -4103,20 +4314,66 @@ class OBJECT_OT_export_and_ingest(Operator):
         if not gn_modifier or not gn_modifier.node_group:
             return False
 
+        # Get all materials currently in the object's slots
         slot_materials = {s.material for s in obj.material_slots if s.material}
 
         node_tree = gn_modifier.node_group
+        # Find all materials being set by "Set Material" nodes inside the tree
         node_materials = {
             n.inputs['Material'].default_value
             for n in node_tree.nodes
             if n.type == 'SET_MATERIAL' and n.inputs['Material'].default_value is not None
         }
 
+        # If there are materials set in the nodes that are not in the object's slots,
+        # it's a generator that needs to be realized.
         if node_materials and not node_materials.issubset(slot_materials):
-            logging.info(f"Object '{obj.name}' is a GeoNodes generator. Materials used in nodes: {[m.name for m in node_materials]}. Materials in slots: {[m.name for m in slot_materials]}.")
+            logging.info(f"Object '{obj.name}' detected as a GeoNodes generator.")
             return True
 
         return False
+    
+    def _combine_albedo_and_opacity(self, color_map_path, opacity_map_path):
+        """
+        [CORRECTED] Loads a color map and a grayscale opacity map, and combines them into a
+        single RGBA image. The opacity map's values are placed into the alpha channel of the
+        color map. The final combined image overwrites the original color map path.
+        """
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            logging.error("Pillow library is not installed. Cannot combine albedo and opacity maps.")
+            self.report({'ERROR'}, "Pillow dependency not found. Cannot create transparency.")
+            return
+
+        if not os.path.exists(color_map_path) or not os.path.exists(opacity_map_path):
+            logging.warning(f"Skipping texture combination: one or both maps missing. Color: '{os.path.exists(color_map_path)}', Opacity: '{os.path.exists(opacity_map_path)}'")
+            return
+
+        logging.info(f"  > Combining '{os.path.basename(color_map_path)}' with opacity from '{os.path.basename(opacity_map_path)}'")
+
+        try:
+            # Load the base color map and ensure it has an alpha channel to modify.
+            albedo_img = Image.open(color_map_path).convert("RGBA")
+
+            # Load the opacity map and ensure it's a single-channel grayscale ("Luminance").
+            opacity_img = Image.open(opacity_map_path).convert("L")
+
+            # Ensure images are the same size before combining.
+            if albedo_img.size != opacity_img.size:
+                logging.warning(f"    - Albedo and opacity maps have different sizes. Resizing opacity map to {albedo_img.size}.")
+                opacity_img = opacity_img.resize(albedo_img.size, Image.Resampling.LANCZOS)
+
+            # This is the correct method: put the grayscale opacity_img into the alpha channel of the albedo_img.
+            albedo_img.putalpha(opacity_img)
+
+            # Save the combined RGBA image, overwriting the original color map.
+            albedo_img.save(color_map_path, "PNG")
+            logging.info(f"    - Successfully created RGBA texture at: {os.path.basename(color_map_path)}")
+
+        except Exception as e:
+            logging.error(f"Failed during texture combination for '{color_map_path}': {e}", exc_info=True)
+            self.report({'WARNING'}, "Failed to combine color and opacity maps.")
 
     def execute(self, context):
         if not PSUTIL_INSTALLED:
@@ -4130,7 +4387,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         export_lock = True
 
-        # ---> START OF THE FIX: Ensure all necessary keys are initialized. <---
+        # Initialize operator state
         self._timer = None
         self._op_lock = Lock()
         self._export_data = {
@@ -4142,7 +4399,6 @@ class OBJECT_OT_export_and_ingest(Operator):
             "normals_were_flipped": False, 
             "temp_realized_object_names": []
         }
-        # ---> END OF THE FIX <---
         self._task_batches = []
         self._worker_slots = []
         self._comm_threads = []
@@ -4154,7 +4410,6 @@ class OBJECT_OT_export_and_ingest(Operator):
         self._resource_check_counter = 0
 
         try:
-            # The rest of the function remains the same...
             logging.info("Checking for EXR textures to convert before export...")
             success, _ = convert_exr_textures_to_png(context)
             if not success:
@@ -4172,6 +4427,7 @@ class OBJECT_OT_export_and_ingest(Operator):
             if not initial_selection:
                 raise RuntimeError("No suitable visible objects found to export.")
 
+            # --- YOUR OLD WORKING CODE ---
             final_export_list = set(initial_selection)
             generators_found = {obj for obj in initial_selection if self._is_geonodes_generator(obj)}
             
@@ -4193,6 +4449,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             final_export_list -= generators_found
             final_export_list -= source_objects_to_exclude
+            # --- END OF YOUR OLD WORKING CODE ---
 
             self._export_data["objects_for_export"] = [o for o in final_export_list if o and o.type == 'MESH']
 
@@ -4208,16 +4465,7 @@ class OBJECT_OT_export_and_ingest(Operator):
             )
             self._total_tasks = len(all_tasks)
 
-            any_udims_found = False
-            for obj in self._export_data["objects_for_export"]:
-                for slot in obj.material_slots:
-                    if slot.material and slot.material.use_nodes:
-                        for node in slot.material.node_tree.nodes:
-                            if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
-                                any_udims_found = True
-                                break
-                    if any_udims_found: break
-                if any_udims_found: break
+            any_udims_found = any(self._material_uses_udims(s.material) for obj in self._export_data["objects_for_export"] for s in obj.material_slots if s.material)
             
             if not all_tasks and not any_udims_found:
                 logging.info("No complex materials or UDIMs found. Finalizing export directly with simple textures.")
@@ -4234,12 +4482,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                 for i, task in enumerate(all_tasks):
                     self._task_batches[i % num_batches].append(task)
 
-                self._worker_slots = [{
-                    'process': None, 
-                    'status': 'idle', 
-                    'batch_index': i,
-                    'flagged_for_termination': False # <-- ADD THIS LINE
-                } for i in range(num_batches)]
+                self._worker_slots = [{'process': None, 'status': 'idle', 'batch_index': i, 'flagged_for_termination': False} for i in range(num_batches)]
 
                 self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
                 context.window_manager.modal_handler_add(self)
@@ -4254,17 +4497,57 @@ class OBJECT_OT_export_and_ingest(Operator):
             logging.error(f"Export failed during setup: {e}", exc_info=True)
             self.report({'ERROR'}, f"Export setup failed: {e}")
             return self._cleanup(context, {'CANCELLED'})
-            
+
     def _finalize_export(self, context):
         """
-        Handles the final steps of the export process after any baking is complete.
-        This function now works correctly because `collect_bake_tasks` reliably
-        populates the `height_map_info` dictionary even when no baking occurs.
+        [DEFINITIVE V10 - PID LOCK FILE]
+        Handles the final steps of the export process, including creating the temporary
+        directory with a PID lock file for guaranteed cleanup on the next startup,
+        even after a forced shutdown of Blender.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
+        original_active_uvs = {}
 
         try:
-            logging.info("--- Finalizing Export ---")
+            logging.info("--- Finalizing Export (PID Lock Implementation) ---")
+
+            bake_info = self._export_data.get('bake_info', {})
+            path_remap = {}
+
+            # Hash baked texture filenames to prevent caching issues
+            if bake_info and bake_info.get('tasks'):
+                logging.info("Hashing baked textures before proceeding...")
+                unique_paths_to_hash = {task.get('output_path') for task in bake_info['tasks'] if task.get('output_path')}
+
+                for original_path in unique_paths_to_hash:
+                    if original_path and os.path.exists(original_path):
+                        new_hashed_path = self._hash_and_rename_file(original_path)
+                        path_remap[original_path] = new_hashed_path
+
+                if path_remap:
+                    for task in bake_info.get('tasks', []):
+                        original_path = task.get('output_path')
+                        if original_path in path_remap:
+                            task['output_path'] = path_remap[original_path]
+
+                    if bake_info.get('special_texture_info'):
+                        for mat_name, texture_list in bake_info['special_texture_info'].items():
+                            for texture_data in texture_list:
+                                original_special_path = texture_data.get('path')
+                                if original_special_path in path_remap:
+                                    texture_data['path'] = path_remap[original_special_path]
+
+            # Combine Albedo and Opacity maps if they were baked
+            if bake_info and bake_info.get('tasks') and PILLOW_INSTALLED:
+                tasks = bake_info.get('tasks', [])
+                tasks_by_mat_uuid = defaultdict(dict)
+                for task in tasks:
+                    tasks_by_mat_uuid[task['material_uuid']][task['target_socket_name']] = task['output_path']
+
+                logging.info("Combining baked Color and Alpha maps into final RGBA textures...")
+                for mat_uuid, maps in tasks_by_mat_uuid.items():
+                    if "Base Color" in maps and "Alpha" in maps:
+                        self._combine_albedo_and_opacity(maps["Base Color"], maps["Alpha"])
 
             final_meshes_for_obj = self._export_data.get("objects_for_export", [])
             if not final_meshes_for_obj:
@@ -4272,76 +4555,92 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             logging.info(f" > Finalizing with {len(final_meshes_for_obj)} mesh objects: {[o.name for o in final_meshes_for_obj]}")
 
-            any_udims_found = any(
-                self._material_uses_udims(s.material) 
-                for obj in final_meshes_for_obj 
-                for s in obj.material_slots if s.material
-            )
-
-            # If baking happened or UDIMs were found, materials need to be swapped.
+            any_udims_found = bake_info.get('udim_materials')
             if self._total_tasks > 0 or any_udims_found:
-                logging.info(f"Preparing materials for export (Bakes: {self._total_tasks > 0}, UDIMs: {any_udims_found}).")
+                logging.info(f"Preparing materials for export (Bakes: {self._total_tasks > 0}, UDIMs: {bool(any_udims_found)}).")
                 self._prepare_materials_for_export(context, objects_to_process=final_meshes_for_obj)
             else:
-                logging.info(" > No bakes or UDIMs. Skipping material preparation to export original state.")
+                logging.info(" > No bakes or UDIMs found. Exporting with original materials.")
 
             if addon_prefs.flip_faces_export:
-                logging.info("Applying 'Flip Normals' to final export meshes as requested.")
+                logging.info("Applying 'Flip Normals' to final export meshes.")
                 batch_flip_normals_optimized(final_meshes_for_obj, context)
                 self._export_data["normals_were_flipped"] = True
 
             base_name, asset_number = get_asset_number(context)
             obj_filename = f"{base_name}_{asset_number}.obj"
-            
-            temp_asset_dir = os.path.join(tempfile.gettempdir(), f"remix_export_{base_name}_{asset_number}")
-            if os.path.exists(temp_asset_dir): shutil.rmtree(temp_asset_dir)
+
+            # Use the global constant for the base path
+            base_finalize_path = CUSTOM_FINALIZE_PATH
+            os.makedirs(base_finalize_path, exist_ok=True)
+
+            # Create the temp dir inside the custom path
+            temp_dir_name = f"{TEMP_DIR_PREFIX}{base_name}_{asset_number}_{uuid.uuid4().hex[:8]}"
+            temp_asset_dir = os.path.join(base_finalize_path, temp_dir_name)
             os.makedirs(temp_asset_dir, exist_ok=True)
+
+            try:
+                with open(os.path.join(temp_asset_dir, 'blender.lock'), 'w') as f:
+                    f.write(str(os.getpid()))
+            except Exception as e:
+                raise RuntimeError(f"Could not create .lock file, aborting export: {e}")
+
             self._export_data["temp_files_to_clean"].add(temp_asset_dir)
-            
             exported_obj_path = os.path.join(temp_asset_dir, obj_filename)
 
             logging.info("Preparing selection for OBJ exporter...")
             bpy.ops.object.select_all(action='DESELECT')
-        
             selectable_meshes = [obj for obj in final_meshes_for_obj if obj and obj.name in context.view_layer.objects]
             if not selectable_meshes:
                 raise RuntimeError("None of the final meshes are selectable in the current view layer.")
-            for obj in selectable_meshes: obj.select_set(True)
+            for obj in selectable_meshes:
+                obj.select_set(True)
             context.view_layer.objects.active = selectable_meshes[0]
+
+            # Set the active UV map to the atlas map for objects that were processed
+            for obj in final_meshes_for_obj:
+                if obj.data and "remix_atlas_uv" in obj.data.uv_layers:
+                     if obj.data.uv_layers.active:
+                         original_active_uvs[obj.name] = obj.data.uv_layers.active.name
+                     obj.data.uv_layers.active = obj.data.uv_layers["remix_atlas_uv"]
 
             logging.info(f" > Exporting {len(context.selected_objects)} objects to OBJ...")
             bpy.ops.wm.obj_export(
-                filepath=exported_obj_path, check_existing=True, export_selected_objects=True, 
+                filepath=exported_obj_path, check_existing=True, export_selected_objects=True,
                 forward_axis=addon_prefs.obj_export_forward_axis, up_axis=addon_prefs.obj_export_up_axis,
                 global_scale=addon_prefs.remix_export_scale, apply_modifiers=addon_prefs.apply_modifiers,
                 export_materials=True, path_mode='COPY', export_pbr_extensions=True
             )
 
-            logging.info(f"Exported to temporary OBJ with copied textures: {exported_obj_path}")
+            logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
 
             ingested_usd = upload_to_api(exported_obj_path, addon_prefs.remix_ingest_directory, context)
-            if not ingested_usd: raise RuntimeError("API upload failed.")
+            if not ingested_usd:
+                raise RuntimeError("API upload failed.")
 
             final_reference_prim = self._replace_or_append_on_server(context, ingested_usd)
-            if not final_reference_prim: raise RuntimeError("Server replace/append operation failed.")
+            if not final_reference_prim:
+                raise RuntimeError("Server replace/append operation failed.")
 
-            # --- THE CRITICAL LOGIC THAT NOW WORKS ---
-            # This check now succeeds because `collect_bake_tasks` correctly found
-            # your displacement map and populated `height_map_info`.
-            bake_info = self._export_data.get('bake_info', {})
-            height_info_exists = bake_info.get('height_map_info')
+            if bake_info.get('special_texture_info'):
+                handle_special_texture_assignments(self, context, final_reference_prim, export_data=self._export_data)
 
-            if self._total_tasks > 0 or height_info_exists:
-                logging.info(f"Proceeding with height texture handling. (Bake tasks: {self._total_tasks}, Found Height Maps: {bool(height_info_exists)})")
-                handle_height_textures(context, final_reference_prim, export_data=self._export_data)
-            else:
-                # This log message will no longer appear for your use case.
-                logging.info("Skipping height texture handling: No bakes were run and no height maps were found.")
+            source_bake_dir = bake_info.get('bake_dir')
+            destination_dir = r"C:\Users\Friss\Documents\Test3" # User-specific path, kept as is
+            if source_bake_dir and os.path.isdir(source_bake_dir):
+                shutil.copytree(source_bake_dir, destination_dir, dirs_exist_ok=True)
 
         except Exception as e:
             logging.error(f"Export finalization failed: {e}", exc_info=True)
             self.report({'ERROR'}, f"Finalization failed: {e}")
-            
+
+        finally:
+            if original_active_uvs:
+                for obj_name, original_map_name in original_active_uvs.items():
+                    obj = bpy.data.objects.get(obj_name)
+                    if obj and obj.data and original_map_name in obj.data.uv_layers:
+                        obj.data.uv_layers.active = obj.data.uv_layers[original_map_name]
+                        
     def _find_ultimate_source_node(self, start_socket):
         """
         [IMPROVED & RENAMED] Traces back from a socket to find the ultimate source node.
@@ -4385,43 +4684,47 @@ class OBJECT_OT_export_and_ingest(Operator):
           
     def _bake_udim_material_to_atlas(self, context, mat, objects_using_mat, bake_dir):
         """
-        [DEFINITIVE V13 - KEYERROR FIX]
-        Removes the erroneous line that tried to access the non-existent
-        'baked_materials' key in the export data dictionary.
+        [FROM ADDON 2 - ADAPTED FOR ADDON 1]
+        Stitches existing UDIM tiles into a new atlas texture. This does NOT bake,
+        it combines the source images directly. It has been adapted to integrate
+        with Addon 1's more advanced special texture handling.
         """
         if not mat or not mat.use_nodes:
             return None, None
-        logging.info(f"--- Starting NON-BAKING UDIM Stitch for Material: '{mat.name}' ---")
+        logging.info(f"--- Starting UDIM Stitch for Material: '{mat.name}' ---")
+        
+        bake_info = self._export_data.get('bake_info', {})
+        
         bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
         output_node = next((n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL"), None)
         if not bsdf or not output_node:
             logging.warning(f"No Principled BSDF or Material Output found in '{mat.name}'. Cannot stitch.")
             return mat, None
+
         udim_jobs = collections.defaultdict(list)
         sockets_to_check = list(bsdf.inputs) + [output_node.inputs['Displacement']]
         for socket in sockets_to_check:
             if not socket.is_linked: continue
-            source_node = self._find_udim_source_node_recursive(socket)
-            if source_node:
+            # Use Addon 1's more robust node finding function
+            source_node = self._find_ultimate_source_node(socket)
+            if source_node and source_node.image and source_node.image.source == 'TILED':
                 udim_jobs[source_node].append(socket.name)
+
         if not udim_jobs:
             logging.info(f"No UDIM textures found to stitch for material '{mat.name}'.")
             return mat, None
 
         final_stitched_mat = bpy.data.materials.new(name=f"{mat.name}__UDIM_STITCHED")
-        
-        # ---> THIS LINE CAUSED THE ERROR AND IS NOW REMOVED <---
-        # self._export_data["baked_materials"][mat.name] = final_stitched_mat
-        
-        # This is the correct way to track the temporary material for cleanup
         self._export_data["temp_materials_for_cleanup"].append(final_stitched_mat)
         
         final_stitched_mat.use_nodes = True
         nt = final_stitched_mat.node_tree
         for node in nt.nodes: nt.nodes.remove(node)
+        
         new_bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
         new_mat_output = nt.nodes.new('ShaderNodeOutputMaterial')
         nt.links.new(new_bsdf.outputs['BSDF'], new_mat_output.inputs['Surface'])
+        
         uv_map_node = nt.nodes.new('ShaderNodeUVMap')
         uv_map_node.uv_map = "remix_atlas_uv"
 
@@ -4430,121 +4733,112 @@ class OBJECT_OT_export_and_ingest(Operator):
             image = udim_node.image
             tiles = sorted([t for t in image.tiles if t.label], key=lambda t: t.number)
             if not all_processed_tiles: all_processed_tiles = tiles
-            num_tiles = len(tiles)
-            if num_tiles == 0:
+            
+            if not tiles:
                 logging.warning(f"UDIM texture '{image.name}' has no valid tiles. Skipping.")
                 continue
-            logging.info(f"Found {num_tiles} tiles for UDIM texture '{image.name}'. Stitching...")
+
+            logging.info(f"Found {len(tiles)} tiles for UDIM texture '{image.name}'. Stitching...")
             tile_width, tile_height = image.size
+
             if tile_width == 0 or tile_height == 0:
-                determined_size = False
-                for tile_to_check in tiles:
-                    base_path_pattern = image.filepath_raw
-                    if not base_path_pattern: continue
-                    tile_path = abspath(base_path_pattern.replace('<UDIM>', str(tile_to_check.number)))
+                # Logic to determine size from first available tile
+                for tile in tiles:
+                    tile_path = abspath(image.filepath_raw.replace('<UDIM>', str(tile.number)))
                     if os.path.exists(tile_path):
-                        loaded_tile = self._load_tile_robustly(tile_path, tile_to_check.label)
+                        loaded_tile = self._load_tile_robustly(tile_path, tile.label)
                         if loaded_tile:
                             tile_width, tile_height = loaded_tile.size
-                            determined_size = True
                             bpy.data.images.remove(loaded_tile)
                             break
-                if not determined_size:
-                    logging.error(f"Could not determine tile size for any tile in '{image.name}'. Defaulting to 2048x2048.")
+                if tile_width == 0: # If still zero, error and default
+                    logging.error(f"Could not determine tile size for '{image.name}'. Defaulting to 2048.")
                     tile_width, tile_height = 2048, 2048
-            atlas_width = tile_width * num_tiles
+
+            atlas_width = tile_width * len(tiles)
             atlas_height = tile_height
+            
             safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '.', '-'))
             safe_img_name = "".join(c for c in image.name if c.isalnum() or c in ('_', '.', '-'))
             atlas_filename = f"{safe_mat_name}_{safe_img_name}_atlas.png"
             atlas_filepath = os.path.join(bake_dir, atlas_filename)
-            logging.info(f"Creating atlas: {atlas_width}x{atlas_height} at '{atlas_filepath}'")
+
             atlas_image = bpy.data.images.new(name=atlas_filename, width=atlas_width, height=atlas_height, alpha=True)
             atlas_image.filepath_raw = atlas_filepath
             atlas_image.file_format = 'PNG'
             atlas_pixels = [0.0] * (atlas_width * atlas_height * 4)
+
             for i, tile in enumerate(tiles):
-                base_path_pattern = image.filepath_raw
-                if not base_path_pattern:
-                    logging.warning(f"Image '{image.name}' has no base filepath pattern. Cannot resolve tile {tile.number}.")
-                    continue
-                tile_path = abspath(base_path_pattern.replace('<UDIM>', str(tile.number)))
-                if not os.path.exists(tile_path):
-                    logging.warning(f"Tile path does not exist, skipping: {tile_path}")
-                    continue
+                tile_path = abspath(image.filepath_raw.replace('<UDIM>', str(tile.number)))
+                if not os.path.exists(tile_path): continue
+                
                 tile_image = self._load_tile_robustly(tile_path, tile.label)
                 if not tile_image: continue
+
                 try:
                     if tile_image.size[0] != tile_width or tile_image.size[1] != tile_height:
-                        logging.warning(f"Tile '{tile.label}' has mismatched dimensions ({tile_image.size[0]}x{tile_image.size[1]}) vs atlas tile size ({tile_width}x{tile_height}). Resizing in memory.")
                         tile_image.scale(tile_width, tile_height)
+                    
                     tile_pixels = tile_image.pixels[:]
                     for y in range(tile_height):
-                        src_start_idx = (y * tile_width) * 4
-                        src_end_idx = src_start_idx + (tile_width * 4)
-                        dest_x_offset = i * tile_width
-                        dest_start_idx = (y * atlas_width + dest_x_offset) * 4
-                        dest_end_idx = dest_start_idx + (tile_width * 4)
-                        atlas_pixels[dest_start_idx:dest_end_idx] = tile_pixels[src_start_idx:src_end_idx]
+                        src_start = (y * tile_width) * 4
+                        src_end = src_start + (tile_width * 4)
+                        dest_x = i * tile_width
+                        dest_start = (y * atlas_width + dest_x) * 4
+                        dest_end = dest_start + (tile_width * 4)
+                        atlas_pixels[dest_start:dest_end] = tile_pixels[src_start:src_end]
                 finally:
                     bpy.data.images.remove(tile_image)
+
             atlas_image.pixels = atlas_pixels
             atlas_image.save()
+            
             atlas_tex_node = nt.nodes.new('ShaderNodeTexImage')
             atlas_tex_node.image = atlas_image
             nt.links.new(uv_map_node.outputs['UV'], atlas_tex_node.inputs['Vector'])
-            is_data = any('Normal' in name or 'Roughness' in name or 'Metallic' in name for name in target_socket_names)
+            
+            is_data = any(n in s for s in target_socket_names for n in ['Normal', 'Roughness', 'Metallic', 'Displacement'])
             atlas_image.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
+
             for socket_name in target_socket_names:
                 target_socket = new_bsdf.inputs.get(socket_name) or new_mat_output.inputs.get(socket_name)
                 if not target_socket: continue
-                if target_socket.type == 'VECTOR' and 'Normal' in target_socket.name:
+                
+                if 'Normal' in socket_name:
                     normal_map_node = nt.nodes.new('ShaderNodeNormalMap')
                     nt.links.new(atlas_tex_node.outputs['Color'], normal_map_node.inputs['Color'])
                     nt.links.new(normal_map_node.outputs['Normal'], target_socket)
-                elif socket_name == 'Displacement':
+                elif 'Displacement' in socket_name:
                     disp_node = nt.nodes.new('ShaderNodeDisplacement')
                     nt.links.new(atlas_tex_node.outputs['Color'], disp_node.inputs['Height'])
                     nt.links.new(disp_node.outputs['Displacement'], new_mat_output.inputs['Displacement'])
-                    logging.info(f"Storing stitched displacement map path for API: {atlas_filepath}")
-                    self._export_data.setdefault('bake_info', {}).setdefault('height_map_info', {})[mat.name] = atlas_filepath
+                    # ** ADAPTATION FOR ADDON 1 **
+                    # Use the advanced special_texture_info structure
+                    bake_info['special_texture_info'][mat.name].append({
+                        'path': atlas_filepath, 'type': 'HEIGHT'
+                    })
                 else:
                     nt.links.new(atlas_tex_node.outputs['Color'], target_socket)
-        logging.info(f"--- Finished NON-BAKING UDIM Stitch for '{mat.name}' ---")
-        return final_stitched_mat, all_processed_tiles
+
+        self._transform_uvs_for_atlas(objects_using_mat, all_processed_tiles)
+        logging.info(f"--- Finished UDIM Stitch for '{mat.name}' ---")
+        return final_stitched_mat
 
     def _load_tile_robustly(self, tile_path, tile_label):
         """
-        A dedicated, robust helper to load a single image tile from disk.
-        It ensures pixels are actually loaded into memory and returns a valid
-        image datablock, or None if it fails.
+        [FROM ADDON 2] A dedicated, robust helper to load a single image tile from disk.
         """
         tile_image = None
         try:
             tile_image = bpy.data.images.load(tile_path, check_existing=True)
-
-            # The most reliable way to check for pixels is to try accessing them.
-            # `has_data` can be misleading. A zero-length pixel array is definitive.
             if len(tile_image.pixels) > 0:
-                return tile_image # Success on first try
-            
-            # If pixels are empty, force a reload from disk.
-            logging.debug(f"Tile '{tile_label}' at '{tile_path}' loaded without data. Forcing reload...")
+                return tile_image
             tile_image.reload()
-
-            # Final check. If this fails, the file is unreadable by Blender's scripting API.
             if len(tile_image.pixels) > 0:
-                return tile_image # Success after reload
-            
-            # If we reach here, it failed.
-            logging.warning(
-                f"CRITICAL: Could not load pixel data for tile '{tile_label}' from path '{tile_path}'. "
-                "The file may be corrupt, have an unsupported format/bit-depth, or have access permission issues. "
-                "Skipping this tile."
-            )
+                return tile_image
+            logging.warning(f"CRITICAL: Could not load pixel data for tile '{tile_label}' from path '{tile_path}'.")
             bpy.data.images.remove(tile_image)
             return None
-
         except Exception as e:
             logging.error(f"An unexpected error occurred while loading tile '{tile_label}' from '{tile_path}': {e}", exc_info=True)
             if tile_image:
@@ -4552,131 +4846,139 @@ class OBJECT_OT_export_and_ingest(Operator):
             return None
 
     def _transform_uvs_for_atlas(self, objects_to_process, processed_tiles):
+        """
+        [FROM ADDON 2] Creates a new UV map and transforms coordinates to fit the stitched atlas.
+        """
         if not objects_to_process or not processed_tiles: return
         num_tiles = len(processed_tiles)
         if num_tiles == 0: return
+        
         logging.info(f"Transforming UVs for {len(objects_to_process)} object(s) to fit {num_tiles}-tile atlas.")
         tile_number_to_atlas_index = {tile.number: i for i, tile in enumerate(processed_tiles)}
+        
         for obj in objects_to_process:
             if not obj.data or not obj.data.uv_layers: continue
+            
             source_uv_layer = obj.data.uv_layers[0]
-            if not source_uv_layer:
-                logging.warning(f"Object '{obj.name}' has no source UV map. Skipping UV transformation.")
-                continue
+            if not source_uv_layer: continue
+
             atlas_uv_map_name = "remix_atlas_uv"
             if atlas_uv_map_name in obj.data.uv_layers:
                 atlas_uv_layer = obj.data.uv_layers[atlas_uv_map_name]
-                logging.debug(f"Re-using existing atlas UV map '{atlas_uv_map_name}' for object '{obj.name}'.")
             else:
                 atlas_uv_layer = obj.data.uv_layers.new(name=atlas_uv_map_name)
-                logging.debug(f"Created new atlas UV map '{atlas_uv_map_name}' for object '{obj.name}'.")
-            
-            # THE FIX: This must be set before export
+
             obj.data.uv_layers.active = atlas_uv_layer
-            logging.info(f"Set '{atlas_uv_map_name}' as the active UV map for '{obj.name}' for export.")
 
             for loop_index in range(len(source_uv_layer.data)):
-                original_uv = source_uv_layer.data[loop_index].uv
-                u_original = original_uv.x
-                v_original = original_uv.y
+                u_original, v_original = source_uv_layer.data[loop_index].uv
                 tile_u_offset = math.floor(u_original)
                 udim_number = 1001 + tile_u_offset
                 atlas_index = tile_number_to_atlas_index.get(udim_number)
+                
                 if atlas_index is not None:
                     u_fractional = u_original - tile_u_offset
                     u_new = (u_fractional + atlas_index) / num_tiles
+                    atlas_uv_layer.data[loop_index].uv = (u_new, v_original)
                 else:
-                    u_new = 0.0
-                    v_original = 0.0
-                atlas_uv_layer.data[loop_index].uv = (u_new, v_original)
-            logging.info(f"Successfully transformed UVs for '{obj.name}'.")
+                    # If a UV coord points to a tile that doesn't exist, collapse it to zero.
+                    atlas_uv_layer.data[loop_index].uv = (0.0, 0.0)
 
     def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [UDIM-BAKE V2] Prepares final materials. It now builds new materials from
-        baked textures for both complex and UDIM-based sources. For UDIMs, it adds
-        a UV Map node pointing to the generated atlas map.
+        [OBJECT-CENTRIC FIX V2]
+        This function has been completely rewritten to be object-centric. It iterates
+        through each object and its material slots, creating a unique baked material
+        for each slot that used a procedural or UDIM material. This ensures that
+        objects with unique UVs receive their corresponding unique baked textures.
         """
-        logging.info("Preparing final export materials (handling bakes and simple materials)...")
+        logging.info("Preparing final export materials (Object-Centric Fix)...")
 
         self._export_data["original_material_assignments"] = {
-            obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process
+            obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
-    
+
         bake_info = self._export_data.get('bake_info', {})
-        baked_tasks_by_mat_uuid = defaultdict(list)
-        for task in bake_info.get('tasks', []):
-            baked_tasks_by_mat_uuid[task.get("material_uuid")].append(task)
     
-        # Map of original material name -> final material to be assigned
-        processed_materials_map = {}
-        all_original_materials = {s.material for o in objects_to_process for s in o.material_slots if s.material}
-
-        for original_mat in all_original_materials:
-            if original_mat.name in processed_materials_map:
-                continue
-
-            export_mat_to_assign = original_mat # Default to original
-            mat_uuid = original_mat.get("uuid")
-            tasks_for_this_mat = baked_tasks_by_mat_uuid.get(mat_uuid, [])
-        
-            # Check if any bake tasks for this material succeeded
-            successful_bake_files = [t for t in tasks_for_this_mat if os.path.exists(t.get("output_path"))]
-
-            # If the material was baked (either complex or UDIM)
-            if mat_uuid and successful_bake_files:
-                logging.info(f"   - Building new baked material for '{original_mat.name}'...")
-                baked_mat = bpy.data.materials.new(name=f"{original_mat.name}_BAKED")
-                self._export_data["temp_materials_for_cleanup"].append(baked_mat)
-                baked_mat.use_nodes = True
-                nt = baked_mat.node_tree
-                # Clear default nodes
-                for node in nt.nodes: nt.nodes.remove(node)
-            
-                bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
-                out = nt.nodes.new('ShaderNodeOutputMaterial')
-                nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-            
-                uv_map_node = None
-                # If this was a UDIM bake, create a UV Map node to point to the atlas
-                if original_mat.name in bake_info.get('udim_materials', set()):
-                    uv_map_node = nt.nodes.new('ShaderNodeUVMap')
-                    uv_map_node.uv_map = "remix_atlas_uv"
-
-                # Use a dict to get one unique texture per bake type
-                unique_textures = {os.path.basename(t['output_path']): t for t in successful_bake_files}.values()
-                for task in unique_textures:
-                    tex_node = nt.nodes.new('ShaderNodeTexImage')
-                    tex_node.image = bpy.data.images.load(task["output_path"], check_existing=True)
-                
-                    if uv_map_node: # If it's a UDIM bake, connect the UVs
-                        nt.links.new(uv_map_node.outputs['UV'], tex_node.inputs['Vector'])
-
-                    if task.get("is_value_bake") or task['bake_type'] == 'NORMAL':
-                        tex_node.image.colorspace_settings.name = 'Non-Color'
-                
-                    target_name = task.get("target_socket_name")
-                    if target_name == "Normal":
-                        norm_map = nt.nodes.new('ShaderNodeNormalMap')
-                        nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
-                        nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
-                    else:
-                        socket_name = {"Emission": "Emission Color"}.get(target_name, target_name)
-                        if bsdf.inputs.get(socket_name):
-                            nt.links.new(tex_node.outputs['Color'], bsdf.inputs[socket_name])
-            
-                export_mat_to_assign = baked_mat
-            else:
-                logging.info(f"   - Material '{original_mat.name}' is simple. Using original for export.")
-
-            processed_materials_map[original_mat.name] = export_mat_to_assign
-
-        # Final pass to assign the newly created/chosen materials
+        # --- START OF THE FIX: Group tasks by object AND material ---
+        tasks_by_object_and_mat_uuid = defaultdict(list)
+        for task in bake_info.get('tasks', []):
+            key = (task.get("object_name"), task.get("material_uuid"))
+            tasks_by_object_and_mat_uuid[key].append(task)
+    
+        # Iterate through objects first, then their materials.
         for obj in objects_to_process:
-            for slot in obj.material_slots:
-                if slot.material and slot.material.name in processed_materials_map:
-                    slot.material = processed_materials_map[slot.material.name]
+            if not obj: continue
+        
+            # We need to iterate over a copy because we are modifying the slots
+            for i, slot in enumerate(list(obj.material_slots)):
+                original_assignments = self._export_data["original_material_assignments"].get(obj.name)
+                if not original_assignments or i >= len(original_assignments):
+                    continue
                 
+                original_mat = original_assignments[i]
+                if not original_mat:
+                    continue
+
+                mat_uuid = original_mat.get("uuid")
+            
+                # Find the specific bake tasks for THIS object and THIS material
+                tasks_for_this_slot = tasks_by_object_and_mat_uuid.get((obj.name, mat_uuid))
+            
+                # If tasks exist, it means this specific slot needs a new, unique baked material
+                if tasks_for_this_slot:
+                    logging.info(f"   - Building unique baked material for object '{obj.name}', slot {i} (original: '{original_mat.name}')...")
+                
+                    # Create a unique name for the new material
+                    safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
+                    safe_mat_name = "".join(c for c in original_mat.name if c.isalnum() or c in ('_', '-')).strip()
+                    baked_mat_name = f"{safe_obj_name}_{safe_mat_name}_BAKED"
+                
+                    baked_mat = bpy.data.materials.new(name=baked_mat_name)
+                    self._export_data["temp_materials_for_cleanup"].append(baked_mat)
+                    baked_mat.use_nodes = True
+                    nt = baked_mat.node_tree
+                    for node in nt.nodes: nt.nodes.remove(node)
+            
+                    bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+                    out = nt.nodes.new('ShaderNodeOutputMaterial')
+                    nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+            
+                    uv_map_node = None
+                    if original_mat.name in bake_info.get('udim_materials', set()):
+                        uv_map_node = nt.nodes.new('ShaderNodeUVMap')
+                        uv_map_node.uv_map = "remix_atlas_uv"
+
+                    unique_textures = {os.path.basename(t['output_path']): t for t in tasks_for_this_slot}.values()
+                    for task in unique_textures:
+                        if not os.path.exists(task['output_path']): continue
+                    
+                        tex_node = nt.nodes.new('ShaderNodeTexImage')
+                        tex_node.image = bpy.data.images.load(task["output_path"], check_existing=True)
+                
+                        if uv_map_node:
+                            nt.links.new(uv_map_node.outputs['UV'], tex_node.inputs['Vector'])
+
+                        if not task.get("is_color_data", False):
+                            tex_node.image.colorspace_settings.name = 'Non-Color'
+                
+                        target_name = task.get("target_socket_name")
+                        if target_name == "Base Color":
+                            nt.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+                            nt.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+                        elif target_name == "Normal":
+                            norm_map = nt.nodes.new('ShaderNodeNormalMap')
+                            nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
+                            nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
+                        elif target_name != "Alpha":
+                            socket_name = {"Emission": "Emission Color"}.get(target_name, target_name)
+                            if bsdf.inputs.get(socket_name):
+                                nt.links.new(tex_node.outputs['Color'], bsdf.inputs[socket_name])
+                
+                    # Assign the new, unique material to the object's slot
+                    obj.material_slots[i].material = baked_mat
+        # --- END OF THE FIX ---
+    
     def _replace_or_append_on_server(self, context, ingested_usd):
         """
         Smarter workflow handler. Automatically detects if an asset with the same
@@ -4839,6 +5141,10 @@ class OBJECT_OT_export_and_ingest(Operator):
                     os.remove(path_to_clean)
             except Exception as e:
                 logging.warning(f"Could not remove temporary path '{path_to_clean}': {e}")
+        # ---> START OF FIX: UNREGISTER CLEANED FILES <---
+        # Clear the global list so the atexit handler doesn't try to delete them again.
+        TEMP_FILES_FOR_ATEXIT_CLEANUP.clear()
+        # ---> END OF FIX <---
 
         if self._timer:
             context.window_manager.event_timer_remove(self._timer)
@@ -5461,41 +5767,39 @@ class VIEW3D_PT_remix_ingestor(Panel):
 
     def draw(self, context):
         layout = self.layout
-        
-        # --- NEW: Conditional UI based on psutil installation ---
-        if not PSUTIL_INSTALLED:
-            box = layout.box()
-            box.label(text="Dependency Required", icon='ERROR')
-            
-            col = box.column(align=True)
-            col.label(text="The 'psutil' library is needed for")
-            col.label(text="dynamic resource management.")
+        addon_prefs = context.preferences.addons[__name__].preferences
 
-            # Show install button only if the installation hasn't been completed in this session
-            if not getattr(context.scene, 'remix_install_complete', False):
-                 box.operator("remix.install_psutil", text="Install psutil", icon='CONSOLE')
-            else:
+        # --- NEW: Combined Dependency Check ---
+        if not PSUTIL_INSTALLED or not PILLOW_INSTALLED:
+            box = layout.box()
+            box.label(text="Dependencies Required", icon='ERROR')
+            
+            if not PSUTIL_INSTALLED:
+                col = box.column(align=True)
+                col.label(text="'psutil' is needed for resource management.")
+                op = col.operator("remix.install_dependency", text="Install psutil", icon='CONSOLE')
+                op.dependency = 'psutil'
+
+            if not PILLOW_INSTALLED:
+                col = box.column(align=True)
+                col.label(text="'Pillow' is needed for texture fixing.")
+                op = col.operator("remix.install_dependency", text="Install Pillow", icon='CONSOLE')
+                op.dependency = 'Pillow'
+
+            if getattr(context.scene, 'remix_install_complete', False):
                  info_box = box.box()
                  info_box.label(text="Installation successful!", icon='CHECKMARK')
-                 info_box.label(text="Please restart Blender now.")
+                 info_box.label(text="Please restart Blender now to apply.")
                  box.operator("remix.restart_blender", text="Save and Restart Blender", icon='RECOVER_LAST')
             
-            # Stop drawing the rest of the panel
-            return
-        # --- End of new conditional UI ---
+            return # Stop drawing the rest of the panel
 
-
-        # --- Main Addon UI (only drawn if psutil is installed) ---
-        addon_prefs = context.preferences.addons[__name__].preferences
-        layout = self.layout
-
-        # --- Presets Box ---
+        # --- Main Addon UI (only drawn if all dependencies are installed) ---
         presets_box = layout.box()
         presets_box.label(text="Presets", icon='SETTINGS')
         row = presets_box.row()
         row.prop(addon_prefs, "remix_preset", text="")
 
-        # --- Export Box ---
         export_box = layout.box()
         export_box.label(text="Export & Ingest", icon='EXPORT')
         export_box.prop(addon_prefs, "remix_ingest_directory", text="Ingest Directory")
@@ -5522,7 +5826,6 @@ class VIEW3D_PT_remix_ingestor(Panel):
         export_box.prop(addon_prefs, "remix_export_scale", text="Export Scale")
         export_box.operator("object.export_and_ingest", text="Export and Ingest", icon='PLAY')
 
-        # --- Import Box ---
         import_box = layout.box()
         import_box.label(text="USD Import", icon='IMPORT')
         import_box.prop(addon_prefs, "mirror_import", text="Mirror on Import")
@@ -5533,17 +5836,13 @@ class VIEW3D_PT_remix_ingestor(Panel):
         import_box.operator("object.import_usd_from_remix", text="Import from Remix")
         import_box.operator("object.import_captures", text="Import USD Captures")
 
-        # --- Utilities Box ---
         utilities_box = layout.box()
         utilities_box.label(text="Utilities", icon='TOOL_SETTINGS')
         utilities_box.operator("system.check_gpu_settings", text="Check GPU Settings", icon='SYSTEM')
-        # The line for the debug operator that caused the error has been REMOVED.
 
-        # --- Reset Box ---
         reset_box = layout.box()
         reset_box.operator("object.reset_remix_ingestor_options", text="Reset All Options", icon='FILE_REFRESH')
 
-        # --- Info Box ---
         info_box = layout.box()
         info_row = info_box.row()
         info_row.operator("object.info_operator", text="Hover for Info", icon='INFO')
@@ -5563,17 +5862,23 @@ classes = [
     EXPORT_OT_SubstancePainterExporter,
     SYSTEM_OT_check_gpu_settings,
     SYSTEM_OT_show_gpu_report,
-    # --- The new operators for the installation UI ---
-    REMIX_OT_install_psutil,
+    # --- The new generalized installer and restart operators ---
+    REMIX_OT_install_dependency,
     REMIX_OT_restart_blender,
 ]
      
+      
       
 def register():
     global BAKE_WORKER_PY
     log = logging.getLogger(__name__)
 
-    check_psutil()
+    # ################################################################## #
+    # THIS IS THE FIRST CRITICAL CHANGE                                  #
+    # Run the orphan cleanup routine every time the addon loads.         #
+    check_dependencies()
+    cleanup_orphan_directories()
+    # ################################################################## #
 
     try:
         setup_logger()
@@ -5588,16 +5893,13 @@ def register():
         bpy.types.Scene.remix_asset_number = CollectionProperty(type=AssetNumberItem)
         bpy.types.Scene.remix_install_complete = BoolProperty(
             name="Remix Install Complete",
-            description="Tracks if the psutil installation has been attempted.",
+            description="Tracks if a dependency installation has been attempted.",
             default=False
         )
         
-        # --- THIS IS THE FIX ---
-        # Register our global cleanup function to run when Blender exits.
+        # We can still keep the atexit handler for graceful shutdowns, but it's no longer the primary defense
         atexit.register(_kill_all_active_workers)
-        # --- END OF FIX ---
-        
-        log.info("Remix Ingestor addon registration complete with orphan process handler.")
+        log.info("Remix Ingestor addon registration complete with orphan process handler and startup cleanup.")
     except Exception as e:
         log.error(f"Addon registration failed: {e}", exc_info=True)
         raise
