@@ -4625,11 +4625,6 @@ class OBJECT_OT_export_and_ingest(Operator):
             if bake_info.get('special_texture_info'):
                 handle_special_texture_assignments(self, context, final_reference_prim, export_data=self._export_data)
 
-            source_bake_dir = bake_info.get('bake_dir')
-            destination_dir = r"C:\Users\Friss\Documents\Test3" # User-specific path, kept as is
-            if source_bake_dir and os.path.isdir(source_bake_dir):
-                shutil.copytree(source_bake_dir, destination_dir, dirs_exist_ok=True)
-
         except Exception as e:
             logging.error(f"Export finalization failed: {e}", exc_info=True)
             self.report({'ERROR'}, f"Finalization failed: {e}")
@@ -4640,7 +4635,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                     obj = bpy.data.objects.get(obj_name)
                     if obj and obj.data and original_map_name in obj.data.uv_layers:
                         obj.data.uv_layers.active = obj.data.uv_layers[original_map_name]
-                        
+                    
     def _find_ultimate_source_node(self, start_socket):
         """
         [IMPROVED & RENAMED] Traces back from a socket to find the ultimate source node.
