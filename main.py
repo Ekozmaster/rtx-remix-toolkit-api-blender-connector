@@ -2514,14 +2514,16 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
 
         if scale_needed:
             scale_matrix = Matrix.Diagonal((remix_scale, remix_scale, remix_scale, 1.0))
-        if mirror_flag:
-            mirror_matrix = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
 
         valid_exts = tuple(ext.strip().lower() for ext in self.filename_ext.split(','))
 
         all_keep_objs = []
         processed_files_count = 0
         textures_processed_for_count = 0
+    
+        # --- MODIFICATION START: List to collect meshes for mirroring ---
+        meshes_to_mirror_collector = []
+        # --- MODIFICATION END ---
 
         # 3) Switch to temp_scene once (avoiding repeated context switches)
         original_scene_for_loop = context.window.scene
@@ -2622,7 +2624,7 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                         mats_before.add(mat.name)
             materials_seen = mats_before
 
-            # 7) Apply transforms (scale, mirror, flip), collect meshes_for_texture
+            # 7) Apply transforms (scale, flip), collect meshes_for_texture and mirroring
             meshes_for_texture = []
             for keeper_obj in unique_meshes:
                 # Scale (only top‐level objects)
@@ -2632,12 +2634,15 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
                     if not keeper_obj.parent or keeper_obj.parent not in unique_meshes:
                         keeper_obj.matrix_world = scale_matrix @ keeper_obj.matrix_world
 
-                # Mirror (only selected meshes)
-                if mirror_flag and keeper_obj.type == 'MESH' and keeper_obj.select_get():
-                    keeper_obj.matrix_world = mirror_matrix @ keeper_obj.matrix_world
+                # --- MODIFICATION START: Collect object for batch mirror ---
+                if mirror_flag and keeper_obj.type == 'MESH':
+                    meshes_to_mirror_collector.append(keeper_obj)
+                # --- MODIFICATION END ---
 
                 # Flip normals
                 if flip_flag and keeper_obj.type == 'MESH':
+                    # This is a simple data-level flip, not the same as the batch_flip_normals_optimized
+                    # which uses Edit Mode. This per-object flip is acceptable here.
                     mesh_data = keeper_obj.data
                     if hasattr(mesh_data, "flip_normals"):
                         mesh_data.flip_normals()
@@ -2679,8 +2684,18 @@ class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHe
             unique_meshes[:] = pruned
 
             all_keep_objs.extend(unique_meshes)
-
         # end for file_elem
+    
+        # --- MODIFICATION START: Perform batch mirror operation ---
+        if mirror_flag and meshes_to_mirror_collector:
+            logging.info(f"Applying batch mirror to {len(meshes_to_mirror_collector)} imported objects.")
+            # Ensure we only pass valid, unique objects
+            valid_meshes_to_mirror = list(dict.fromkeys(
+                obj for obj in meshes_to_mirror_collector if obj and obj.name in temp_scene.objects
+            ))
+            if valid_meshes_to_mirror:
+                batch_mirror_objects_optimized(valid_meshes_to_mirror, context)
+        # --- MODIFICATION END ---
 
         # Restore original scene
         context.window.scene = original_scene_for_loop
@@ -2939,9 +2954,12 @@ class OBJECT_OT_import_usd_from_remix(Operator):
                 if hasattr(importer_prefs, attr):
                     original_importer_settings[attr] = getattr(importer_prefs, attr)
             logging.debug(f"Backed up USD importer settings for Remix import: {original_importer_settings.keys()}")
-        
+    
         original_window_scene = context.window.scene
-        
+    
+        # List to collect meshes for batch mirroring
+        all_meshes_to_mirror_in_temp = []
+    
         try:
             if usd_importer_addon:
                 importer_prefs = usd_importer_addon.preferences
@@ -2952,14 +2970,14 @@ class OBJECT_OT_import_usd_from_remix(Operator):
                 if hasattr(importer_prefs, 'import_materials'): importer_prefs.import_materials = 'USD_PREVIEW_SURFACE'
                 if hasattr(importer_prefs, 'import_meshes'): importer_prefs.import_meshes = True
                 # Add other desired defaults for USD import here
-            
+        
             if context.window.scene != target_scene:
                 context.window.scene = target_scene
                 logging.info(f"Temporarily set active window scene to '{target_scene.name}' for Remix USD import.")
 
             for usd_file_path in usd_file_paths_to_import:
                 logging.info(f"Importing (Remix) '{usd_file_path}' into temp scene '{target_scene.name}'")
-                
+            
                 # Store objects already in the temp scene to identify newly added ones
                 objects_before_import_in_temp = set(target_scene.objects)
                 bpy.ops.object.select_all(action='DESELECT') # Deselect in temp scene
@@ -2967,59 +2985,63 @@ class OBJECT_OT_import_usd_from_remix(Operator):
                 try:
                     bpy.ops.wm.usd_import(filepath=usd_file_path)
                     logging.info(f"  Successfully imported (Remix) {os.path.basename(usd_file_path)} into {target_scene.name}.")
-                    
+                
                     objects_after_import_in_temp = set(target_scene.objects)
                     newly_added_objects = list(objects_after_import_in_temp - objects_before_import_in_temp)
-                    
+                
                     if not newly_added_objects:
-                        # Sometimes USD import might select objects instead of just adding them,
-                        # or if it imports into an existing hierarchy, the diff might be complex.
-                        # Fallback to selected if any, otherwise log a warning.
                         if context.selected_objects:
                             newly_added_objects = list(context.selected_objects)
                             logging.debug(f"  Remix import of {os.path.basename(usd_file_path)}: using selected objects as newly added.")
                         else:
                             logging.warning(f"  Remix import of {os.path.basename(usd_file_path)}: No new objects detected by diff and nothing selected. Subsequent per-object operations might be skipped for this file.")
                             imported_top_level_objects_map[usd_file_path] = []
-                            continue # Skip to next file if nothing seems to have been imported from this one
+                            continue
 
                     imported_top_level_objects_map[usd_file_path] = newly_added_objects
                     logging.info(f"  Remix import: Identified {len(newly_added_objects)} new top-level objects from {os.path.basename(usd_file_path)}.")
 
-                    # Apply your addon-specific scaling, mirroring, normal flipping
                     import_scale = addon_prefs_instance.remix_import_scale
                     if import_scale != 1.0:
                         for obj in newly_added_objects:
-                            if obj.type in {'MESH', 'CURVE', 'EMPTY'}: # Apply scale to relevant types
-                                obj.scale = tuple(s * import_scale for s in obj.scale) # Direct multiplication
+                            if obj.type in {'MESH', 'CURVE', 'EMPTY'}:
+                                obj.scale = tuple(s * import_scale for s in obj.scale)
                                 logging.debug(f"  Applied import scale {import_scale} to object: {obj.name} (Remix temp).")
-                    
+                
                     if addon_prefs_instance.mirror_import:
                         for obj in newly_added_objects:
                              if obj.type == 'MESH':
-                                logging.info(f"  Mirroring object: {obj.name} (Remix temp).")
-                                mirror_object(obj) # Your existing function
+                                all_meshes_to_mirror_in_temp.append(obj)
 
                     if addon_prefs_instance.flip_normals_import:
                         for obj in newly_added_objects:
                             if obj.type == 'MESH':
-                                flip_normals_api(obj) # Your existing function
+                                flip_normals_api(obj)
                                 logging.debug(f"  Flipped normals for imported object: {obj.name} (Remix temp).")
-                
+            
                 except RuntimeError as e_imp_remix:
                     logging.error(f"  Runtime error importing (Remix) {usd_file_path} into {target_scene.name}: {e_imp_remix}", exc_info=True)
-                    # self.report is not available here, main execute will report
                 except Exception as ex_gen_remix:
                     logging.error(f"  Unexpected error importing (Remix) {usd_file_path}: {ex_gen_remix}", exc_info=True)
 
-        finally: # Restore settings and original scene
+        finally:
+            # Perform batch mirror operation after all imports are done, but before restoring the scene state.
+            if addon_prefs_instance.mirror_import and all_meshes_to_mirror_in_temp:
+                logging.info(f"Applying batch mirror to {len(all_meshes_to_mirror_in_temp)} imported Remix objects.")
+                valid_meshes_to_mirror = list(dict.fromkeys(
+                    obj for obj in all_meshes_to_mirror_in_temp if obj and obj.name in target_scene.objects
+                ))
+                if valid_meshes_to_mirror:
+                    batch_mirror_objects_optimized(valid_meshes_to_mirror, context)
+
+            # Restore Blender's original settings
             if usd_importer_addon and original_importer_settings:
                 importer_prefs = usd_importer_addon.preferences
                 for attr, val in original_importer_settings.items():
                     try: setattr(importer_prefs, attr, val)
-                    except Exception: pass # Logged in captures version
+                    except Exception: pass
                 logging.debug("Restored Blender's USD importer preferences (Remix).")
-            
+        
             if context.window.scene != original_window_scene:
                 try:
                     context.window.scene = original_window_scene
@@ -3028,7 +3050,6 @@ class OBJECT_OT_import_usd_from_remix(Operator):
                     logging.error(f"Failed to restore original window scene '{original_window_scene.name}' (Remix): {e_restore_scene_remix}", exc_info=True)
 
         return imported_top_level_objects_map
-
 
     def execute(self, context):
         addon_prefs = context.preferences.addons[__name__].preferences
