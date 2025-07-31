@@ -59,6 +59,9 @@ PILLOW_INSTALLED = False
 ACTIVE_WORKER_PROCESSES = []
 TEMP_FILES_FOR_ATEXIT_CLEANUP = []
 TEMP_DIR_PREFIX = "remix_ingestor_temp_"
+# --- NEW: Material Caching Globals ---
+global_material_hash_cache = {}
+global_image_hash_cache = {}
 # Define the custom paths here to be used by all functions
 CUSTOM_COLLECT_PATH = os.path.join(tempfile.gettempdir(), "remix_collect")
 CUSTOM_FINALIZE_PATH = os.path.join(tempfile.gettempdir(), "remix_finalize")
@@ -2371,7 +2374,182 @@ def _perform_duplicate_cleanup_phase_module(context, scene_to_clean):
 
     logging.info(f"Finished cleanup for scene '{scene_to_clean.name}'. Deleted {deleted_objects_count_inst} 'inst_', {deleted_objects_mesh_pattern} 'mesh.####'.")
     return {'deleted_objects_inst': deleted_objects_count_inst, 'deleted_objects_mesh_pattern': deleted_objects_mesh_pattern}
-        
+  
+def _stable_repr(value):
+    """Creates a stable, repeatable string representation for various data types."""
+    if isinstance(value, (int, str, bool)):
+        return str(value)
+    elif isinstance(value, float):
+        # Format float to a consistent number of decimal places
+        return f"{value:.8f}"
+    elif isinstance(value, (bpy.types.bpy_prop_array, tuple, list)):
+        if not value: return '[]'
+        try:
+            # Check if all items are numeric for consistent formatting
+            if all(isinstance(x, (int, float)) for x in value):
+                return '[' + ','.join([f"{item:.8f}" if isinstance(item, float) else str(item) for item in value]) + ']'
+        except TypeError:
+            pass
+        # Fallback for mixed or non-numeric types
+        return repr(value)
+    elif hasattr(value, 'to_list'):
+        # For mathutils types like Vector, Color, Quaternion
+        list_val = value.to_list()
+        if not list_val: return '[]'
+        return '[' + ','.join([f"{item:.8f}" if isinstance(item, float) else str(item) for item in list_val]) + ']'
+    elif value is None:
+        return 'None'
+    else:
+        # Generic fallback for any other type
+        return repr(value)
+
+def _hash_image(img, image_hash_cache):
+    """Calculates a hash based on the image's file content."""
+    if not img:
+        return "NO_IMAGE_DATABLOCK"
+
+    # Use the image's full name as a key for in-session caching
+    cache_key = img.name_full if hasattr(img, 'name_full') else str(id(img))
+    if image_hash_cache is not None and cache_key in image_hash_cache:
+        return image_hash_cache[cache_key]
+
+    calculated_digest = None
+    # Prioritize packed data if it exists
+    if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
+        try:
+            # Hash the first 128KB of the packed data
+            data_to_hash = bytes(img.packed_file.data[:131072])
+            calculated_digest = hashlib.md5(data_to_hash).hexdigest()
+        except Exception as e_pack:
+            print(f"[_hash_image Warning] Hash failed on packed data for '{img.name}': {e_pack}", file=sys.stderr)
+
+    # If not packed or packing failed, try to read from disk
+    if calculated_digest is None and hasattr(img, 'filepath_raw') and img.filepath_raw:
+        try:
+            resolved_abs_path = bpy.path.abspath(img.filepath_raw)
+            if os.path.isfile(resolved_abs_path):
+                with open(resolved_abs_path, "rb") as f:
+                    # Hash the first 128KB of the file
+                    data_from_file = f.read(131072)
+                calculated_digest = hashlib.md5(data_from_file).hexdigest()
+        except Exception as e_file:
+            print(f"[_hash_image Warning] Hash failed on file '{img.filepath_raw}': {e_file}", file=sys.stderr)
+
+    # Fallback if no data or file is available (e.g., generated textures)
+    if calculated_digest is None:
+        fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
+        calculated_digest = hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
+
+    # Store in the session cache to avoid re-calculating
+    if image_hash_cache is not None:
+        image_hash_cache[cache_key] = calculated_digest
+
+    return calculated_digest
+
+
+def get_material_hash(mat, force=True, image_hash_cache=None):
+    """
+    [PRODUCTION VERSION] Calculates a highly detailed, content-based structural hash for a material.
+    This version uses a robust, queue-based traversal to correctly handle nested node
+    groups and their exposed slider values.
+    """
+    # By incrementing this version string, you can force all materials to be re-hashed
+    # if you ever change the hashing logic in the future.
+    HASH_VERSION = "v_STRUCTURAL_ROBUST_TRAVERSAL_2"
+
+    if not mat:
+        return None
+
+    mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial'))
+
+    try:
+        recipe_parts = [f"VERSION:{HASH_VERSION}"]
+
+        if not mat.use_nodes or not mat.node_tree:
+            # Handle non-node materials (older Blender Internal style)
+            recipe_parts.append("NON_NODE_MATERIAL")
+            recipe_parts.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
+            recipe_parts.append(f"Metallic:{_stable_repr(mat.metallic)}")
+            recipe_parts.append(f"Roughness:{_stable_repr(mat.roughness)}")
+        else:
+            # This is the main logic for node-based materials
+            if image_hash_cache is None:
+                image_hash_cache = {}
+
+            all_node_recipes = []
+            all_link_recipes = []
+
+            trees_to_process = deque([mat.node_tree])
+            processed_trees = {mat.node_tree}
+
+            while trees_to_process:
+                current_tree = trees_to_process.popleft()
+
+                for node in current_tree.nodes:
+                    node_parts = [f"NODE:{node.name}", f"TYPE:{node.bl_idname}"]
+
+                    # Generic Properties (dropdowns, checkboxes, etc.)
+                    for prop in node.bl_rna.properties:
+                        if prop.is_readonly or prop.identifier in [
+                            'rna_type', 'name', 'label', 'inputs', 'outputs', 'parent', 'internal_links',
+                            'color_ramp', 'image', 'node_tree', 'outputs'
+                        ]:
+                            continue
+                        try:
+                            value = getattr(node, prop.identifier)
+                            node_parts.append(f"PROP:{prop.identifier}={_stable_repr(value)}")
+                        except AttributeError:
+                            continue
+
+                    # Unconnected Input Values (sliders, color fields, etc.)
+                    for inp in node.inputs:
+                        if not inp.is_linked and hasattr(inp, 'default_value'):
+                            node_parts.append(f"INPUT_DEFAULT:{inp.identifier}={_stable_repr(inp.default_value)}")
+
+                    # Specific fix for ShaderNodeValue output values
+                    if node.type == 'VALUE' and hasattr(node.outputs[0], 'default_value'):
+                        output_val = node.outputs[0].default_value
+                        node_parts.append(f"VALUE_NODE_OUTPUT={_stable_repr(output_val)}")
+
+                    # Special Content Node Handlers
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        image_content_hash = _hash_image(node.image, image_hash_cache)
+                        node_parts.append(f"SPECIAL_CONTENT_HASH:{image_content_hash}")
+                    elif node.type == 'ShaderNodeValToRGB':  # ColorRamp
+                        cr = node.color_ramp
+                        if cr:
+                            elements_str = [f"STOP({_stable_repr(s.position)}, {_stable_repr(s.color)})" for s in cr.elements]
+                            node_parts.append(f"SPECIAL_CONTENT_STOPS:[{','.join(elements_str)}]")
+
+                    # Queue up Node Groups for processing
+                    if node.type == 'GROUP' and node.node_tree:
+                        if node.node_tree not in processed_trees:
+                            trees_to_process.append(node.node_tree)
+                            processed_trees.add(node.node_tree)
+
+                    all_node_recipes.append("||".join(sorted(node_parts)))
+
+                # Process all connections in the current tree
+                for link in current_tree.links:
+                    link_repr = (f"LINK:"
+                                 f"{link.from_node.name}.{link.from_socket.identifier}->"
+                                 f"{link.to_node.name}.{link.to_socket.identifier}")
+                    all_link_recipes.append(link_repr)
+
+            recipe_parts.extend(sorted(all_node_recipes))
+            recipe_parts.extend(sorted(all_link_recipes))
+
+        # Final hash calculation
+        final_recipe_string = "|||".join(recipe_parts)
+        digest = hashlib.md5(final_recipe_string.encode('utf-8')).hexdigest()
+
+        return digest
+
+    except Exception as e:
+        print(f"[get_material_hash] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return None
+
 class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
     """Import multiple USD files, treating base_name.### as the same asset, with per-file texture handling."""
     bl_idname = "object.import_captures"
@@ -3844,70 +4022,55 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [DEFINITIVE V7 - PID LOCK FILE]
-        Also creates its bake directory with the unique prefix and a PID lock file.
+        [DEFINITIVE V8 - Material Caching]
+        Analyzes materials to generate bake tasks. Before creating a task, it hashes the
+        material's node structure and content. If an identical material has already been
+        baked during the session, it reuses the cached texture paths instead of creating
+        a new bake task, significantly speeding up re-exports.
         """
         tasks = []
         if not is_blend_file_saved():
             raise RuntimeError("Blend file must be saved to create a bake/temp directory.")
 
-        # ################################################################## #
-        # THIS IS THE THIRD CRITICAL CHANGE                                  #
-        # Create the bake dir with the unique prefix and write the lock file.#
-        # ################################################################## #
-        base_bake_path = CUSTOM_COLLECT_PATH
-        os.makedirs(base_bake_path, exist_ok=True)
-
-        # Create a uniquely named sub-folder inside the custom base path
-        bake_dir_name = f"{TEMP_DIR_PREFIX}baked_textures_{uuid.uuid4().hex[:8]}"
-        bake_dir = os.path.join(base_bake_path, bake_dir_name)
+        # Use the persistent collection directory, which is cleaned on Blender startup.
+        # This directory is NOT cleaned after each export, allowing the cache to work.
+        bake_dir = CUSTOM_COLLECT_PATH
         os.makedirs(bake_dir, exist_ok=True)
         
-        # Write the lock file with the current process ID
-        try:
-            with open(os.path.join(bake_dir, 'blender.lock'), 'w') as f:
-                f.write(str(os.getpid()))
-        except Exception as e:
-            raise RuntimeError(f"Could not create .lock file for bake directory, aborting: {e}")
-
-        export_data['temp_files_to_clean'].add(bake_dir)
-
+        # This bake_info dictionary will be populated with tasks for the worker.
+        # The 'cached_materials' dict will store info about materials using the cache.
         bake_info = {
-            'tasks': [], 'bake_dir': bake_dir, 'special_texture_info': defaultdict(list),
-            'udim_materials': set()
+            'tasks': [], 
+            'bake_dir': bake_dir, 
+            'special_texture_info': defaultdict(list),
+            'udim_materials': set(),
+            'cached_materials': {} # NEW: Tracks materials using cached textures. { 'mat_hash': {socket: path}, ...}
         }
         export_data['bake_info'] = bake_info
 
+        # Clear the single-operation image hash cache before starting.
+        global global_image_hash_cache
+        global_image_hash_cache.clear()
+
         SPECIAL_TEXTURE_MAP = {
-            "Displacement": "HEIGHT",
-            "Emission Color": "EMISSIVE",
-            "Anisotropy": "ANISOTROPY",
-            "Transmission": "TRANSMITTANCE",
-            "Subsurface Radius": "MEASUREMENT_DISTANCE",
-            "Subsurface Scale": "SINGLE_SCATTERING",
-            "Alpha": "OPACITY"
+            "Displacement": "HEIGHT", "Emission Color": "EMISSIVE", "Anisotropy": "ANISOTROPY",
+            "Transmission": "TRANSMITTANCE", "Subsurface Radius": "MEASUREMENT_DISTANCE",
+            "Subsurface Scale": "SINGLE_SCATTERING", "Alpha": "OPACITY"
         }
         CORE_PBR_CHANNELS = [
-            ("Base Color", 'EMIT', False, True),
-            ("Metallic", 'EMIT', True, False),
-            ("Roughness", 'EMIT', True, False),
-            ("Normal", 'NORMAL', False, False),
+            ("Base Color", 'EMIT', False, True), ("Metallic", 'EMIT', True, False),
+            ("Roughness", 'EMIT', True, False), ("Normal", 'NORMAL', False, False),
         ]
         OPTIONAL_CHANNELS = [
-            ("Alpha", 'EMIT', True, False),
-            ("Displacement", 'EMIT', True, False),
-            ("Emission Color", 'EMIT', False, True),
-            ("Anisotropy", 'EMIT', True, False),
-            ("Transmission", 'EMIT', True, False),
-            ("Subsurface Radius", 'EMIT', False, True),
+            ("Alpha", 'EMIT', True, False), ("Displacement", 'EMIT', True, False),
+            ("Emission Color", 'EMIT', False, True), ("Anisotropy", 'EMIT', True, False),
+            ("Transmission", 'EMIT', True, False), ("Subsurface Radius", 'EMIT', False, True),
             ("Subsurface Scale", 'EMIT', True, False)
         ]
-
         DEFAULT_BAKE_RESOLUTION = 2048
 
-        logging.info("Analyzing materials using corrected replication strategy...")
-
-        processed_object_material_pairs = set()
+        logging.info("Analyzing materials with caching...")
+        processed_materials_for_hashing = set()
 
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data or not obj.data.uv_layers:
@@ -3915,61 +4078,44 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             for slot in obj.material_slots:
                 mat = slot.material
-                if not mat or not mat.use_nodes:
+                if not mat or not mat.use_nodes or mat.name in processed_materials_for_hashing:
                     continue
+                
+                processed_materials_for_hashing.add(mat.name)
 
-                # --- THIS IS THE CRITICAL FIX ---
-                # This check MUST come first to prevent processing the same material multiple times
-                # if it's in multiple slots on the same object.
-                if (obj.name, mat.name) in processed_object_material_pairs:
-                    continue
-                processed_object_material_pairs.add((obj.name, mat.name))
-                # --- END OF FIX ---
+                # --- HASHING AND CACHING LOGIC ---
+                material_hash = get_material_hash(mat, image_hash_cache=global_image_hash_cache)
+                if not material_hash:
+                    logging.warning(f"Could not generate a hash for material '{mat.name}'. It will be treated as complex and baked.")
+                
+                # Add the hash to the material's custom properties for later retrieval.
+                mat["remix_material_hash"] = material_hash
 
-                handled_by_direct_ingest = set()
-            
-                output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-                bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+                if material_hash and material_hash in global_material_hash_cache:
+                    logging.info(f"  CACHE HIT: Material '{mat.name}' (Hash: {material_hash[:8]}...) is cached. Reusing baked textures.")
+                    bake_info['cached_materials'][material_hash] = global_material_hash_cache[material_hash]
+                    # If a special texture was part of the cached bake, add it to special_texture_info
+                    cached_data = global_material_hash_cache[material_hash]
+                    for socket_name, path in cached_data.items():
+                        if socket_name in SPECIAL_TEXTURE_MAP:
+                             bake_info['special_texture_info'][(obj.name, mat.name)].append({
+                                'path': path, 'type': SPECIAL_TEXTURE_MAP[socket_name]
+                            })
+                    continue # Skip to the next material
 
-                # Master list of all special sockets for direct ingestion
-                special_sockets_to_check = {
-                    "Displacement": (output_node, "HEIGHT"),
-                    "Emission Color": (bsdf, "EMISSIVE"),
-                    "Transmission": (bsdf, "TRANSMITTANCE"),
-                    "Anisotropy": (bsdf, "ANISOTROPY"),
-                    # Alpha is intentionally excluded here to let the albedo combination logic handle it
-                    "Subsurface Radius": (bsdf, "MEASUREMENT_DISTANCE"),
-                    "Subsurface Scale": (bsdf, "SINGLE_SCATTERING")
-                }
-
-                for socket_name, (node_to_check, server_type) in special_sockets_to_check.items():
-                    if not node_to_check: continue
-                    socket = node_to_check.inputs.get(socket_name)
-
-                    if socket and socket.is_linked:
-                        source_node = self._find_ultimate_source_node(socket)
-                        if source_node and source_node.image and source_node.image.filepath and not self._material_uses_udims(mat):
-                            filepath = abspath(source_node.image.filepath)
-                            if os.path.exists(filepath):
-                                logging.info(f"  > DIRECT INGEST: Found texture for '{socket_name}' on '{mat.name}'. Queuing.")
-                                bake_info['special_texture_info'][(obj.name, mat.name)].append({'path': filepath, 'type': server_type})
-                                handled_by_direct_ingest.add(socket_name)
-            
-                # --- Logic for actual baking (now runs only once per material) ---
-                final_shader_node = None
-                if output_node and output_node.inputs['Surface'].is_linked:
-                    final_shader_node = output_node.inputs['Surface'].links[0].from_node
+                logging.info(f"  CACHE MISS: Material '{mat.name}' (Hash: {material_hash[:8]}...) will be processed.")
+                # --- END OF HASHING AND CACHING LOGIC ---
 
                 is_complex = not self._is_simple_pbr_setup(mat)
                 uses_udims = self._material_uses_udims(mat)
 
                 if not (is_complex or uses_udims):
                     continue
-
+                
                 log_reason_parts = []
                 if is_complex: log_reason_parts.append("complex setup")
                 if uses_udims: log_reason_parts.append("UDIM textures")
-                logging.info(f"  - Queuing BAKE tasks for material '{mat.name}' on object '{obj.name}' (Reason: {', '.join(log_reason_parts)}).")
+                logging.info(f"  - Queuing BAKE tasks for material '{mat.name}' (Reason: {', '.join(log_reason_parts)}).")
 
                 bake_resolution_x, bake_resolution_y = DEFAULT_BAKE_RESOLUTION, DEFAULT_BAKE_RESOLUTION
                 uv_layer_for_bake = obj.data.uv_layers.active.name if obj.data.uv_layers.active else obj.data.uv_layers[0].name
@@ -4003,55 +4149,50 @@ class OBJECT_OT_export_and_ingest(Operator):
                     if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {bake_resolution_x}x{bake_resolution_y}.")
 
                 mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-
+                
                 task_templates = list(CORE_PBR_CHANNELS)
+                output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+                bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
 
                 for channel_name, bake_type, is_val, is_color in OPTIONAL_CHANNELS:
-                    if channel_name in handled_by_direct_ingest:
-                        continue
-
+                    socket = None
                     if channel_name == "Displacement":
                         socket = output_node.inputs.get(channel_name) if output_node else None
                     else:
-                        socket = final_shader_node.inputs.get(channel_name) if final_shader_node else None
+                        socket = bsdf.inputs.get(channel_name) if bsdf else None
 
                     if (socket and socket.is_linked) or \
                        (channel_name == "Alpha" and socket and not math.isclose(socket.default_value, 1.0)):
                         task_templates.append((channel_name, bake_type, is_val, is_color))
-
+                
                 for channel_name, bake_type, is_val, is_color in task_templates:
-                    safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
                     safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
                     safe_socket_name = channel_name.replace(' ', '')
-                    if uses_udims:
-                        output_filename = f"{safe_mat_name}_{safe_socket_name}_baked.png"
-                    else:
-                        output_filename = f"{safe_obj_name}_{safe_mat_name}_{safe_socket_name}_baked.png"
-
+                    
+                    # Use the material hash in the filename to guarantee uniqueness across sessions
+                    output_filename = f"{safe_mat_name}_{material_hash[:8]}_{safe_socket_name}.png"
                     output_path = os.path.join(bake_dir, output_filename)
 
                     if channel_name in SPECIAL_TEXTURE_MAP and channel_name != "Alpha":
                         bake_info['special_texture_info'][(obj.name, mat.name)].append({
                             'path': output_path, 'type': SPECIAL_TEXTURE_MAP[channel_name]
                         })
-
+                    
                     tasks.append({
                         "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
-                        "bake_type": 'EMIT' if uses_udims and bake_type == 'DIFFUSE' else bake_type,
-                        "output_path": output_path, "target_socket_name": channel_name,
+                        "bake_type": 'EMIT' if uses_udims and bake_type == 'DIFFUSE' else bake_type, 
+                        "output_path": output_path, "target_socket_name": channel_name, 
                         "is_value_bake": is_val, "is_color_data": is_color,
                         "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
-                        "uv_layer": uv_layer_for_bake
+                        "uv_layer": uv_layer_for_bake, "material_hash": material_hash # Pass hash to worker
                     })
 
         bake_info['tasks'] = tasks
-        if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} total BAKE tasks for procedural/UDIM materials.")
-    
-        total_special_maps = sum(len(v) for v in bake_info['special_texture_info'].values())
-        if total_special_maps > 0: logging.info(f"Found a total of {total_special_maps} special maps to be ingested (some may be from bakes).")
+        if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
+        if bake_info['cached_materials']: logging.info(f"Reusing cached textures for {len(bake_info['cached_materials'])} materials.")
 
         return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
-    
+        
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
         if self._persistent_worker:
@@ -4521,42 +4662,33 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _finalize_export(self, context):
         """
-        [DEFINITIVE V10 - PID LOCK FILE]
-        Handles the final steps of the export process, including creating the temporary
-        directory with a PID lock file for guaranteed cleanup on the next startup,
-        even after a forced shutdown of Blender.
+        [DEFINITIVE V11 - Cache Population]
+        Handles the final steps of the export process. After a successful bake, this
+        function now populates the global material cache with the new texture paths,
+        keyed by their material hash, for reuse in subsequent exports within the same session.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
         original_active_uvs = {}
 
         try:
-            logging.info("--- Finalizing Export (PID Lock Implementation) ---")
-
+            logging.info("--- Finalizing Export (Cache Aware) ---")
             bake_info = self._export_data.get('bake_info', {})
-            path_remap = {}
 
-            # Hash baked texture filenames to prevent caching issues
+            # --- CACHE POPULATION ---
+            # If any new textures were baked, add them to the global cache now.
             if bake_info and bake_info.get('tasks'):
-                logging.info("Hashing baked textures before proceeding...")
-                unique_paths_to_hash = {task.get('output_path') for task in bake_info['tasks'] if task.get('output_path')}
-
-                for original_path in unique_paths_to_hash:
-                    if original_path and os.path.exists(original_path):
-                        new_hashed_path = self._hash_and_rename_file(original_path)
-                        path_remap[original_path] = new_hashed_path
-
-                if path_remap:
-                    for task in bake_info.get('tasks', []):
-                        original_path = task.get('output_path')
-                        if original_path in path_remap:
-                            task['output_path'] = path_remap[original_path]
-
-                    if bake_info.get('special_texture_info'):
-                        for mat_name, texture_list in bake_info['special_texture_info'].items():
-                            for texture_data in texture_list:
-                                original_special_path = texture_data.get('path')
-                                if original_special_path in path_remap:
-                                    texture_data['path'] = path_remap[original_special_path]
+                logging.info("Updating global material cache with newly baked textures...")
+                for task in bake_info['tasks']:
+                    mat_hash = task.get('material_hash')
+                    socket_name = task.get('target_socket_name')
+                    output_path = task.get('output_path')
+                    
+                    if mat_hash and socket_name and os.path.exists(output_path):
+                        if mat_hash not in global_material_hash_cache:
+                            global_material_hash_cache[mat_hash] = {}
+                        global_material_hash_cache[mat_hash][socket_name] = output_path
+                logging.info(f"Global cache now contains {len(global_material_hash_cache)} unique materials.")
+            # --- END OF CACHE POPULATION ---
 
             # Combine Albedo and Opacity maps if they were baked
             if bake_info and bake_info.get('tasks') and PILLOW_INSTALLED:
@@ -4574,14 +4706,13 @@ class OBJECT_OT_export_and_ingest(Operator):
             if not final_meshes_for_obj:
                 raise RuntimeError("Final object list for export is empty.")
 
-            logging.info(f" > Finalizing with {len(final_meshes_for_obj)} mesh objects: {[o.name for o in final_meshes_for_obj]}")
-
-            any_udims_found = bake_info.get('udim_materials')
-            if self._total_tasks > 0 or any_udims_found:
-                logging.info(f"Preparing materials for export (Bakes: {self._total_tasks > 0}, UDIMs: {bool(any_udims_found)}).")
+            # Determine if any material replacement needs to happen
+            needs_material_prep = bake_info.get('tasks') or bake_info.get('cached_materials') or bake_info.get('udim_materials')
+            if needs_material_prep:
+                logging.info("Preparing materials for final OBJ export...")
                 self._prepare_materials_for_export(context, objects_to_process=final_meshes_for_obj)
             else:
-                logging.info(" > No bakes or UDIMs found. Exporting with original materials.")
+                logging.info(" > No bakes or cached materials found. Exporting with original materials.")
 
             if addon_prefs.flip_faces_export:
                 logging.info("Applying 'Flip Normals' to final export meshes.")
@@ -4591,15 +4722,13 @@ class OBJECT_OT_export_and_ingest(Operator):
             base_name, asset_number = get_asset_number(context)
             obj_filename = f"{base_name}_{asset_number}.obj"
 
-            # Use the global constant for the base path
             base_finalize_path = CUSTOM_FINALIZE_PATH
             os.makedirs(base_finalize_path, exist_ok=True)
 
-            # Create the temp dir inside the custom path
             temp_dir_name = f"{TEMP_DIR_PREFIX}{base_name}_{asset_number}_{uuid.uuid4().hex[:8]}"
             temp_asset_dir = os.path.join(base_finalize_path, temp_dir_name)
             os.makedirs(temp_asset_dir, exist_ok=True)
-
+            
             try:
                 with open(os.path.join(temp_asset_dir, 'blender.lock'), 'w') as f:
                     f.write(str(os.getpid()))
@@ -4618,7 +4747,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 obj.select_set(True)
             context.view_layer.objects.active = selectable_meshes[0]
 
-            # Set the active UV map to the atlas map for objects that were processed
             for obj in final_meshes_for_obj:
                 if obj.data and "remix_atlas_uv" in obj.data.uv_layers:
                      if obj.data.uv_layers.active:
@@ -4656,7 +4784,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                     obj = bpy.data.objects.get(obj_name)
                     if obj and obj.data and original_map_name in obj.data.uv_layers:
                         obj.data.uv_layers.active = obj.data.uv_layers[original_map_name]
-                    
+                        
     def _find_ultimate_source_node(self, start_socket):
         """
         [IMPROVED & RENAMED] Traces back from a socket to find the ultimate source node.
@@ -4902,99 +5030,107 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [OBJECT-CENTRIC FIX V2]
-        This function has been completely rewritten to be object-centric. It iterates
-        through each object and its material slots, creating a unique baked material
-        for each slot that used a procedural or UDIM material. This ensures that
-        objects with unique UVs receive their corresponding unique baked textures.
+        [DEFINITIVE V11 - REVERTED NAMING LOGIC]
+        This version restores the ORIGINAL, working material naming scheme (`ObjectName_MaterialName_BAKED`).
+        It uses the hash/cache system ONLY to decide whether to build a new baked material, but the
+        resulting material name is identical to the old, working version, ensuring compatibility
+        with the special texture assignment logic.
         """
-        logging.info("Preparing final export materials (Object-Centric Fix)...")
+        logging.info("Preparing final export materials (Reverted Naming Logic)...")
 
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
 
         bake_info = self._export_data.get('bake_info', {})
-    
-        # --- START OF THE FIX: Group tasks by object AND material ---
-        tasks_by_object_and_mat_uuid = defaultdict(list)
-        for task in bake_info.get('tasks', []):
-            key = (task.get("object_name"), task.get("material_uuid"))
-            tasks_by_object_and_mat_uuid[key].append(task)
-    
-        # Iterate through objects first, then their materials.
+        
+        # Determine which materials need to be replaced (either newly baked or from cache)
+        # We still need the hash to make this decision.
+        mats_to_replace = set()
+        if bake_info.get('tasks'):
+            for task in bake_info['tasks']:
+                mat = bpy.data.materials.get(task.get("material_name"))
+                if mat: mats_to_replace.add(mat)
+        
+        if bake_info.get('cached_materials'):
+            # This part is a bit trickier, we need to find materials that match the cached hashes
+            for mat in bpy.data.materials:
+                mat_hash = mat.get("remix_material_hash")
+                if mat_hash and mat_hash in bake_info['cached_materials']:
+                    mats_to_replace.add(mat)
+
+        # Iterate through objects and their materials, same as the old working code.
         for obj in objects_to_process:
             if not obj: continue
         
-            # We need to iterate over a copy because we are modifying the slots
             for i, slot in enumerate(list(obj.material_slots)):
-                original_assignments = self._export_data["original_material_assignments"].get(obj.name)
-                if not original_assignments or i >= len(original_assignments):
-                    continue
-                
-                original_mat = original_assignments[i]
-                if not original_mat:
+                original_mat = slot.material
+                if not original_mat or original_mat not in mats_to_replace:
                     continue
 
-                mat_uuid = original_mat.get("uuid")
-            
-                # Find the specific bake tasks for THIS object and THIS material
-                tasks_for_this_slot = tasks_by_object_and_mat_uuid.get((obj.name, mat_uuid))
-            
-                # If tasks exist, it means this specific slot needs a new, unique baked material
-                if tasks_for_this_slot:
-                    logging.info(f"   - Building unique baked material for object '{obj.name}', slot {i} (original: '{original_mat.name}')...")
+                # --- REVERTED LOGIC ---
+                # Build the name EXACTLY like the old working code.
+                safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
+                safe_mat_name = "".join(c for c in original_mat.name if c.isalnum() or c in ('_', '-')).strip()
+                baked_mat_name = f"{safe_obj_name}_{safe_mat_name}_BAKED"
+
+                mat_hash = original_mat.get("remix_material_hash")
+                texture_paths_to_use = None
+
+                # Find the texture paths for this material, whether new or cached
+                if mat_hash in (bake_info.get('cached_materials') or {}):
+                    texture_paths_to_use = bake_info['cached_materials'][mat_hash]
+                else:
+                    # If not cached, it must be newly baked. We need to collect its task outputs.
+                    temp_paths = {}
+                    for task in bake_info.get('tasks', []):
+                        if task.get("material_hash") == mat_hash:
+                            temp_paths[task.get("target_socket_name")] = task.get("output_path")
+                    if temp_paths:
+                        texture_paths_to_use = temp_paths
                 
-                    # Create a unique name for the new material
-                    safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
-                    safe_mat_name = "".join(c for c in original_mat.name if c.isalnum() or c in ('_', '-')).strip()
-                    baked_mat_name = f"{safe_obj_name}_{safe_mat_name}_BAKED"
-                
+                if not texture_paths_to_use:
+                    logging.warning(f"Material '{original_mat.name}' was marked for replacement but no textures were found (new or cached).")
+                    continue
+
+                # Now build the material using the original naming scheme
+                if baked_mat_name in bpy.data.materials:
+                    baked_mat = bpy.data.materials[baked_mat_name]
+                else:
+                    logging.info(f"   - Building baked material '{baked_mat_name}'...")
                     baked_mat = bpy.data.materials.new(name=baked_mat_name)
                     self._export_data["temp_materials_for_cleanup"].append(baked_mat)
                     baked_mat.use_nodes = True
                     nt = baked_mat.node_tree
                     for node in nt.nodes: nt.nodes.remove(node)
-            
+        
                     bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
                     out = nt.nodes.new('ShaderNodeOutputMaterial')
                     nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-            
-                    uv_map_node = None
-                    if original_mat.name in bake_info.get('udim_materials', set()):
-                        uv_map_node = nt.nodes.new('ShaderNodeUVMap')
-                        uv_map_node.uv_map = "remix_atlas_uv"
-
-                    unique_textures = {os.path.basename(t['output_path']): t for t in tasks_for_this_slot}.values()
-                    for task in unique_textures:
-                        if not os.path.exists(task['output_path']): continue
                     
+                    for socket_name, path in texture_paths_to_use.items():
+                        if not os.path.exists(path): continue
+                        
                         tex_node = nt.nodes.new('ShaderNodeTexImage')
-                        tex_node.image = bpy.data.images.load(task["output_path"], check_existing=True)
-                
-                        if uv_map_node:
-                            nt.links.new(uv_map_node.outputs['UV'], tex_node.inputs['Vector'])
+                        tex_node.image = bpy.data.images.load(path, check_existing=True)
+                        
+                        is_color = socket_name in ["Base Color", "Emission Color", "Subsurface Radius"]
+                        tex_node.image.colorspace_settings.name = 'sRGB' if is_color else 'Non-Color'
 
-                        if not task.get("is_color_data", False):
-                            tex_node.image.colorspace_settings.name = 'Non-Color'
-                
-                        target_name = task.get("target_socket_name")
-                        if target_name == "Base Color":
+                        if socket_name == "Base Color":
                             nt.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
                             nt.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-                        elif target_name == "Normal":
+                        elif socket_name == "Normal":
                             norm_map = nt.nodes.new('ShaderNodeNormalMap')
                             nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
                             nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
-                        elif target_name != "Alpha":
-                            socket_name = {"Emission": "Emission Color"}.get(target_name, target_name)
-                            if bsdf.inputs.get(socket_name):
-                                nt.links.new(tex_node.outputs['Color'], bsdf.inputs[socket_name])
+                        elif socket_name != "Alpha":
+                            target_input_name = {"Emission": "Emission Color"}.get(socket_name, socket_name)
+                            if bsdf.inputs.get(target_input_name):
+                                nt.links.new(tex_node.outputs['Color'], bsdf.inputs[target_input_name])
                 
-                    # Assign the new, unique material to the object's slot
-                    obj.material_slots[i].material = baked_mat
-        # --- END OF THE FIX ---
-    
+                obj.material_slots[i].material = baked_mat
+                
     def _replace_or_append_on_server(self, context, ingested_usd):
         """
         Smarter workflow handler. Automatically detects if an asset with the same
@@ -5079,17 +5215,16 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _cleanup(self, context, return_value):
         """
-        [DEFINITIVE V6 - CORRECTED CLEANUP]
-        Handles all post-operation cleanup tasks. This version correctly references
-        _worker_slots instead of the old _worker_pool.
+        [DEFINITIVE V7 - Cache-Aware Cleanup]
+        Handles all post-operation cleanup. This version no longer deletes the
+        main bake directory (CUSTOM_COLLECT_PATH), allowing textures to be cached
+        across multiple exports in the same Blender session.
         """
         global export_lock
 
         # --- 1. SHUTDOWN EXTERNAL PROCESSES ---
-        # ---> THIS IS THE FIX: Use self._worker_slots, not self._worker_pool <---
         if hasattr(self, '_worker_slots') and self._worker_slots:
             logging.info(f"Shutting down {len(self._worker_slots)} worker process(es)...")
-            # We iterate over the 'process' object within each slot dictionary
             for slot in self._worker_slots:
                 worker = slot.get('process')
                 if worker and worker.poll() is None:
@@ -5098,7 +5233,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                     except Exception as e:
                         logging.warning(f"Could not terminate worker PID {worker.pid}: {e}")
             
-            # Wait for them to terminate
             for slot in self._worker_slots:
                 worker = slot.get('process')
                 if worker and worker.poll() is None:
@@ -5106,7 +5240,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                         worker.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         worker.kill()
-        # ---> END OF FIX <---
 
         if hasattr(self, '_comm_threads'):
             for thread in self._comm_threads:
@@ -5148,6 +5281,13 @@ class OBJECT_OT_export_and_ingest(Operator):
         
         # --- 4. CLEANUP DISK AND UI ---
         for path_to_clean in self._export_data.get("temp_files_to_clean", set()):
+            # --- MODIFICATION START ---
+            # DO NOT clean the main bake directory. The startup routine will handle it.
+            if os.path.normpath(path_to_clean) == os.path.normpath(CUSTOM_COLLECT_PATH):
+                logging.info(f"Preserving bake directory '{path_to_clean}' for session caching.")
+                continue
+            # --- MODIFICATION END ---
+            
             if not os.path.exists(path_to_clean):
                 continue
             try:
@@ -5157,10 +5297,10 @@ class OBJECT_OT_export_and_ingest(Operator):
                     os.remove(path_to_clean)
             except Exception as e:
                 logging.warning(f"Could not remove temporary path '{path_to_clean}': {e}")
-        # ---> START OF FIX: UNREGISTER CLEANED FILES <---
-        # Clear the global list so the atexit handler doesn't try to delete them again.
-        TEMP_FILES_FOR_ATEXIT_CLEANUP.clear()
-        # ---> END OF FIX <---
+        
+        # We clear the list of files to clean up from this operation, but this does not affect
+        # the main list that the atexit handler uses. This is correct.
+        self._export_data.get("temp_files_to_clean", set()).clear()
 
         if self._timer:
             context.window_manager.event_timer_remove(self._timer)
