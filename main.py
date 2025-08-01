@@ -143,8 +143,9 @@ check_dependencies()
 
 def cleanup_orphan_directories():
     """
-    [DEFINITIVE FIX] Scans the specific custom directories for orphaned temp folders
-    left over from previous crashed sessions and deletes them.
+    [DEFINITIVE FIX V2] Scans and cleans ALL addon-related temporary directories on startup.
+    - Wipes the entire bake cache ('remix_collect') to ensure a fresh start.
+    - Intelligently removes only orphaned session folders ('remix_finalize') from crashed instances.
     """
     if not PSUTIL_INSTALLED:
         logging.warning("Orphan cleanup skipped: 'psutil' is not installed.")
@@ -154,13 +155,30 @@ def cleanup_orphan_directories():
     # List of all base paths that the addon might create temp folders in.
     paths_to_scan = [CUSTOM_COLLECT_PATH, CUSTOM_FINALIZE_PATH]
     
-    logging.info(f"Startup cleanup: Scanning custom paths for orphan directories...")
+    logging.info(f"Startup cleanup: Scanning custom paths...")
 
     for base_path in paths_to_scan:
         if not os.path.exists(base_path):
-            continue # Skip if the base directory (e.g., 'collect') doesn't even exist.
+            continue
 
-        logging.debug(f" > Scanning: {base_path}")
+        # --- THIS IS THE CORRECTED LOGIC ---
+        # If we are scanning the bake cache directory, wipe its contents completely.
+        if os.path.normpath(base_path) == os.path.normpath(CUSTOM_COLLECT_PATH):
+            logging.info(f"Wiping bake cache directory: {base_path}")
+            try:
+                for item_name in os.listdir(base_path):
+                    item_path = os.path.join(base_path, item_name)
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+            except Exception as e:
+                logging.error(f"Failed to wipe bake cache directory '{base_path}': {e}")
+            # Continue to the next path in paths_to_scan
+            continue
+
+        # For all other paths (i.e., remix_finalize), use the existing orphan-check logic.
+        logging.info(f"Scanning for orphaned session directories in: {base_path}")
         try:
             for dirname in os.listdir(base_path):
                 if dirname.startswith(TEMP_DIR_PREFIX):
@@ -2447,15 +2465,14 @@ def _hash_image(img, image_hash_cache):
     return calculated_digest
 
 
-def get_material_hash(mat, force=True, image_hash_cache=None):
+def get_material_hash(mat, obj=None, material_slot_index=None, force=True, image_hash_cache=None):
     """
-    [PRODUCTION VERSION] Calculates a highly detailed, content-based structural hash for a material.
-    This version uses a robust, queue-based traversal to correctly handle nested node
-    groups and their exposed slider values.
+    [PRODUCTION VERSION - UV AWARE V2] Calculates a highly detailed, content-based structural hash.
+    This version now incorporates the mesh geometry, material assignments, AND the active UV Map,
+    ensuring that any change to the material, mesh, or UVs triggers a new bake.
     """
-    # By incrementing this version string, you can force all materials to be re-hashed
-    # if you ever change the hashing logic in the future.
-    HASH_VERSION = "v_STRUCTURAL_ROBUST_TRAVERSAL_2"
+    # Incrementing the version string invalidates all previous, incorrect caches.
+    HASH_VERSION = "v_STRUCTURAL_UV_AWARE_7"
 
     if not mat:
         return None
@@ -2538,6 +2555,56 @@ def get_material_hash(mat, force=True, image_hash_cache=None):
 
             recipe_parts.extend(sorted(all_node_recipes))
             recipe_parts.extend(sorted(all_link_recipes))
+
+        # --- Mesh Context Hashing (Now including UVs) ---
+        if obj and obj.type == 'MESH' and obj.data and material_slot_index is not None:
+            mesh_context_parts = ["MESH_CONTEXT_START"]
+            
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+
+            # 1. Hashing vertex positions to detect geometry changes.
+            vert_co_string = "".join(f"{v.co.x:.6f},{v.co.y:.6f},{v.co.z:.6f};" for v in bm.verts)
+            geom_hash = hashlib.md5(vert_co_string.encode('utf-8')).hexdigest()
+            mesh_context_parts.append(f"GEOM_HASH:{geom_hash}")
+
+            # 2. Hashing topology (face vertex indices), sorted by face index for stability.
+            topo_string = "".join(
+                f"{f.index}:{','.join(str(v.index) for v in f.verts)};"
+                for f in sorted(bm.faces, key=lambda face: face.index)
+            )
+            topo_hash = hashlib.md5(topo_string.encode('utf-8')).hexdigest()
+            mesh_context_parts.append(f"TOPO_HASH:{topo_hash}")
+
+            # 3. Hashing the list of faces this specific material is assigned to.
+            assigned_face_indices_string = ",".join(str(f.index)
+                for f in sorted(bm.faces, key=lambda face: face.index)
+                if f.material_index == material_slot_index
+            )
+            assignment_hash = hashlib.md5(assigned_face_indices_string.encode('utf-8')).hexdigest()
+            mesh_context_parts.append(f"ASSIGN_HASH:{assignment_hash}")
+            
+            # 4. --- THIS IS THE CRITICAL FIX ---
+            # Hashing the UV coordinates from the active UV layer.
+            active_uv_layer = obj.data.uv_layers.active
+            if active_uv_layer:
+                mesh_context_parts.append(f"UV_MAP_NAME:{active_uv_layer.name}")
+                # Create a stable string from all UV coordinates in the active layer.
+                # Use enumerate to get a stable index; 'MeshUVLoop' has no '.index'.
+                uv_data_string = "".join(
+                    f"{i}:{l.uv.x:.6f},{l.uv.y:.6f};"
+                    for i, l in enumerate(active_uv_layer.data)
+                )
+                uv_hash = hashlib.md5(uv_data_string.encode('utf-8')).hexdigest()
+                mesh_context_parts.append(f"UV_HASH:{uv_hash}")
+            else:
+                mesh_context_parts.append("UV_HASH:NONE")
+            # --- END OF FIX ---
+
+            recipe_parts.extend(mesh_context_parts)
+            bm.free()
 
         # Final hash calculation
         final_recipe_string = "|||".join(recipe_parts)
@@ -4022,33 +4089,27 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [DEFINITIVE V8 - Material Caching]
-        Analyzes materials to generate bake tasks. Before creating a task, it hashes the
-        material's node structure and content. If an identical material has already been
-        baked during the session, it reuses the cached texture paths instead of creating
-        a new bake task, significantly speeding up re-exports.
+        [DEFINITIVE V10 - ROBUST HASH HANDLING]
+        Analyzes materials to generate bake tasks. This version safely handles cases where
+        the mesh-aware hash generation might fail, preventing crashes and ensuring that
+        any material that can't be hashed is treated as complex and baked by default.
         """
         tasks = []
         if not is_blend_file_saved():
             raise RuntimeError("Blend file must be saved to create a bake/temp directory.")
 
-        # Use the persistent collection directory, which is cleaned on Blender startup.
-        # This directory is NOT cleaned after each export, allowing the cache to work.
         bake_dir = CUSTOM_COLLECT_PATH
         os.makedirs(bake_dir, exist_ok=True)
-        
-        # This bake_info dictionary will be populated with tasks for the worker.
-        # The 'cached_materials' dict will store info about materials using the cache.
+    
         bake_info = {
             'tasks': [], 
             'bake_dir': bake_dir, 
             'special_texture_info': defaultdict(list),
             'udim_materials': set(),
-            'cached_materials': {} # NEW: Tracks materials using cached textures. { 'mat_hash': {socket: path}, ...}
+            'cached_materials': {}
         }
         export_data['bake_info'] = bake_info
 
-        # Clear the single-operation image hash cache before starting.
         global global_image_hash_cache
         global_image_hash_cache.clear()
 
@@ -4069,53 +4130,50 @@ class OBJECT_OT_export_and_ingest(Operator):
         ]
         DEFAULT_BAKE_RESOLUTION = 2048
 
-        logging.info("Analyzing materials with caching...")
-        processed_materials_for_hashing = set()
+        logging.info("Analyzing materials with mesh-aware caching...")
 
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data or not obj.data.uv_layers:
                 continue
 
-            for slot in obj.material_slots:
+            for slot_index, slot in enumerate(obj.material_slots):
                 mat = slot.material
-                if not mat or not mat.use_nodes or mat.name in processed_materials_for_hashing:
+                if not mat or not mat.use_nodes:
                     continue
-                
-                processed_materials_for_hashing.add(mat.name)
-
-                # --- HASHING AND CACHING LOGIC ---
-                material_hash = get_material_hash(mat, image_hash_cache=global_image_hash_cache)
-                if not material_hash:
-                    logging.warning(f"Could not generate a hash for material '{mat.name}'. It will be treated as complex and baked.")
-                
-                # Add the hash to the material's custom properties for later retrieval.
-                mat["remix_material_hash"] = material_hash
+            
+                material_hash = get_material_hash(mat, obj, slot_index, image_hash_cache=global_image_hash_cache)
+            
+                # --- THIS IS THE CRITICAL FIX ---
+                # Create a safe version of the hash for logging, ONLY if it's not None.
+                hash_for_log = f"Hash: {material_hash[:8]}..." if material_hash else "Hash: [FAILED]"
 
                 if material_hash and material_hash in global_material_hash_cache:
-                    logging.info(f"  CACHE HIT: Material '{mat.name}' (Hash: {material_hash[:8]}...) is cached. Reusing baked textures.")
+                    logging.info(f"  CACHE HIT: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) is cached. Reusing.")
                     bake_info['cached_materials'][material_hash] = global_material_hash_cache[material_hash]
-                    # If a special texture was part of the cached bake, add it to special_texture_info
+                
                     cached_data = global_material_hash_cache[material_hash]
                     for socket_name, path in cached_data.items():
                         if socket_name in SPECIAL_TEXTURE_MAP:
                              bake_info['special_texture_info'][(obj.name, mat.name)].append({
                                 'path': path, 'type': SPECIAL_TEXTURE_MAP[socket_name]
                             })
-                    continue # Skip to the next material
+                    continue
 
-                logging.info(f"  CACHE MISS: Material '{mat.name}' (Hash: {material_hash[:8]}...) will be processed.")
-                # --- END OF HASHING AND CACHING LOGIC ---
+                # If hashing failed, the warning is now printed inside get_material_hash.
+                # We just proceed as if it's a cache miss.
+                logging.info(f"  CACHE MISS: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) will be processed.")
+                # --- END OF FIX ---
 
                 is_complex = not self._is_simple_pbr_setup(mat)
                 uses_udims = self._material_uses_udims(mat)
 
                 if not (is_complex or uses_udims):
                     continue
-                
+            
                 log_reason_parts = []
                 if is_complex: log_reason_parts.append("complex setup")
                 if uses_udims: log_reason_parts.append("UDIM textures")
-                logging.info(f"  - Queuing BAKE tasks for material '{mat.name}' (Reason: {', '.join(log_reason_parts)}).")
+                logging.info(f"  - Queuing BAKE tasks for material '{mat.name}' on '{obj.name}' (Reason: {', '.join(log_reason_parts)}).")
 
                 bake_resolution_x, bake_resolution_y = DEFAULT_BAKE_RESOLUTION, DEFAULT_BAKE_RESOLUTION
                 uv_layer_for_bake = obj.data.uv_layers.active.name if obj.data.uv_layers.active else obj.data.uv_layers[0].name
@@ -4149,7 +4207,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                     if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {bake_resolution_x}x{bake_resolution_y}.")
 
                 mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-                
+            
                 task_templates = list(CORE_PBR_CHANNELS)
                 output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
                 bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
@@ -4164,35 +4222,37 @@ class OBJECT_OT_export_and_ingest(Operator):
                     if (socket and socket.is_linked) or \
                        (channel_name == "Alpha" and socket and not math.isclose(socket.default_value, 1.0)):
                         task_templates.append((channel_name, bake_type, is_val, is_color))
-                
+            
                 for channel_name, bake_type, is_val, is_color in task_templates:
                     safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
                     safe_socket_name = channel_name.replace(' ', '')
-                    
-                    # Use the material hash in the filename to guarantee uniqueness across sessions
-                    output_filename = f"{safe_mat_name}_{material_hash[:8]}_{safe_socket_name}.png"
+                
+                    # Use a fallback hash if generation failed, to ensure a unique filename.
+                    hash_for_filename = material_hash[:8] if material_hash else f"NOHSH_{uuid.uuid4().hex[:6]}"
+                    output_filename = f"{safe_mat_name}_{hash_for_filename}_{safe_socket_name}.png"
                     output_path = os.path.join(bake_dir, output_filename)
 
                     if channel_name in SPECIAL_TEXTURE_MAP and channel_name != "Alpha":
                         bake_info['special_texture_info'][(obj.name, mat.name)].append({
                             'path': output_path, 'type': SPECIAL_TEXTURE_MAP[channel_name]
                         })
-                    
+                
                     tasks.append({
                         "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
                         "bake_type": 'EMIT' if uses_udims and bake_type == 'DIFFUSE' else bake_type, 
                         "output_path": output_path, "target_socket_name": channel_name, 
                         "is_value_bake": is_val, "is_color_data": is_color,
                         "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
-                        "uv_layer": uv_layer_for_bake, "material_hash": material_hash # Pass hash to worker
+                        "uv_layer": uv_layer_for_bake, 
+                        "material_hash": material_hash
                     })
 
         bake_info['tasks'] = tasks
         if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
-        if bake_info['cached_materials']: logging.info(f"Reusing cached textures for {len(bake_info['cached_materials'])} materials.")
+        if bake_info['cached_materials']: logging.info(f"Reusing cached textures for {len(bake_info['cached_materials'])} material contexts.")
 
         return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
-        
+    
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
         if self._persistent_worker:
@@ -5030,106 +5090,109 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [DEFINITIVE V11 - REVERTED NAMING LOGIC]
-        This version restores the ORIGINAL, working material naming scheme (`ObjectName_MaterialName_BAKED`).
-        It uses the hash/cache system ONLY to decide whether to build a new baked material, but the
-        resulting material name is identical to the old, working version, ensuring compatibility
-        with the special texture assignment logic.
+        [DEFINITIVE V12 - CONTEXT-AWARE FINALIZATION]
+        This version fixes a critical bug where baked textures could not be found during
+        the final material creation stage. It now correctly re-calculates the unique
+        mesh-aware hash for each material context (object + material + slot) and uses
+        that hash to reliably look up the corresponding texture paths from either the
+        newly baked tasks or the session cache.
         """
-        logging.info("Preparing final export materials (Reverted Naming Logic)...")
+        logging.info("Preparing final export materials (Context-Aware Finalization)...")
 
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
 
         bake_info = self._export_data.get('bake_info', {})
-        
-        # Determine which materials need to be replaced (either newly baked or from cache)
-        # We still need the hash to make this decision.
-        mats_to_replace = set()
-        if bake_info.get('tasks'):
-            for task in bake_info['tasks']:
-                mat = bpy.data.materials.get(task.get("material_name"))
-                if mat: mats_to_replace.add(mat)
-        
-        if bake_info.get('cached_materials'):
-            # This part is a bit trickier, we need to find materials that match the cached hashes
-            for mat in bpy.data.materials:
-                mat_hash = mat.get("remix_material_hash")
-                if mat_hash and mat_hash in bake_info['cached_materials']:
-                    mats_to_replace.add(mat)
+        if not bake_info:
+            logging.warning("Bake info is missing, cannot prepare materials.")
+            return
 
-        # Iterate through objects and their materials, same as the old working code.
+        # --- Pre-process new tasks into a dictionary keyed by hash for efficient lookup ---
+        tasks_by_hash = defaultdict(dict)
+        for task in bake_info.get('tasks', []):
+            mat_hash = task.get('material_hash')
+            if mat_hash:
+                tasks_by_hash[mat_hash][task.get('target_socket_name')] = task.get('output_path')
+
+        cached_textures_by_hash = bake_info.get('cached_materials', {})
+
+        # Use a fresh image cache for hashing to ensure results match the collection phase.
+        local_image_hash_cache = {}
+
+        # Iterate through each unique material assignment context.
         for obj in objects_to_process:
             if not obj: continue
-        
-            for i, slot in enumerate(list(obj.material_slots)):
+
+            for slot_index, slot in enumerate(obj.material_slots):
                 original_mat = slot.material
-                if not original_mat or original_mat not in mats_to_replace:
+                if not original_mat:
                     continue
 
-                # --- REVERTED LOGIC ---
-                # Build the name EXACTLY like the old working code.
-                safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
-                safe_mat_name = "".join(c for c in original_mat.name if c.isalnum() or c in ('_', '-')).strip()
-                baked_mat_name = f"{safe_obj_name}_{safe_mat_name}_BAKED"
+                # Re-calculate the hash for this specific context to get the correct key.
+                context_hash = get_material_hash(original_mat, obj, slot_index, image_hash_cache=local_image_hash_cache)
+            
+                if not context_hash:
+                    continue
 
-                mat_hash = original_mat.get("remix_material_hash")
                 texture_paths_to_use = None
-
-                # Find the texture paths for this material, whether new or cached
-                if mat_hash in (bake_info.get('cached_materials') or {}):
-                    texture_paths_to_use = bake_info['cached_materials'][mat_hash]
-                else:
-                    # If not cached, it must be newly baked. We need to collect its task outputs.
-                    temp_paths = {}
-                    for task in bake_info.get('tasks', []):
-                        if task.get("material_hash") == mat_hash:
-                            temp_paths[task.get("target_socket_name")] = task.get("output_path")
-                    if temp_paths:
-                        texture_paths_to_use = temp_paths
+            
+                # Look up the hash first in the new bakes, then in the cache.
+                if context_hash in tasks_by_hash:
+                    texture_paths_to_use = tasks_by_hash[context_hash]
+                elif context_hash in cached_textures_by_hash:
+                    texture_paths_to_use = cached_textures_by_hash[context_hash]
+            
+                # If we found textures for this specific context, proceed to build the material.
+                if texture_paths_to_use:
+                    # Use the original, stable naming scheme for the new material.
+                    safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
+                    safe_mat_name = "".join(c for c in original_mat.name if c.isalnum() or c in ('_', '-')).strip()
+                    baked_mat_name = f"{safe_obj_name}_{safe_mat_name}_BAKED"
                 
-                if not texture_paths_to_use:
-                    logging.warning(f"Material '{original_mat.name}' was marked for replacement but no textures were found (new or cached).")
-                    continue
-
-                # Now build the material using the original naming scheme
-                if baked_mat_name in bpy.data.materials:
-                    baked_mat = bpy.data.materials[baked_mat_name]
-                else:
-                    logging.info(f"   - Building baked material '{baked_mat_name}'...")
-                    baked_mat = bpy.data.materials.new(name=baked_mat_name)
-                    self._export_data["temp_materials_for_cleanup"].append(baked_mat)
-                    baked_mat.use_nodes = True
-                    nt = baked_mat.node_tree
-                    for node in nt.nodes: nt.nodes.remove(node)
+                    # Build or find the existing baked material.
+                    if baked_mat_name in bpy.data.materials:
+                        baked_mat = bpy.data.materials[baked_mat_name]
+                    else:
+                        logging.info(f"   - Building baked material '{baked_mat_name}' for context obj='{obj.name}', mat='{original_mat.name}'...")
+                        baked_mat = bpy.data.materials.new(name=baked_mat_name)
+                        self._export_data["temp_materials_for_cleanup"].append(baked_mat)
+                        baked_mat.use_nodes = True
+                        nt = baked_mat.node_tree
+                        for node in nt.nodes: nt.nodes.remove(node)
         
-                    bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
-                    out = nt.nodes.new('ShaderNodeOutputMaterial')
-                    nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+                        bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+                        out = nt.nodes.new('ShaderNodeOutputMaterial')
+                        nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
                     
-                    for socket_name, path in texture_paths_to_use.items():
-                        if not os.path.exists(path): continue
+                        for socket_name, path in texture_paths_to_use.items():
+                            if not os.path.exists(path): continue
                         
-                        tex_node = nt.nodes.new('ShaderNodeTexImage')
-                        tex_node.image = bpy.data.images.load(path, check_existing=True)
-                        
-                        is_color = socket_name in ["Base Color", "Emission Color", "Subsurface Radius"]
-                        tex_node.image.colorspace_settings.name = 'sRGB' if is_color else 'Non-Color'
+                            tex_node = nt.nodes.new('ShaderNodeTexImage')
+                            try:
+                                tex_node.image = bpy.data.images.load(path, check_existing=True)
+                            except RuntimeError as e:
+                                logging.error(f"Could not load image file '{path}' for baked material: {e}")
+                                continue
 
-                        if socket_name == "Base Color":
-                            nt.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-                            nt.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-                        elif socket_name == "Normal":
-                            norm_map = nt.nodes.new('ShaderNodeNormalMap')
-                            nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
-                            nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
-                        elif socket_name != "Alpha":
-                            target_input_name = {"Emission": "Emission Color"}.get(socket_name, socket_name)
-                            if bsdf.inputs.get(target_input_name):
-                                nt.links.new(tex_node.outputs['Color'], bsdf.inputs[target_input_name])
+                            is_color = socket_name in ["Base Color", "Emission Color", "Subsurface Radius"]
+                            tex_node.image.colorspace_settings.name = 'sRGB' if is_color else 'Non-Color'
+
+                            if socket_name == "Base Color":
+                                nt.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+                                if 'Alpha' in tex_node.outputs:
+                                    nt.links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+                            elif socket_name == "Normal":
+                                norm_map = nt.nodes.new('ShaderNodeNormalMap')
+                                nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
+                                nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
+                            elif socket_name != "Alpha": # Alpha is handled with Base Color connection.
+                                target_input_name = {"Emission": "Emission Color"}.get(socket_name, socket_name)
+                                if bsdf.inputs.get(target_input_name):
+                                    nt.links.new(tex_node.outputs['Color'], bsdf.inputs[target_input_name])
                 
-                obj.material_slots[i].material = baked_mat
+                    # Assign the newly created/found baked material to the object's slot.
+                    obj.material_slots[slot_index].material = baked_mat
                 
     def _replace_or_append_on_server(self, context, ingested_usd):
         """
