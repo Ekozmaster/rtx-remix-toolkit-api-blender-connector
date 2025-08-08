@@ -10,6 +10,7 @@ import math
 import re
 import tempfile # <-- ADD THIS LINE
 import uuid     # <-- ADD THIS LINE
+import collections
 from threading import Lock, RLock
 from collections import defaultdict
 
@@ -64,47 +65,53 @@ def setup_render_engine():
     except Exception as e:
         log(f" > ERROR setting up render engine: {e}. Defaulting to CPU.")
         bpy.context.scene.cycles.device = 'CPU'
-
-
-      
-def _get_socket_to_bake(node_tree, target_socket_name):
+     
+def _find_source_socket_recursively(current_node, target_socket_name, visited_nodes):
     """
-    [DEFINITIVE V2 - UNIVERSAL SHADER FINDER]
-    Finds a target socket to bake from, regardless of the shader node setup.
-    It starts from the final Material Output and works backwards to find the
-    main shader, making it compatible with Principled BSDF, custom node
-    groups, or any other setup.
-    """
-    # Find the active Material Output node.
-    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-    if not output_node:
-        log(" > Could not find an active Material Output node.")
-        return None
-
-    # Check if the main 'Surface' input is connected to anything.
-    if not output_node.inputs['Surface'].is_linked:
-        log(" > Material Output node's Surface is not connected to any shader.")
-        return None
-
-    # This is the final shader node connected to the output.
-    # It could be Principled BSDF, a custom group, a Mix Shader, etc.
-    final_shader_node = output_node.inputs['Surface'].links[0].from_node
-
-    # Now, look for the target socket on this final shader node.
-    socket = final_shader_node.inputs.get(target_socket_name)
-    if socket:
-        return socket
-
-    # If not found on the main shader, it might be a direct output (unlikely but possible)
-    socket = output_node.inputs.get(target_socket_name)
-    if socket:
-        return socket
-
-    log(f" > Could not find socket '{target_socket_name}' on the final shader '{final_shader_node.name}'.")
-    return None
-
+    The recursive engine for finding a target socket. It traverses the node
+    graph backwards from the current node.
     
-                     
+    - visited_nodes: A set to prevent getting stuck in infinite loops.
+    """
+    # --- Base Case 1: Success ---
+    # If the current node itself has the target socket, we've found our source.
+    # This is the most common exit point (e.g., we've arrived at a Principled BSDF).
+    if target_socket_name in current_node.inputs:
+        log(f"      - SUCCESS: Found target socket '{target_socket_name}' on node '{current_node.name}'.")
+        return current_node.inputs[target_socket_name]
+
+    # Add the current node to our visited set so we don't process it again in this path.
+    visited_nodes.add(current_node)
+
+    # --- Recursive Step: Traverse backwards ---
+    # Find all inputs on the current node that are of type 'SHADER' and are linked.
+    # These are our paths to trace backwards.
+    shader_inputs_to_trace = [
+        inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked
+    ]
+
+    for shader_input in shader_inputs_to_trace:
+        previous_node = shader_input.links[0].from_node
+
+        # If we've already visited the node we're about to jump to, skip it.
+        if previous_node in visited_nodes:
+            continue
+
+        log(f"      - Traversing from '{current_node.name}' backwards to '{previous_node.name}'...")
+        
+        # Make the recursive call, diving deeper into the graph.
+        found_socket = _find_source_socket_recursively(
+            previous_node, target_socket_name, visited_nodes
+        )
+
+        # If the recursive call found the socket down that path, immediately return it.
+        if found_socket:
+            return found_socket
+
+    # --- Base Case 2: Dead End ---
+    # If we loop through all shader inputs and find nothing, this path is a dead end.
+    return None
+    
 def perform_bake_task(task):
     # ---> THIS IS THE FIX: Read the global number and set the counter <---
     global_num = task.get("global_task_number", task_counter.i + 1)
@@ -118,12 +125,24 @@ def perform_bake_task(task):
         log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}'. Object not found.")
         return False
 
+    original_active_uv_map_name = None
+    if bake_target_obj.data and bake_target_obj.data.uv_layers.active:
+        original_active_uv_map_name = bake_target_obj.data.uv_layers.active.name
+
     try:
+        # --- Start of new UV map handling ---
         if bake_target_obj.data and bake_target_obj.data.uv_layers:
-            if bake_target_obj.data.uv_layers.active_index != 0:
-                bake_target_obj.data.uv_layers.active_index = 0
+            uv_map_for_bake = task.get('uv_layer')
+            if uv_map_for_bake and uv_map_for_bake in bake_target_obj.data.uv_layers:
+                # Set the correct UV map for the bake operation.
+                log(f" > Setting active UV map for '{bake_target_obj_name}' to '{uv_map_for_bake}' for baking.")
+                bake_target_obj.data.uv_layers.active = bake_target_obj.data.uv_layers[uv_map_for_bake]
+            elif uv_map_for_bake:
+                # If a map was specified but not found, warn the user.
+                log(f" > WARNING: Specified bake UV map '{uv_map_for_bake}' not found on '{bake_target_obj_name}'. Using the current active map.")
         else:
             log(f" > WARNING: No UV maps on '{bake_target_obj_name}'.")
+        # --- End of new UV map handling ---
 
         original_mat = next((m for m in bpy.data.materials if m.get("uuid") == task['material_uuid']), None)
         if not original_mat:
@@ -137,7 +156,19 @@ def perform_bake_task(task):
         log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}' !!!")
         log(traceback.format_exc())
         return False
-        
+    finally:
+        # Restore the originally active UV map to avoid side effects on the .blend file.
+        if original_active_uv_map_name and bake_target_obj and bake_target_obj.data:
+             if original_active_uv_map_name in bake_target_obj.data.uv_layers:
+                current_active_map = bake_target_obj.data.uv_layers.active
+                # Only restore if the active map was changed.
+                if not current_active_map or current_active_map.name != original_active_uv_map_name:
+                    try:
+                        log(f" > Restoring original active UV map for '{bake_target_obj_name}' to '{original_active_uv_map_name}'.")
+                        bake_target_obj.data.uv_layers.active = bake_target_obj.data.uv_layers[original_active_uv_map_name]
+                    except Exception as e:
+                        log(f" > WARNING: Could not restore original active UV map on '{bake_target_obj_name}': {e}")
+                        
 def _recover_packed_image_for_bake(image_datablock):
     """
     [DEFINITIVE V2 - ROBUST RECOVERY]
@@ -204,144 +235,661 @@ def _recover_packed_image_for_bake(image_datablock):
     
     # If the image has no valid path AND no data, it's unrecoverable.
     return None
+      
+def _find_bsdf_and_output_nodes(node_tree):
+    """Finds the active Principled BSDF and Material Output nodes."""
+    bsdf_node = next((n for n in node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    if not output_node:
+        output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    return bsdf_node, output_node
 
-def perform_single_bake_operation(obj, original_mat, task):
+def _find_universal_decal_mixer(current_node, end_node, visited_nodes):
+    """The recursive engine for finding an intermediate mix or add shader."""
+    if current_node in visited_nodes or current_node == end_node:
+        return None
+    visited_nodes.add(current_node)
+
+    if current_node.type == 'MIX_SHADER':
+        log(f"      - [Search] SUCCESS: Found Mix Shader '{current_node.name}'.")
+        return (current_node, None)
+
+    if current_node.type == 'GROUP' and current_node.node_tree:
+        log(f"      - [Search] Traversing into Group Node: '{current_node.name}' (Tree: '{current_node.node_tree.name}')")
+        group_tree = current_node.node_tree
+        internal_output = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT' and n.is_active_output), None)
+        if internal_output:
+            shader_input = next((s for s in internal_output.inputs if s.type == 'SHADER' and s.is_linked), None)
+            if shader_input:
+                found_result = _find_universal_decal_mixer(shader_input.links[0].from_node, end_node, visited_nodes)
+                if found_result:
+                    found_node, _ = found_result
+                    log(f"      - [Search] SUCCESS: Found target '{found_node.name}' within group '{current_node.name}'.")
+                    return (found_node, current_node)
+        log(f"      - [Search] Finished traversing group '{current_node.name}'.")
+
+    next_input = next((inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked), None)
+    if next_input:
+        return _find_universal_decal_mixer(next_input.links[0].from_node, end_node, visited_nodes)
+    return None
+
+def _find_intermediate_mix_shader(start_node, end_node, visited_nodes):
     """
-    [DEFINITIVE V43 - CORRECT OPERATOR CALL]
-    This version corrects the embarrassing and repeated TypeError. The bake pass
-    settings (use_pass_color, etc.) are now correctly set on the scene's render
-    bake settings BEFORE calling the operator, as required by the API. This
-    ensures native DIFFUSE bakes execute correctly without crashing.
+    The recursive engine for finding an intermediate mix or add shader.
     """
-    # Define all backup variables BEFORE the try block to prevent NameErrors
+    if start_node == end_node:
+        return None
+    visited_nodes.add(start_node)
+    if start_node.type in {'MIX_SHADER', 'ADD_SHADER'}:
+        return start_node
+    if start_node.type == 'GROUP' and start_node.node_tree:
+        internal_output = next((n for n in start_node.node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+        if internal_output:
+            for grp_input in (i for i in internal_output.inputs if i.type == 'SHADER' and i.is_linked):
+                prev_node = grp_input.links[0].from_node
+                if prev_node not in visited_nodes:
+                    found = _find_intermediate_mix_shader(prev_node, end_node, visited_nodes)
+                    if found:
+                        return found
+    for shader_input in (i for i in start_node.inputs if i.type == 'SHADER' and i.is_linked):
+        prev_node = shader_input.links[0].from_node
+        if prev_node not in visited_nodes:
+            found = _find_intermediate_mix_shader(prev_node, end_node, visited_nodes)
+            if found:
+                return found
+    return None
+
+def _get_socket_to_bake(node_tree, target_socket_name):
+    """
+    [DEFINITIVE V3 - NODE GROUP AWARE] Finds a target socket by recursively
+    traversing the shader graph backwards from the material output. This version
+    is fully aware of node groups and can trace inputs through them.
+    """
+    log(f" > Starting robust recursive search for socket '{target_socket_name}'...")
+
+    # Find the active Material Output node.
+    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    if not output_node:
+        log("   - ERROR: Could not find an active Material Output node.")
+        return None
+
+    # This is the recursive engine.
+    def find_source_recursively(current_node, visited_nodes):
+        # Prevent infinite loops.
+        if current_node in visited_nodes:
+            return None
+        visited_nodes.add(current_node)
+
+        # Base Case 1: Success. The socket is an input on the current node.
+        if target_socket_name in current_node.inputs:
+            log(f"      - SUCCESS: Found target socket '{target_socket_name}' on node '{current_node.name}'.")
+            return current_node.inputs[target_socket_name]
+
+        # Recursive Case 1: The current node is a group. Dive into it.
+        if current_node.type == 'GROUP' and current_node.node_tree:
+            log(f"      - Traversing into Group Node: '{current_node.name}'")
+            group_output_node = next((n for n in current_node.node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+            if group_output_node:
+                # Find the shader input on the group's output node
+                shader_input = next((s for s in group_output_node.inputs if s.type == 'SHADER' and s.is_linked), None)
+                if shader_input:
+                    # Continue the search from the node connected to the group's internal output.
+                    found_socket = find_source_recursively(shader_input.links[0].from_node, visited_nodes)
+                    if found_socket:
+                        return found_socket
+
+        # Recursive Case 2: Traverse backwards through any shader input.
+        for shader_input in (inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked):
+            previous_node = shader_input.links[0].from_node
+            log(f"      - Traversing from '{current_node.name}' backwards to '{previous_node.name}'...")
+            found_socket = find_source_recursively(previous_node, visited_nodes)
+            if found_socket:
+                return found_socket
+
+        # Base Case 2: Dead end.
+        return None
+
+    # Start the search from the node connected to the material output.
+    if not output_node.inputs['Surface'].is_linked:
+        log("   - ERROR: Material Output node's Surface is not connected.")
+        return None
+        
+    start_node = output_node.inputs['Surface'].links[0].from_node
+    log(f"   - Starting search from node: '{start_node.name}'")
+    
+    final_socket = find_source_recursively(start_node, set())
+
+    if final_socket:
+        log(f" > Search complete. Successfully found '{final_socket.name}' on '{final_socket.node.name}'.")
+    else:
+        # --- NEW: Also check the Displacement socket as a final fallback ---
+        if target_socket_name == 'Displacement' and 'Displacement' in output_node.inputs:
+             log(" > Search failed for shader, checking direct Displacement output.")
+             return output_node.inputs['Displacement']
+        log(f" > FINAL WARNING: Robust search could not find a source for '{target_socket_name}'.")
+        
+    return final_socket
+
+
+def _setup_bake_environment(task, obj, original_mat):
+    """
+    Sets up the bake environment, including scene settings, temporary materials, and images.
+    Returns a dictionary containing the setup data and original settings for cleanup.
+    """
     scene = bpy.context.scene
     render_settings = scene.render
     bake_settings = render_settings.bake
     image_settings = render_settings.image_settings
-    
-    original_film_transparent = render_settings.film_transparent
-    original_format = image_settings.file_format
-    original_color_depth = image_settings.color_depth
-    original_compression = image_settings.compression
-    original_use_pass_direct = bake_settings.use_pass_direct
-    original_use_pass_indirect = bake_settings.use_pass_indirect
-    original_use_pass_color = bake_settings.use_pass_color
-    
-    mat_for_bake = None
-    temp_mat_name_for_cleanup = None
+
+    original_settings = {
+        'format': image_settings.file_format,
+        'color_depth': image_settings.color_depth,
+        'compression': image_settings.compression,
+        'film_transparent': render_settings.film_transparent,
+        'original_mat': original_mat,
+        'original_mat_slot_index': -1,
+    }
+
+    with COPY_BAKE_GLOBAL_LOCK:
+        mat_for_bake = original_mat.copy()
+
+    nt = mat_for_bake.node_tree
+    if not nt:
+        raise RuntimeError("Material copy failed.")
+
     original_mat_slot_index = -1
-    img = None
+    for i, slot in enumerate(obj.material_slots):
+        if slot.material == original_mat:
+            slot.material = mat_for_bake
+            original_mat_slot_index = i
+            break
+    if original_mat_slot_index == -1:
+        raise RuntimeError("Could not find original material on object.")
+    original_settings['original_mat_slot_index'] = original_mat_slot_index
+
+    img = bpy.data.images.new(
+        name=f"BakeTarget_{task['material_uuid']}",
+        width=task['resolution_x'], height=task['resolution_y'], alpha=True
+    )
+    img.filepath_raw = task['output_path']
+    image_settings.file_format = 'PNG'
+    is_high_precision = task['bake_type'] == 'NORMAL' or task['target_socket_name'] == 'Displacement'
+    image_settings.color_depth = '16' if is_high_precision else '8'
+    image_settings.compression = 0 if is_high_precision else 15
+
+    # --- FIX #1: Correctly set Non-Color for data maps with a safe default ---
+    # The default for .get() is now False, which is safer.
+    if not task.get('is_color_data', False):
+        img.colorspace_settings.name = 'Non-Color'
+    else:
+        img.colorspace_settings.name = 'sRGB'
+    # --- END OF FIX ---
+
+    tex_node = nt.nodes.new('ShaderNodeTexImage')
+    tex_node.image = img
+    nt.nodes.active, tex_node.select = tex_node, True
+
+    return {
+        "scene": scene,
+        "mat_for_bake": mat_for_bake,
+        "nt": nt,
+        "img": img,
+        "tex_node": tex_node,
+        "original_settings": original_settings,
+    }
     
-    output_node = None
-    original_surface_link = None
-    hijack_nodes = []
+def _bake_base_albedo_pass(setup_data, task, final_mix_shader_original, active_output_node, main_shader_link_from, group_node_instance):
+    """
+    [MODIFIED] Performs Pass 1. If the task is a simple decal composite,
+    it copies the original texture. Otherwise, it bakes the base albedo.
+    """
+    nt = setup_data['nt']
+    img = setup_data['img']
+    render_settings = setup_data['scene'].render
+
+    if task.get("is_simple_decal_composite"):
+        log("   - Pass 1: Copying original base albedo from source texture (simple material).")
+        original_path = task.get("original_base_color_path")
+        if original_path and os.path.exists(original_path):
+            try:
+                source_img = bpy.data.images.load(original_path)
+                if source_img.size[0] != img.size[0] or source_img.size[1] != img.size[1]:
+                    source_img.scale(img.size[0], img.size[1])
+                img.pixels = source_img.pixels[:]
+                bpy.data.images.remove(source_img)
+                log("     - Successfully copied pixels from: %s", os.path.basename(original_path))
+            except Exception as e:
+                log("    - Pass 1 ERROR: Could not load or copy original base color from '%s': %e. Result will be black.", original_path, e)
+                img.pixels = [0.0] * len(img.pixels)
+        else:
+            log("    - Pass 1 WARNING: Original base color path was not provided or not found. Result will be black.")
+            img.pixels = [0.0] * len(img.pixels)
+        return
+
+    log("   - Pass 1: Baking Base Albedo (Opaque) using EMIT to: %s", os.path.basename(task['output_path']))
+    base_shader_input = final_mix_shader_original.inputs[1]
+    pass1_cleanup = {'link': None, 'group_instance': None, 'original_tree': None, 'temp_tree': None, 'emission_node': None}
+    
+    try:
+        if active_output_node.inputs['Surface'].is_linked:
+            nt.links.remove(active_output_node.inputs['Surface'].links[0])
+        
+        if base_shader_input.is_linked:
+            base_shader_socket = base_shader_input.links[0].from_socket
+            
+            if group_node_instance:
+                original_tree = group_node_instance.node_tree
+                temp_tree = original_tree.copy()
+                group_node_instance.node_tree = temp_tree
+                pass1_cleanup.update({'group_instance': group_node_instance, 'original_tree': original_tree, 'temp_tree': temp_tree})
+                base_node_in_copy = temp_tree.nodes.get(base_shader_socket.node.name)
+                base_socket_in_copy = base_node_in_copy.outputs[base_shader_socket.name]
+                group_output = next(n for n in temp_tree.nodes if n.type == 'GROUP_OUTPUT')
+                shader_output = next(s for s in group_output.inputs if s.type == 'SHADER')
+                for link in list(shader_output.links):
+                    temp_tree.links.remove(link)
+                temp_tree.links.new(base_socket_in_copy, shader_output)
+                nt.links.new(main_shader_link_from, active_output_node.inputs['Surface'])
+            else:
+                nt.links.new(base_shader_socket, active_output_node.inputs['Surface'])
+            
+            socket_to_bake = _get_socket_to_bake(nt, "Base Color")
+
+            if socket_to_bake:
+                emission_node = nt.nodes.new('ShaderNodeEmission')
+                pass1_cleanup['emission_node'] = emission_node
+
+                if active_output_node.inputs['Surface'].is_linked:
+                    nt.links.remove(active_output_node.inputs['Surface'].links[0])
+
+                if socket_to_bake.is_linked:
+                    nt.links.new(socket_to_bake.links[0].from_socket, emission_node.inputs['Color'])
+                else:
+                    emission_node.inputs['Color'].default_value = socket_to_bake.default_value
+                
+                pass1_cleanup['link'] = nt.links.new(emission_node.outputs['Emission'], active_output_node.inputs['Surface'])
+                
+                render_settings.film_transparent = False
+                
+                # --- FIX: Select and activate the object before baking ---
+                obj = bpy.data.objects.get(task['object_name'])
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.bake(type='EMIT', use_clear=True, margin=16)
+                # --- END OF FIX ---
+            else:
+                log("    - Pass 1 WARNING: Could not find 'Base Color' socket. Bake for this pass will be black.")
+                img.pixels = [0.0] * len(img.pixels)
+    finally:
+        if pass1_cleanup.get('link'): nt.links.remove(pass1_cleanup['link'])
+        if pass1_cleanup.get('emission_node') and pass1_cleanup['emission_node'].name in nt.nodes: nt.nodes.remove(pass1_cleanup['emission_node'])
+        if pass1_cleanup.get('group_instance'): pass1_cleanup['group_instance'].node_tree = pass1_cleanup['original_tree']
+        if pass1_cleanup.get('temp_tree'): bpy.data.node_groups.remove(pass1_cleanup['temp_tree'])
+
+def _flip_uvs_horizontally(obj):
+    """
+    Directly manipulates the UV data of an object to flip it horizontally.
+    This is more robust than using bpy.ops.
+    """
+    if not obj or obj.type != 'MESH':
+        log(" > WARNING: Cannot flip UVs, object is not a mesh.")
+        return
+
+    mesh = obj.data
+    if not mesh.uv_layers:
+        log(" > WARNING: Cannot flip UVs, no UV layers found on the object.")
+        return
+
+    # Use the active UV layer for rendering
+    uv_layer = mesh.uv_layers.active
+    if not uv_layer:
+        log(" > WARNING: No active UV layer to flip.")
+        return
+
+    log("   - Flipping UVs horizontally via direct data access...")
+    for uv_data in uv_layer.data:
+        # Flip the U coordinate (the first component of the uv vector)
+        uv_data.uv[0] = 1.0 - uv_data.uv[0]
+    log("   - UV flip complete.")
+
+
+def _bake_decal_albedo_pass(setup_data, task, decal_albedo_path, final_mix_shader_original, active_output_node, main_shader_link_from, group_node_instance):
+    """Performs Pass 2 of the 3-pass bake: Decal Albedo."""
+    log("   - Pass 2: Baking Decal Albedo (Transparent) to: %s", os.path.basename(decal_albedo_path))
+    nt = setup_data['nt']
+    tex_node = setup_data['tex_node']
+    render_settings = setup_data['scene'].render
+    obj = bpy.data.objects.get(task['object_name'])
+
+    decal_shader_input = final_mix_shader_original.inputs[2]
+    decal_albedo_img = bpy.data.images.new(name="DecalAlbedo", width=task['resolution_x'], height=task['resolution_y'], alpha=True)
+    decal_albedo_img.filepath_raw = decal_albedo_path
+    tex_node.image = decal_albedo_img
+    pass2_cleanup = {'link': None, 'group_instance': None, 'original_tree': None, 'temp_tree': None}
 
     try:
-        mat_for_bake = original_mat.copy()
-        temp_mat_name_for_cleanup = mat_for_bake.name
-        nt = mat_for_bake.node_tree
-        if not nt: raise RuntimeError("Material copy failed.")
-        
-        for i, slot in enumerate(obj.material_slots):
-            if slot.material == original_mat:
-                slot.material = mat_for_bake
-                original_mat_slot_index = i; break
-        if original_mat_slot_index == -1: raise RuntimeError("Could not find original material on object.")
+        # Flip UVs horizontally using the robust method
+        _flip_uvs_horizontally(obj)
 
-        uv_layer_name_from_task = task.get('uv_layer')
-        if uv_layer_name_from_task and uv_layer_name_from_task in obj.data.uv_layers:
-            obj.data.uv_layers.active = obj.data.uv_layers[uv_layer_name_from_task]
-
-        img = bpy.data.images.new(name=f"BakeTarget_{task['material_uuid']}", width=task['resolution_x'], height=task['resolution_y'], alpha=True)
-        img.filepath_raw = task['output_path']
-        
-        image_settings.file_format = 'PNG'
-        is_high_precision = task['bake_type'] == 'NORMAL' or task['target_socket_name'] == 'Displacement'
-        if is_high_precision:
-            image_settings.color_depth, image_settings.compression = '16', 0
-        else:
-            image_settings.color_depth, image_settings.compression = '8', 15
-        if not task.get('is_color_data', False):
-            img.colorspace_settings.name = 'Non-Color'
-
-        tex_node = nt.nodes.new('ShaderNodeTexImage')
-        tex_node.image = img
-        nt.nodes.active, tex_node.select = tex_node, True
-        hijack_nodes.append(tex_node)
-        
-        bake_type = task['bake_type']
-        bake_args = {'use_clear': True, 'margin': 16, 'type': bake_type}
-
-        if bake_type == 'EMIT':
-            log(f" > Setting up EMIT hijack for: {task['target_socket_name']}.")
-            output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-            if output_node and output_node.inputs['Surface'].is_linked:
-                original_surface_link = output_node.inputs['Surface'].links[0]
-            
-            socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
-            if not socket_to_bake: 
-                log(f" > WARNING: Could not find socket '{task['target_socket_name']}' to bake. Skipping this task.")
-                return 
-
-            emission_node = nt.nodes.new('ShaderNodeEmission')
-            hijack_nodes.append(emission_node)
-            if socket_to_bake.is_linked:
-                source_socket = socket_to_bake.links[0].from_socket
-                if task.get('is_value_bake'): nt.links.new(source_socket, emission_node.inputs['Strength'])
-                else: nt.links.new(source_socket, emission_node.inputs['Color'])
+        if decal_shader_input.is_linked:
+            decal_shader_socket = decal_shader_input.links[0].from_socket
+            if group_node_instance:
+                original_tree = group_node_instance.node_tree
+                temp_tree = original_tree.copy()
+                group_node_instance.node_tree = temp_tree
+                pass2_cleanup.update({'group_instance': group_node_instance, 'original_tree': original_tree, 'temp_tree': temp_tree})
+                decal_node_in_copy = temp_tree.nodes.get(decal_shader_socket.node.name)
+                decal_socket_in_copy = decal_node_in_copy.outputs[decal_shader_socket.name]
+                group_output = next(n for n in temp_tree.nodes if n.type == 'GROUP_OUTPUT')
+                shader_output = next(s for s in group_output.inputs if s.type == 'SHADER')
+                for link in list(shader_output.links):
+                    temp_tree.links.remove(link)
+                temp_tree.links.new(decal_socket_in_copy, shader_output)
+                nt.links.new(main_shader_link_from, active_output_node.inputs['Surface'])
             else:
-                default_val = socket_to_bake.default_value
-                if task.get('is_value_bake'):
-                    final_value = sum(default_val) / len(default_val) if hasattr(default_val, '__len__') and len(default_val) > 0 else float(default_val)
-                    emission_node.inputs['Strength'].default_value = final_value
-                else:
-                    emission_node.inputs['Color'].default_value = default_val
+                nt.links.new(decal_shader_socket, active_output_node.inputs['Surface'])
+            pass2_cleanup['link'] = active_output_node.inputs['Surface'].links[0]
+
+            render_settings.film_transparent = True
             
-            if output_node:
-                if original_surface_link: nt.links.remove(original_surface_link)
-                nt.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
+            # --- FIX: Select and activate the object before baking ---
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.bake(type='DIFFUSE', use_clear=True, margin=16)
+            # --- END OF FIX ---
+    finally:
+        # Flip UVs back to their original state
+        _flip_uvs_horizontally(obj)
+
+        if pass2_cleanup['link']: nt.links.remove(pass2_cleanup['link'])
+        if pass2_cleanup['group_instance']: pass2_cleanup['group_instance'].node_tree = pass2_cleanup['original_tree']
+        if pass2_cleanup['temp_tree']: bpy.data.node_groups.remove(pass2_cleanup['temp_tree'])
+
+    return decal_albedo_img
+
+def _bake_decal_alpha_mask_pass(setup_data, task, decal_alpha_mask_path, final_mix_shader_original, active_output_node, main_shader_link_from, group_node_instance):
+    """Performs Pass 3 of the 3-pass bake: Decal Alpha Mask."""
+    log("   - Pass 3: Baking Decal Alpha Mask to: %s", os.path.basename(decal_alpha_mask_path))
+    nt = setup_data['nt']
+    tex_node = setup_data['tex_node']
+    render_settings = setup_data['scene'].render
+
+    fac_socket = final_mix_shader_original.inputs['Fac']
+    decal_alpha_img = bpy.data.images.new(name="DecalAlpha", width=task['resolution_x'], height=task['resolution_y'], alpha=False)
+    decal_alpha_img.filepath_raw = decal_alpha_mask_path
+    decal_alpha_img.colorspace_settings.name = 'Non-Color'
+    tex_node.image = decal_alpha_img
+    pass3_cleanup = {'link': None, 'emission_node_name': None, 'group_instance': None, 'original_tree': None, 'temp_tree': None}
+
+    try:
+        if fac_socket.is_linked:
+            fac_source_socket = fac_socket.links[0].from_socket
+            local_nt = nt
+            source_socket_to_use = fac_source_socket
+            if group_node_instance:
+                original_tree = group_node_instance.node_tree
+                temp_tree = original_tree.copy()
+                group_node_instance.node_tree = temp_tree
+                local_nt = temp_tree
+                pass3_cleanup.update({'group_instance': group_node_instance, 'original_tree': original_tree, 'temp_tree': temp_tree})
+                node_in_copy = local_nt.nodes.get(fac_source_socket.node.name)
+                source_socket_to_use = node_in_copy.outputs[fac_source_socket.name]
+
+            emission_node = local_nt.nodes.new('ShaderNodeEmission')
+            pass3_cleanup['emission_node_name'] = emission_node.name
+            local_nt.links.new(source_socket_to_use, emission_node.inputs['Color'])
+            
+            if group_node_instance:
+                group_output = next(n for n in local_nt.nodes if n.type == 'GROUP_OUTPUT')
+                shader_output = next(s for s in group_output.inputs if s.type == 'SHADER')
+                for link in list(shader_output.links):
+                    local_nt.links.remove(link)
+                local_nt.links.new(emission_node.outputs['Emission'], shader_output)
+                nt.links.new(main_shader_link_from, active_output_node.inputs['Surface'])
+            else:
+                nt.links.new(emission_node.outputs['Emission'], active_output_node.inputs['Surface'])
+            pass3_cleanup['link'] = active_output_node.inputs['Surface'].links[0]
+            
+            render_settings.film_transparent = True
+            
+            # --- FIX: Select and activate the object before baking ---
+            obj = bpy.data.objects.get(task['object_name'])
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.bake(type='EMIT', use_clear=True, margin=16)
+            # --- END OF FIX ---
+    finally:
+        if pass3_cleanup['link']: nt.links.remove(pass3_cleanup['link'])
+        if pass3_cleanup['group_instance']: pass3_cleanup['group_instance'].node_tree = pass3_cleanup['original_tree']
+        if pass3_cleanup['temp_tree']: bpy.data.node_groups.remove(pass3_cleanup['temp_tree'])
+        elif pass3_cleanup['emission_node_name']:
+            node_to_remove = nt.nodes.get(pass3_cleanup['emission_node_name'])
+            if node_to_remove: nt.nodes.remove(node_to_remove)
+
+    return decal_alpha_img
+
+def _composite_decal_bakes(img, decal_albedo_img, decal_alpha_img):
+    """Composites the baked decal layers into the final albedo."""
+    try:
+        log("   - Compositing decal over base albedo with corrected alpha...")
+
+        # Manually flip the decal albedo image horizontally.
+        log("     - Flipping decal albedo bake horizontally...")
+        width, height = decal_albedo_img.size
+        pixels = list(decal_albedo_img.pixels)
+        flipped_pixels = [0.0] * len(pixels)
+        components = 4 # RGBA
+
+        for y in range(height):
+            for x in range(width):
+                source_idx = (y * width + x) * components
+                dest_idx = (y * width + (width - 1 - x)) * components
+                flipped_pixels[dest_idx:dest_idx + components] = pixels[source_idx:source_idx + components]
+
+        decal_albedo_img.pixels[:] = flipped_pixels
+        log("     - Flip complete.")
+
+        # Ensure pixel caches are up-to-date before proceeding
+        img.pixels[0]
+        decal_albedo_img.pixels[0]
+        decal_alpha_img.pixels[0]
+
+        total_pixels = width * height
         
-        else:
-            log(f" > Using native bake pass '{bake_type}'.")
-            # --- THIS IS THE FIX ---
-            # Set the bake pass properties on the context, NOT in the operator call.
-            if bake_type == 'DIFFUSE':
-                bake_settings.use_pass_direct = False
-                bake_settings.use_pass_indirect = False
-                bake_settings.use_pass_color = True
+        base_pixels = list(img.pixels)
+        decal_pixels = list(decal_albedo_img.pixels)
+        alpha_mask_pixels = list(decal_alpha_img.pixels) 
         
-        bpy.ops.object.select_all(action='DESELECT')
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-        log(" > CALLING BAKE with args: %s", bake_args)
-        bpy.ops.object.bake(**bake_args)
+        final_decal_pixels = list(decal_pixels)
+
+        for i in range(total_pixels):
+            rgba_idx = i * 4
+            mask_idx = i * 4 
+            final_alpha = alpha_mask_pixels[mask_idx]
+
+            for c in range(3):
+                base_val = base_pixels[rgba_idx + c]
+                decal_val = decal_pixels[rgba_idx + c]
+                base_pixels[rgba_idx + c] = base_val * (1.0 - final_alpha) + decal_val * final_alpha
+            
+            base_pixels[rgba_idx + 3] = 1.0
+            final_decal_pixels[rgba_idx + 3] = final_alpha
+
+        log("     - Saving final composite albedo: %s", os.path.basename(img.filepath_raw))
+        img.pixels[:] = base_pixels
         img.save()
+        
+        log("     - Saving decal albedo with correct alpha: %s", os.path.basename(decal_albedo_img.filepath_raw))
+        decal_albedo_img.pixels[:] = final_decal_pixels
+        decal_albedo_img.save()
+        
+        log("     - Saving decal alpha mask: %s", os.path.basename(decal_alpha_img.filepath_raw))
+        decal_alpha_img.save()
+        
+        log("   - Compositing complete.")
+    except Exception as e:
+        log(f"!!! ERROR during corrected compositing: {e}")
+        log(traceback.format_exc())
+        img.save()
+        decal_albedo_img.save()
+        decal_alpha_img.save()
+
+def _perform_simple_bake(setup_data, task, active_output_node):
+    """
+    [CORRECTED] Performs a simple, single-pass bake with proper handling for
+    different bake types and robust cleanup.
+    """
+    nt = setup_data['nt']
+    img = setup_data['img']
+    obj = bpy.data.objects.get(task['object_name'])
+    bake_type = task['bake_type']
+
+    if bake_type == 'EMIT':
+        log(f" > Performing EMIT bake for socket '{task['target_socket_name']}'...")
+        socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
+
+        if not socket_to_bake:
+            log(f" > SIMPLE BAKE WARNING: Could not find socket '{task['target_socket_name']}'. Skipping.")
+            return
+
+        # --- THIS IS THE FIX FOR THE ReferenceError ---
+        # Store the sockets themselves, NOT the link object.
+        original_from_socket = None
+        original_to_socket = None
+        if active_output_node and active_output_node.inputs['Surface'].is_linked:
+            link = active_output_node.inputs['Surface'].links[0]
+            original_from_socket, original_to_socket = link.from_socket, link.to_socket
+            nt.links.remove(link)
+        # --- END OF FIX ---
+
+        emission_node = nt.nodes.new('ShaderNodeEmission')
+        try:
+            if socket_to_bake.is_linked:
+                nt.links.new(socket_to_bake.links[0].from_socket, emission_node.inputs['Color' if not task.get('is_value_bake') else 'Strength'])
+            else:
+                input_socket = emission_node.inputs['Color' if not task.get('is_value_bake') else 'Strength']
+                input_socket.default_value = socket_to_bake.default_value
+
+            if active_output_node:
+                nt.links.new(emission_node.outputs['Emission'], active_output_node.inputs['Surface'])
+            
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            
+            bpy.ops.object.bake(type='EMIT', use_clear=True, margin=16)
+            img.save()
+
+        finally:
+            # Cleanup the hijack
+            nt.nodes.remove(emission_node)
+            # Restore the connection using the safely stored sockets.
+            if original_from_socket and original_to_socket:
+                nt.links.new(original_from_socket, original_to_socket)
+    else:
+        log(f" > Performing NATIVE bake for type '{bake_type}'...")
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.bake(type=bake_type, use_clear=True, margin=16)
+        img.save()
+
+def perform_single_bake_operation(obj, original_mat, task):
+    """
+    Orchestrates the entire bake operation for a single task,
+    choosing between a 3-pass decal bake or a simple bake.
+    """
+    setup_data = None
+    decal_albedo_img = None
+    decal_alpha_img = None
+
+    try:
+        setup_data = _setup_bake_environment(task, obj, original_mat)
+        nt = setup_data['nt']
+
+        target_socket_name = task['target_socket_name']
+        bsdf_node, active_output_node = _find_bsdf_and_output_nodes(nt)
+        
+        found_decal_info = None
+        if bsdf_node and active_output_node and active_output_node.inputs['Surface'].is_linked:
+            start_node = active_output_node.inputs['Surface'].links[0].from_node
+            # Assuming _find_universal_decal_mixer is defined elsewhere as requested
+            found_decal_info = _find_universal_decal_mixer(start_node, bsdf_node, set())
+        
+        if target_socket_name == "Base Color" and found_decal_info:
+            log(" > Complex decal setup detected. Initiating 3-Pass Bake.")
+            base, ext = os.path.splitext(task['output_path'])
+            decal_albedo_path = f"{base}_decal{ext}"
+            decal_alpha_mask_path = f"{base}_decal_alpha{ext}"
+
+            final_mix_shader_original, group_node_instance = found_decal_info
+            
+            main_shader_link_from, main_shader_link_to = None, None
+            if active_output_node.inputs['Surface'].is_linked:
+                main_link = active_output_node.inputs['Surface'].links[0]
+                main_shader_link_from = main_link.from_socket
+                main_shader_link_to = main_link.to_socket
+            else:
+                raise RuntimeError("Material Output has no input link for bake.")
+
+            # --- Execute 3-Pass Bake ---
+            _bake_base_albedo_pass(setup_data, task, final_mix_shader_original, active_output_node, main_shader_link_from, group_node_instance)
+            decal_albedo_img = _bake_decal_albedo_pass(setup_data, task, decal_albedo_path, final_mix_shader_original, active_output_node, main_shader_link_from, group_node_instance)
+            decal_alpha_img = _bake_decal_alpha_mask_pass(setup_data, task, decal_alpha_mask_path, final_mix_shader_original, active_output_node, main_shader_link_from, group_node_instance)
+
+            # --- Restore original main shader link ---
+            if main_shader_link_from and main_shader_link_to:
+                # Ensure no other link is present before creating the new one
+                if active_output_node.inputs['Surface'].is_linked:
+                    nt.links.remove(active_output_node.inputs['Surface'].links[0])
+                nt.links.new(main_shader_link_from, main_shader_link_to)
+            
+            _composite_decal_bakes(setup_data['img'], decal_albedo_img, decal_alpha_img)
+
+        else:
+            _perform_simple_bake(setup_data, task, active_output_node)
+
         log(" > Bake successful.")
 
+    except Exception as e:
+        log(f"!!! BAKE TASK FAILED for '{obj.name}' during operation !!!")
+        log(traceback.format_exc())
+        raise e
     finally:
-        # Restore all settings correctly
-        render_settings.film_transparent = original_film_transparent
-        image_settings.file_format = original_format
-        image_settings.color_depth = original_color_depth
-        image_settings.compression = original_compression
-        bake_settings.use_pass_direct = original_use_pass_direct
-        bake_settings.use_pass_indirect = original_use_pass_indirect
-        bake_settings.use_pass_color = original_use_pass_color
+        # --- Cleanup ---
+        if setup_data:
+            render_settings = setup_data['scene'].render
+            image_settings = setup_data['scene'].render.image_settings
+            original_settings = setup_data['original_settings']
+            
+            image_settings.file_format = original_settings['format']
+            image_settings.color_depth = original_settings['color_depth']
+            image_settings.compression = original_settings['compression']
+            render_settings.film_transparent = original_settings['film_transparent']
 
-        if 'nt' in locals() and nt and output_node:
-            if original_surface_link and not output_node.inputs['Surface'].is_linked:
-                try: nt.links.new(original_surface_link.from_socket, output_node.inputs['Surface'])
-                except Exception: pass
-            for node in hijack_nodes:
-                if node and node.name in nt.nodes: nt.nodes.remove(node)
-        
-        if obj and original_mat_slot_index != -1:
-            try: obj.material_slots[original_mat_slot_index].material = original_mat
-            except Exception: pass
-        
-        mat_to_clean = bpy.data.materials.get(temp_mat_name_for_cleanup)
-        if mat_to_clean: bpy.data.materials.remove(mat_to_clean, do_unlink=True)
-        if img and img.name in bpy.data.images: bpy.data.images.remove(img)
+            if obj and original_settings['original_mat_slot_index'] != -1:
+                try:
+                    obj.material_slots[original_settings['original_mat_slot_index']].material = original_settings['original_mat']
+                except Exception:
+                    pass
+            
+            if 'nt' in setup_data and 'tex_node' in setup_data and setup_data['nt'].nodes.get(setup_data['tex_node'].name):
+                setup_data['nt'].nodes.remove(setup_data['nt'].nodes.get(setup_data['tex_node'].name))
+            
+            mat_to_clean = bpy.data.materials.get(setup_data['mat_for_bake'].name)
+            if mat_to_clean:
+                bpy.data.materials.remove(mat_to_clean, do_unlink=True)
+
+            if setup_data.get('img') and setup_data['img'].name in bpy.data.images:
+                bpy.data.images.remove(setup_data['img'])
+
+        if decal_albedo_img and decal_albedo_img.name in bpy.data.images:
+            bpy.data.images.remove(decal_albedo_img)
+        if decal_alpha_img and decal_alpha_img.name in bpy.data.images:
+            bpy.data.images.remove(decal_alpha_img)
 
 def persistent_worker_loop():
     """Main loop for the worker. Includes PID in all stdout messages."""
