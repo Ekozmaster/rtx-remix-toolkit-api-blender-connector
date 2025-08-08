@@ -5003,83 +5003,79 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _finalize_export(self, context):
         """
-        [DEFINITIVE V12 - Composite Aware]
-        Handles the final steps of the export. Now includes logic to find and
-        combine the separate RGB and Alpha bakes into final RGBA textures
-        for complex materials like those with decals.
+        [DEFINITIVE V13 - Atlas UV & Composite Aware Finalization]
+        Handles the final steps of the export. This is the complete workflow that:
+        1. Combines baked textures that require it (e.g., color + alpha).
+        2. Populates the session cache with newly baked textures.
+        3. Delegates material preparation to a helper function which handles UDIM stitching,
+           baked material creation, and assignment.
+        4. Applies final export transformations like mirroring and normal flipping.
+        5. Sets the correct 'remix_atlas_uv' map for UDIM-stitched objects before export.
+        6. Manages the entire API upload and server communication process.
+        7. Restores the state of modified UV maps after completion.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
+        # This dictionary will track any UV maps we change so we can restore them
         original_active_uvs = {}
 
         try:
-            logging.info("--- Finalizing Export (Composite Aware) ---")
+            logging.info("--- Finalizing Export (Composite & Atlas Aware) ---")
             bake_info = self._export_data.get('bake_info', {})
 
-            # --- COMBINE COMPOSITE BAKES ---
+            # --- PHASE 1: TEXTURE COMPOSITING & CACHING ---
             if bake_info and bake_info.get('tasks'):
                 logging.info("Checking for composite bakes to combine...")
                 tasks = bake_info.get('tasks', [])
-                # Find all the base color maps that were baked
                 color_maps_to_check = {
                     task['output_path'] for task in tasks if task.get('target_socket_name') == 'Base Color'
                 }
-
                 for color_path in color_maps_to_check:
                     base, ext = os.path.splitext(color_path)
-                    # Look for the corresponding alpha mask created by the new bake logic
                     expected_alpha_path = f"{base}_alpha_mask{ext}"
                     if os.path.exists(expected_alpha_path):
                         self._combine_color_and_alpha(color_path, expected_alpha_path)
-            # --- END OF COMBINATION LOGIC ---
 
-            # --- CACHE POPULATION ---
-            if bake_info and bake_info.get('tasks'):
                 logging.info("Updating global material cache with newly baked textures...")
-                for task in bake_info['tasks']:
+                for task in bake_info.get('tasks', []):
                     mat_hash = task.get('material_hash')
                     socket_name = task.get('target_socket_name')
                     output_path = task.get('output_path')
-
                     if mat_hash and socket_name and os.path.exists(output_path):
                         if mat_hash not in global_material_hash_cache:
                             global_material_hash_cache[mat_hash] = {}
                         global_material_hash_cache[mat_hash][socket_name] = output_path
                 logging.info(f"Global cache now contains {len(global_material_hash_cache)} unique materials.")
 
-            # --- REST OF THE EXPORT PROCESS ---
+            # --- PHASE 2: MATERIAL PREPARATION ---
+            # This function now handles all the complex logic of UDIM stitching,
+            # baked material creation, and assignment.
+            self._prepare_materials_for_export(context, objects_to_process=self._export_data["objects_for_export"])
+
+            # --- PHASE 3: GEOMETRY PREPARATION ---
             final_meshes_for_obj = self._export_data.get("objects_for_export", [])
             if not final_meshes_for_obj:
-                raise RuntimeError("Final object list for export is empty.")
+                raise RuntimeError("Final object list for export is empty after processing.")
 
-            needs_material_prep = bake_info.get('tasks') or bake_info.get('cached_materials') or bake_info.get('udim_materials')
-            if needs_material_prep:
-                logging.info("Preparing materials for final OBJ export...")
-                self._prepare_materials_for_export(context, objects_to_process=final_meshes_for_obj)
-            else:
-                logging.info(" > No bakes or cached materials found. Exporting with original materials.")
-
-            # --- NEW MIRROR LOGIC ---
             if addon_prefs.mirror_on_export:
                 logging.info("Applying 'Mirror on Export' to final export meshes.")
                 batch_mirror_objects_optimized(final_meshes_for_obj, context)
                 self._export_data["was_mirrored_on_export"] = True
-            # --- END NEW MIRROR LOGIC ---
 
             if addon_prefs.flip_faces_export:
                 logging.info("Applying 'Flip Normals' to final export meshes.")
                 batch_flip_normals_optimized(final_meshes_for_obj, context)
                 self._export_data["normals_were_flipped"] = True
 
+            # --- PHASE 4: FILE EXPORT ---
             base_name, asset_number = get_asset_number(context)
             obj_filename = f"{base_name}_{asset_number}.obj"
 
             base_finalize_path = CUSTOM_FINALIZE_PATH
             os.makedirs(base_finalize_path, exist_ok=True)
-
             temp_dir_name = f"{TEMP_DIR_PREFIX}{base_name}_{asset_number}_{uuid.uuid4().hex[:8]}"
             temp_asset_dir = os.path.join(base_finalize_path, temp_dir_name)
             os.makedirs(temp_asset_dir, exist_ok=True)
-    
+
             try:
                 with open(os.path.join(temp_asset_dir, 'blender.lock'), 'w') as f:
                     f.write(str(os.getpid()))
@@ -5089,7 +5085,7 @@ class OBJECT_OT_export_and_ingest(Operator):
             self._export_data["temp_files_to_clean"].add(temp_asset_dir)
             exported_obj_path = os.path.join(temp_asset_dir, obj_filename)
 
-            logging.info("Preparing selection for OBJ exporter...")
+            logging.info("Preparing selection and UV maps for OBJ exporter...")
             bpy.ops.object.select_all(action='DESELECT')
             selectable_meshes = [obj for obj in final_meshes_for_obj if obj and obj.name in context.view_layer.objects]
             if not selectable_meshes:
@@ -5098,11 +5094,17 @@ class OBJECT_OT_export_and_ingest(Operator):
                 obj.select_set(True)
             context.view_layer.objects.active = selectable_meshes[0]
 
+            # CRITICAL FIX: Ensure any object with a stitched material uses the atlas UV map
             for obj in final_meshes_for_obj:
-                if obj.data and "remix_atlas_uv" in obj.data.uv_layers:
-                     if obj.data.uv_layers.active:
-                         original_active_uvs[obj.name] = obj.data.uv_layers.active.name
-                     obj.data.uv_layers.active = obj.data.uv_layers["remix_atlas_uv"]
+                uses_stitched_material = any(
+                    slot.material and slot.material.name.endswith("__UDIM_STITCHED") 
+                    for slot in obj.material_slots
+                )
+                if uses_stitched_material and obj.data and "remix_atlas_uv" in obj.data.uv_layers:
+                    if obj.data.uv_layers.active:
+                        original_active_uvs[obj.name] = obj.data.uv_layers.active.name
+                    obj.data.uv_layers.active = obj.data.uv_layers["remix_atlas_uv"]
+                    logging.info(f"  > Set active UV map to 'remix_atlas_uv' for '{obj.name}' for export.")
 
             logging.info(f" > Exporting {len(context.selected_objects)} objects to OBJ...")
             bpy.ops.wm.obj_export(
@@ -5114,6 +5116,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
 
+            # --- PHASE 5: API UPLOAD AND SERVER COMMUNICATION ---
             ingested_usd = upload_to_api(exported_obj_path, addon_prefs.remix_ingest_directory, context)
             if not ingested_usd:
                 raise RuntimeError("API upload failed.")
@@ -5126,16 +5129,26 @@ class OBJECT_OT_export_and_ingest(Operator):
                 handle_special_texture_assignments(self, context, final_reference_prim, export_data=self._export_data)
 
         except Exception as e:
+            # If any step in the finalization fails, log it and report to the user.
+            # The main cleanup will still run because this is in a try...except block.
             logging.error(f"Export finalization failed: {e}", exc_info=True)
             self.report({'ERROR'}, f"Finalization failed: {e}")
+            # Re-raise the exception to ensure the calling function knows it failed
+            raise RuntimeError(f"API upload failed.") from e
 
         finally:
+            # This block will run whether the export succeeds or fails.
+            # It's crucial for restoring Blender to its original state.
             if original_active_uvs:
+                logging.debug("Restoring original UV map assignments...")
                 for obj_name, original_map_name in original_active_uvs.items():
                     obj = bpy.data.objects.get(obj_name)
                     if obj and obj.data and original_map_name in obj.data.uv_layers:
-                        obj.data.uv_layers.active = obj.data.uv_layers[original_map_name]
-                    
+                        try:
+                            obj.data.uv_layers.active = obj.data.uv_layers[original_map_name]
+                        except Exception as e_uv:
+                            logging.warning(f"Could not restore UV map for '{obj_name}': {e_uv}")
+                        
     def _find_ultimate_source_node(self, start_socket):
         """
         [IMPROVED & RENAMED] Traces back from a socket to find the ultimate source node.
@@ -5179,144 +5192,132 @@ class OBJECT_OT_export_and_ingest(Operator):
           
     def _bake_udim_material_to_atlas(self, context, mat, objects_using_mat, bake_dir):
         """
-        [FROM ADDON 2 - ADAPTED FOR ADDON 1]
-        Stitches existing UDIM tiles into a new atlas texture. This does NOT bake,
-        it combines the source images directly. It has been adapted to integrate
-        with Addon 1's more advanced special texture handling.
+        [NEW HELPER FUNCTION]
+        Stitches UDIM tiles into new atlas textures for each relevant channel.
+        It creates a new material set up to use these atlases on the 'remix_atlas_uv' map.
+        Returns the newly created material.
         """
+        if not PILLOW_INSTALLED:
+            self.report({'ERROR'}, "Pillow dependency not installed, cannot stitch UDIMs.")
+            return None
         if not mat or not mat.use_nodes:
-            return None, None
+            return None
+        
+        from PIL import Image
+
         logging.info(f"--- Starting UDIM Stitch for Material: '{mat.name}' ---")
-        
+    
         bake_info = self._export_data.get('bake_info', {})
-        
+    
+        # Find the main shader and output nodes
         bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
         output_node = next((n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL"), None)
         if not bsdf or not output_node:
-            logging.warning(f"No Principled BSDF or Material Output found in '{mat.name}'. Cannot stitch.")
-            return mat, None
+            logging.warning(f"No Principled BSDF or Material Output in '{mat.name}'. Cannot stitch.")
+            return None
 
-        udim_jobs = collections.defaultdict(list)
-        sockets_to_check = list(bsdf.inputs) + [output_node.inputs['Displacement']]
-        for socket in sockets_to_check:
+        # Group all sockets by the UDIM texture node that drives them
+        udim_jobs = defaultdict(list)
+        all_sockets_to_check = list(bsdf.inputs) + [output_node.inputs['Displacement']]
+        for socket in all_sockets_to_check:
             if not socket.is_linked: continue
-            # Use Addon 1's more robust node finding function
             source_node = self._find_ultimate_source_node(socket)
             if source_node and source_node.image and source_node.image.source == 'TILED':
                 udim_jobs[source_node].append(socket.name)
 
         if not udim_jobs:
-            logging.info(f"No UDIM textures found to stitch for material '{mat.name}'.")
-            return mat, None
+            logging.info(f"No UDIM textures found to stitch for '{mat.name}'.")
+            return None
 
-        final_stitched_mat = bpy.data.materials.new(name=f"{mat.name}__UDIM_STITCHED")
+        # --- Create the new material that will hold the stitched results ---
+        stitched_mat_name = f"{mat.name}__UDIM_STITCHED"
+        final_stitched_mat = bpy.data.materials.new(name=stitched_mat_name)
         self._export_data["temp_materials_for_cleanup"].append(final_stitched_mat)
-        
+    
         final_stitched_mat.use_nodes = True
         nt = final_stitched_mat.node_tree
         for node in nt.nodes: nt.nodes.remove(node)
-        
+    
         new_bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
         new_mat_output = nt.nodes.new('ShaderNodeOutputMaterial')
         nt.links.new(new_bsdf.outputs['BSDF'], new_mat_output.inputs['Surface'])
-        
+    
+        # Create a UV Map node pointing to the atlas UVs created earlier
         uv_map_node = nt.nodes.new('ShaderNodeUVMap')
         uv_map_node.uv_map = "remix_atlas_uv"
 
-        all_processed_tiles = []
+        # --- Process each UDIM texture set (e.g., one for color, one for roughness, etc.) ---
         for udim_node, target_socket_names in udim_jobs.items():
             image = udim_node.image
             tiles = sorted([t for t in image.tiles if t.label], key=lambda t: t.number)
-            if not all_processed_tiles: all_processed_tiles = tiles
-            
-            if not tiles:
-                logging.warning(f"UDIM texture '{image.name}' has no valid tiles. Skipping.")
+            if not tiles: continue
+
+            logging.info(f"Stitching {len(tiles)} tiles for '{image.name}' used in socket(s): {target_socket_names}")
+        
+            # Determine tile size from the first valid tile image on disk
+            tile_width, tile_height = 0, 0
+            for tile in tiles:
+                tile_path = abspath(image.filepath_raw.replace('<UDIM>', str(tile.number)))
+                if os.path.exists(tile_path):
+                    with Image.open(tile_path) as img_tile:
+                        tile_width, tile_height = img_tile.size
+                        break
+            if tile_width == 0:
+                logging.error(f"Could not determine tile size for '{image.name}'. Skipping this set.")
                 continue
-
-            logging.info(f"Found {len(tiles)} tiles for UDIM texture '{image.name}'. Stitching...")
-            tile_width, tile_height = image.size
-
-            if tile_width == 0 or tile_height == 0:
-                # Logic to determine size from first available tile
-                for tile in tiles:
-                    tile_path = abspath(image.filepath_raw.replace('<UDIM>', str(tile.number)))
-                    if os.path.exists(tile_path):
-                        loaded_tile = self._load_tile_robustly(tile_path, tile.label)
-                        if loaded_tile:
-                            tile_width, tile_height = loaded_tile.size
-                            bpy.data.images.remove(loaded_tile)
-                            break
-                if tile_width == 0: # If still zero, error and default
-                    logging.error(f"Could not determine tile size for '{image.name}'. Defaulting to 2048.")
-                    tile_width, tile_height = 2048, 2048
 
             atlas_width = tile_width * len(tiles)
             atlas_height = tile_height
-            
-            safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '.', '-'))
-            safe_img_name = "".join(c for c in image.name if c.isalnum() or c in ('_', '.', '-'))
-            atlas_filename = f"{safe_mat_name}_{safe_img_name}_atlas.png"
-            atlas_filepath = os.path.join(bake_dir, atlas_filename)
+        
+            # Create a new blank Pillow image for the atlas
+            atlas_pil_image = Image.new('RGBA', (atlas_width, atlas_height))
 
-            atlas_image = bpy.data.images.new(name=atlas_filename, width=atlas_width, height=atlas_height, alpha=True)
-            atlas_image.filepath_raw = atlas_filepath
-            atlas_image.file_format = 'PNG'
-            atlas_pixels = [0.0] * (atlas_width * atlas_height * 4)
-
+            # Paste each tile into the atlas
             for i, tile in enumerate(tiles):
                 tile_path = abspath(image.filepath_raw.replace('<UDIM>', str(tile.number)))
                 if not os.path.exists(tile_path): continue
-                
-                tile_image = self._load_tile_robustly(tile_path, tile.label)
-                if not tile_image: continue
-
-                try:
-                    if tile_image.size[0] != tile_width or tile_image.size[1] != tile_height:
-                        tile_image.scale(tile_width, tile_height)
-                    
-                    tile_pixels = tile_image.pixels[:]
-                    for y in range(tile_height):
-                        src_start = (y * tile_width) * 4
-                        src_end = src_start + (tile_width * 4)
-                        dest_x = i * tile_width
-                        dest_start = (y * atlas_width + dest_x) * 4
-                        dest_end = dest_start + (tile_width * 4)
-                        atlas_pixels[dest_start:dest_end] = tile_pixels[src_start:src_end]
-                finally:
-                    bpy.data.images.remove(tile_image)
-
-            atlas_image.pixels = atlas_pixels
-            atlas_image.save()
             
+                with Image.open(tile_path) as tile_pil_image:
+                    if tile_pil_image.size != (tile_width, tile_height):
+                        tile_pil_image = tile_pil_image.resize((tile_width, tile_height), Image.Resampling.LANCZOS)
+                    atlas_pil_image.paste(tile_pil_image, (i * tile_width, 0))
+
+            # Save the stitched atlas to disk
+            safe_mat_name = "".join(c for c in mat.name if c.isalnum())
+            safe_img_name = "".join(c for c in image.name if c.isalnum())
+            atlas_filename = f"{safe_mat_name}_{safe_img_name}_atlas.png"
+            atlas_filepath = os.path.join(bake_dir, atlas_filename)
+            atlas_pil_image.save(atlas_filepath)
+
+            # Create a texture node in the new material for this new atlas
             atlas_tex_node = nt.nodes.new('ShaderNodeTexImage')
-            atlas_tex_node.image = atlas_image
+            atlas_tex_node.image = bpy.data.images.load(atlas_filepath)
             nt.links.new(uv_map_node.outputs['UV'], atlas_tex_node.inputs['Vector'])
-            
+        
             is_data = any(n in s for s in target_socket_names for n in ['Normal', 'Roughness', 'Metallic', 'Displacement'])
-            atlas_image.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
+            atlas_tex_node.image.colorspace_settings.name = 'Non-Color' if is_data else 'sRGB'
 
+            # Connect the new atlas texture to all the BSDF inputs it's supposed to drive
             for socket_name in target_socket_names:
                 target_socket = new_bsdf.inputs.get(socket_name) or new_mat_output.inputs.get(socket_name)
                 if not target_socket: continue
-                
-                if 'Normal' in socket_name:
+            
+                if socket_name == 'Normal':
                     normal_map_node = nt.nodes.new('ShaderNodeNormalMap')
                     nt.links.new(atlas_tex_node.outputs['Color'], normal_map_node.inputs['Color'])
                     nt.links.new(normal_map_node.outputs['Normal'], target_socket)
-                elif 'Displacement' in socket_name:
+                elif socket_name == 'Displacement':
                     disp_node = nt.nodes.new('ShaderNodeDisplacement')
                     nt.links.new(atlas_tex_node.outputs['Color'], disp_node.inputs['Height'])
                     nt.links.new(disp_node.outputs['Displacement'], new_mat_output.inputs['Displacement'])
-                    # ** ADAPTATION FOR ADDON 1 **
-                    # Use the advanced special_texture_info structure
-                    bake_info['special_texture_info'][mat.name].append({
+                    # Also register this as a special texture for later server assignment
+                    bake_info['special_texture_info'][(stitched_mat_name, stitched_mat_name)].append({
                         'path': atlas_filepath, 'type': 'HEIGHT'
                     })
-                else:
+                else: # For Color, Metallic, Roughness, etc.
                     nt.links.new(atlas_tex_node.outputs['Color'], target_socket)
 
-        self._transform_uvs_for_atlas(objects_using_mat, all_processed_tiles)
-        logging.info(f"--- Finished UDIM Stitch for '{mat.name}' ---")
+        logging.info(f"--- Finished UDIM Stitch for '{mat.name}', created '{final_stitched_mat.name}' ---")
         return final_stitched_mat
 
     def _load_tile_robustly(self, tile_path, tile_label):
@@ -5381,22 +5382,19 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [DEFINITIVE V13 - BAKE-METHOD AWARE FINALIZATION]
-        This version fixes a critical bug where the final material preparation step failed
-        to use the correct baking method when calculating material hashes. It now reads
-        the current bake_method from preferences and passes it to the hashing function,
-        ensuring that the hashes match those generated during the task collection phase,
-        regardless of which baking engine is selected.
+        [DEFINITIVE V13 - UDIM AWARE]
+        Prepares all materials for the final export. It now correctly handles three cases:
+        1. Stitches UDIM materials into new atlas-based materials.
+        2. Uses newly baked textures for complex materials.
+        3. Uses cached textures from previous bakes.
+        It then assigns these new materials to the objects for export.
         """
-        logging.info("Preparing final export materials (Bake-Method Aware Finalization)...")
-
-        # --- START OF FIX ---
-        # 1. Get the currently selected bake method from addon preferences.
+        logging.info("Preparing final export materials (UDIM & Bake-Method Aware Finalization)...")
         addon_prefs = context.preferences.addons[__name__].preferences
         current_bake_method = addon_prefs.bake_method
         logging.info(f"  > Using bake method '{current_bake_method}' for hash lookups.")
-        # --- END OF FIX ---
 
+        # Store original assignments so we can restore them later
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
@@ -5406,16 +5404,39 @@ class OBJECT_OT_export_and_ingest(Operator):
             logging.warning("Bake info is missing, cannot prepare materials.")
             return
 
+        # --- Data Structures for Material Preparation ---
+        udim_materials_to_stitch = bake_info.get('udim_materials', set())
+        stitched_materials_cache = {} # Cache for newly created stitched materials by original material name
         tasks_by_hash = defaultdict(dict)
         for task in bake_info.get('tasks', []):
             mat_hash = task.get('material_hash')
             if mat_hash:
-                pbr_socket_name = task.get('target_socket_name')
-                tasks_by_hash[mat_hash][pbr_socket_name] = task.get('output_path')
-
+                tasks_by_hash[mat_hash][task.get('target_socket_name')] = task.get('output_path')
+    
         cached_textures_by_hash = bake_info.get('cached_materials', {})
         local_image_hash_cache = {}
 
+        # --- NEW: STEP 1 - Process and Stitch UDIM Materials First ---
+        if udim_materials_to_stitch:
+            logging.info(f"Found {len(udim_materials_to_stitch)} UDIM materials to process for stitching...")
+            all_materials_on_export_objects = {s.material for obj in objects_to_process for s in obj.material_slots if s.material}
+        
+            for mat_name_to_stitch in udim_materials_to_stitch:
+                original_udim_mat = bpy.data.materials.get(mat_name_to_stitch)
+                if not original_udim_mat or original_udim_mat not in all_materials_on_export_objects:
+                    continue
+
+                # This function stitches the textures and creates the new material
+                stitched_mat = self._bake_udim_material_to_atlas(
+                    context, 
+                    original_udim_mat, 
+                    [obj for obj in objects_to_process if original_udim_mat in [s.material for s in obj.material_slots]],
+                    bake_info['bake_dir']
+                )
+                if stitched_mat:
+                    stitched_materials_cache[original_udim_mat.name] = stitched_mat
+
+        # --- STEP 2 - Assign Materials to Export Objects ---
         for obj in objects_to_process:
             if not obj: continue
 
@@ -5424,19 +5445,22 @@ class OBJECT_OT_export_and_ingest(Operator):
                 if not original_mat:
                     continue
 
-                # --- START OF FIX ---
-                # 2. Pass the correct bake_method to the hashing function.
+                # --- A: Check if this was a UDIM material that was just stitched ---
+                if original_mat.name in stitched_materials_cache:
+                    stitched_mat = stitched_materials_cache[original_mat.name]
+                    logging.info(f"  - Assigning stitched UDIM material '{stitched_mat.name}' to '{obj.name}'.")
+                    obj.material_slots[slot_index].material = stitched_mat
+                    continue # Material assigned, move to next slot
+
+                # --- B: If not UDIM, check for standard baked or cached materials using hash ---
                 context_hash = get_material_hash(
-                    original_mat,
-                    obj,
-                    slot_index,
+                    original_mat, obj, slot_index,
                     image_hash_cache=local_image_hash_cache,
                     bake_method=current_bake_method
                 )
-                # --- END OF FIX ---
 
                 if not context_hash:
-                    logging.warning(f"  - Could not generate context hash for '{original_mat.name}' on '{obj.name}'. Skipping material prep for this slot.")
+                    logging.warning(f"  - Could not generate context hash for '{original_mat.name}' on '{obj.name}'. Skipping.")
                     continue
 
                 texture_paths_to_use = None
@@ -5446,14 +5470,14 @@ class OBJECT_OT_export_and_ingest(Operator):
                     texture_paths_to_use = cached_textures_by_hash[context_hash]
 
                 if texture_paths_to_use:
-                    safe_obj_name = "".join(c for c in obj.name if c.isalnum() or c in ('_', '-')).strip()
-                    safe_mat_name = "".join(c for c in original_mat.name if c.isalnum() or c in ('_', '-')).strip()
+                    # Build or reuse a material from the baked textures
+                    safe_obj_name = "".join(c for c in obj.name if c.isalnum()).strip()
+                    safe_mat_name = "".join(c for c in original_mat.name if c.isalnum()).strip()
                     baked_mat_name = f"{safe_obj_name}_{safe_mat_name}_BAKED"
 
-                    if baked_mat_name in bpy.data.materials:
-                        baked_mat = bpy.data.materials[baked_mat_name]
-                    else:
-                        logging.info(f"   - Building baked material '{baked_mat_name}' for context obj='{obj.name}', mat='{original_mat.name}'...")
+                    baked_mat = bpy.data.materials.get(baked_mat_name)
+                    if not baked_mat:
+                        logging.info(f"   - Building baked material '{baked_mat_name}'...")
                         baked_mat = bpy.data.materials.new(name=baked_mat_name)
                         self._export_data["temp_materials_for_cleanup"].append(baked_mat)
                         baked_mat.use_nodes = True
@@ -5463,23 +5487,18 @@ class OBJECT_OT_export_and_ingest(Operator):
                         bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
                         out = nt.nodes.new('ShaderNodeOutputMaterial')
                         nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-
+                    
+                        # This part sets up the new material with the baked textures
                         for socket_name, path in texture_paths_to_use.items():
-                            if not os.path.exists(path):
-                                logging.warning(f"      - Baked texture file not found, skipping: {path}")
-                                continue
-
+                            if not os.path.exists(path): continue
                             tex_node = nt.nodes.new('ShaderNodeTexImage')
                             try:
                                 tex_node.image = bpy.data.images.load(path, check_existing=True)
-                            except RuntimeError as e:
-                                logging.error(f"Could not load image file '{path}' for baked material: {e}")
+                            except RuntimeError:
                                 nt.nodes.remove(tex_node)
                                 continue
-
-                            is_color = socket_name in ["Base Color", "Emission Color", "Subsurface Radius"]
+                            is_color = socket_name in ["Base Color", "Emission Color"]
                             tex_node.image.colorspace_settings.name = 'sRGB' if is_color else 'Non-Color'
-
                             if socket_name == "Base Color":
                                 nt.links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
                                 if 'Alpha' in tex_node.outputs:
@@ -5488,12 +5507,11 @@ class OBJECT_OT_export_and_ingest(Operator):
                                 norm_map = nt.nodes.new('ShaderNodeNormalMap')
                                 nt.links.new(tex_node.outputs['Color'], norm_map.inputs['Color'])
                                 nt.links.new(norm_map.outputs['Normal'], bsdf.inputs['Normal'])
-                            elif socket_name != "Alpha":
+                            elif socket_name != "Alpha": # Alpha is handled with Base Color
                                 if bsdf.inputs.get(socket_name):
                                     nt.links.new(tex_node.outputs['Color'], bsdf.inputs[socket_name])
-                                else:
-                                    logging.warning(f"      - Could not find BSDF input for socket '{socket_name}' on material '{baked_mat_name}'.")
-
+                
+                    logging.info(f"  - Assigning baked material '{baked_mat.name}' to '{obj.name}'.")
                     obj.material_slots[slot_index].material = baked_mat
                 
     def _replace_or_append_on_server(self, context, ingested_usd):
