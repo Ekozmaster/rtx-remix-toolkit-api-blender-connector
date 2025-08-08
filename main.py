@@ -2436,48 +2436,85 @@ def _stable_repr(value):
         return repr(value)
 
 def _hash_image(img, image_hash_cache):
-    """Calculates a hash based on the image's file content."""
+    """
+    [DEFINITIVE V2 - UDIM AWARE]
+    Calculates a hash for an image datablock. It is now fully UDIM-aware,
+    iterating through all existing tile files and hashing their content
+    to ensure that changes to any tile will correctly invalidate the cache.
+    """
     if not img:
         return "NO_IMAGE_DATABLOCK"
 
-    # Use the image's full name as a key for in-session caching
     cache_key = img.name_full if hasattr(img, 'name_full') else str(id(img))
     if image_hash_cache is not None and cache_key in image_hash_cache:
         return image_hash_cache[cache_key]
 
     calculated_digest = None
-    # Prioritize packed data if it exists
-    if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
-        try:
-            # Hash the first 128KB of the packed data
-            data_to_hash = bytes(img.packed_file.data[:131072])
-            calculated_digest = hashlib.md5(data_to_hash).hexdigest()
-        except Exception as e_pack:
-            print(f"[_hash_image Warning] Hash failed on packed data for '{img.name}': {e_pack}", file=sys.stderr)
+    hasher = hashlib.md5()
 
-    # If not packed or packing failed, try to read from disk
-    if calculated_digest is None and hasattr(img, 'filepath_raw') and img.filepath_raw:
-        try:
-            resolved_abs_path = bpy.path.abspath(img.filepath_raw)
-            if os.path.isfile(resolved_abs_path):
-                with open(resolved_abs_path, "rb") as f:
-                    # Hash the first 128KB of the file
-                    data_from_file = f.read(131072)
-                calculated_digest = hashlib.md5(data_from_file).hexdigest()
-        except Exception as e_file:
-            print(f"[_hash_image Warning] Hash failed on file '{img.filepath_raw}': {e_file}", file=sys.stderr)
+    try:
+        # --- NEW: UDIM HASHING LOGIC ---
+        if img.source == 'TILED':
+            logging.debug(f"  > Hashing UDIM set for '{img.name}'...")
+            found_any_tiles = False
+            # Sort tiles by number for a consistent hash order
+            sorted_tiles = sorted(img.tiles, key=lambda t: t.number)
+            
+            for tile in sorted_tiles:
+                # Construct the real path for each tile file
+                tile_path = abspath(img.filepath_raw.replace('<UDIM>', str(tile.number)))
+                if os.path.isfile(tile_path):
+                    found_any_tiles = True
+                    # Add the tile number to the hash to account for swaps
+                    hasher.update(str(tile.number).encode('utf-8'))
+                    # Add the content of the tile file to the hash
+                    with open(tile_path, "rb") as f:
+                        buf = f.read(131072) # Read first 128kb is enough
+                        hasher.update(buf)
+                else:
+                    # If a tile is missing, we still add its number to the hash
+                    # to differentiate from a set that doesn't have this tile defined.
+                    hasher.update(f"missing_{tile.number}".encode('utf-8'))
 
-    # Fallback if no data or file is available (e.g., generated textures)
-    if calculated_digest is None:
-        fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
-        calculated_digest = hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
+            if found_any_tiles:
+                calculated_digest = hasher.hexdigest()
+            else:
+                logging.warning(f"  > UDIM set '{img.name}' has no valid tile files on disk.")
+                # Fall through to the fallback hash method if no tiles were found
 
-    # Store in the session cache to avoid re-calculating
+        # --- EXISTING LOGIC FOR STANDARD TEXTURES ---
+        if calculated_digest is None:
+            if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
+                data_to_hash = bytes(img.packed_file.data[:131072])
+                hasher.update(data_to_hash)
+                calculated_digest = hasher.hexdigest()
+            
+            elif hasattr(img, 'filepath_raw') and img.filepath_raw:
+                resolved_abs_path = abspath(img.filepath_raw)
+                if os.path.isfile(resolved_abs_path):
+                    with open(resolved_abs_path, "rb") as f:
+                        data_from_file = f.read(131072)
+                    hasher.update(data_from_file)
+                    calculated_digest = hasher.hexdigest()
+
+        # --- FALLBACK FOR GENERATED OR INVALID TEXTURES ---
+        if calculated_digest is None:
+            fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
+            hasher.update(fallback_data.encode('utf-8'))
+            calculated_digest = hasher.hexdigest()
+
+    except Exception as e:
+        logging.error(f"[_hash_image Error] Hashing failed for '{img.name}': {e}", exc_info=True)
+        # Ensure a failsafe hash is always returned
+        fallback_data = f"ERROR_FALLBACK|{getattr(img, 'name_full', 'N/A')}"
+        hasher.update(fallback_data.encode('utf-8'))
+        calculated_digest = hasher.hexdigest()
+
     if image_hash_cache is not None:
         image_hash_cache[cache_key] = calculated_digest
 
     return calculated_digest
-     
+    
 def _find_bsdf_and_output_nodes(node_tree):
     """Finds the active Principled BSDF and Material Output nodes."""
     bsdf_node = next((n for n in node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
@@ -4188,9 +4225,11 @@ class OBJECT_OT_export_and_ingest(Operator):
     # --- MODIFIED TASK COLLECTION FUNCTION ---
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [DEFINITIVE V2 - Centralized UV Transform] Generates bake tasks. The responsibility
-        for transforming UVs for UDIM atlases has been moved to the _bake_udim_material_to_atlas
-        function to ensure it runs correctly even on a cache hit.
+        [DEFINITIVE V3 - Cache-Aware UDIM Flagging]
+        Generates bake tasks. This version fixes a critical caching bug by ensuring
+        that a material is flagged as using UDIMs *before* the cache is checked.
+        This guarantees that the stitching process is always triggered for UDIM
+        materials, even when a bake is skipped due to a cache hit.
         """
         tasks = []
         if not is_blend_file_saved():
@@ -4223,10 +4262,8 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         if bake_method_for_all_tasks == 'NATIVE':
             CORE_PBR_CHANNELS = [
-                ("Base Color", 'DIFFUSE',   False, True),
-                ("Metallic",   'EMIT',      True,  False),
-                ("Roughness",  'ROUGHNESS', True,  False),
-                ("Normal",     'NORMAL',    False, False),
+                ("Base Color", 'DIFFUSE',   False, True), ("Metallic",   'EMIT',      True,  False),
+                ("Roughness",  'ROUGHNESS', True,  False), ("Normal",     'NORMAL',    False, False),
             ]
         else: # EMIT_HIJACK
             CORE_PBR_CHANNELS = [
@@ -4253,9 +4290,12 @@ class OBJECT_OT_export_and_ingest(Operator):
                 if not mat or not mat.use_nodes:
                     continue
             
+                # --- THIS IS THE FIX: UDIM check is now BEFORE the cache check ---
+                # This ensures bake_info['udim_materials'] is populated even on a cache hit.
                 uses_udims = self._material_uses_udims(mat)
                 if uses_udims and mat.name not in bake_info['udim_materials']:
                     bake_info['udim_materials'].add(mat.name)
+                # --- END OF FIX ---
 
                 material_hash = get_material_hash(
                     mat, obj, slot_index, image_hash_cache=global_image_hash_cache,
@@ -4303,10 +4343,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                                     bake_resolution_x = tile_width * len(tiles)
                                     bake_resolution_y = tile_height
                                     logging.info(f"   - UDIMs detected. Setting bake resolution to {bake_resolution_x}x{bake_resolution_y} for atlas.")
-                                    # --- THIS CALL IS NOW REMOVED ---
-                                    # The UV transformation is now handled by the stitching function to ensure
-                                    # it runs even on a cache hit.
-                                    # self._transform_uvs_for_atlas(objects_using_mat, tiles)
                                     uv_layer_for_bake = "remix_atlas_uv"
                     else:
                         max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
@@ -4352,61 +4388,47 @@ class OBJECT_OT_export_and_ingest(Operator):
                             "material_hash": material_hash,
                             "bake_method": bake_method_for_all_tasks
                         })
-
-                # --- PATH 2: SIMPLE MATERIALS (Check for Special Textures without baking) ---
                 elif has_decal:
-                    # This logic handles simple materials with decals by creating a composite bake task.
-                    # It is a special case of "baking" for simple setups.
                     logging.info(f"  - Queuing DECAL COMPOSITE task for simple material '{mat.name}' on '{obj.name}'.")
-                
                     bsdf_node, _ = _find_bsdf_and_output_nodes(mat.node_tree)
-                    if not bsdf_node: continue
+                    if bsdf_node:
+                        original_base_color_path = self._get_texture_path_from_socket(bsdf_node.inputs['Base Color'])
+                        if not original_base_color_path:
+                            logging.warning(f"    - Could not find a valid source texture for 'Base Color' on simple material '{mat.name}'. It will be treated as black.")
+                        max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
+                        bake_resolution_x = max_w if max_w > 0 else DEFAULT_BAKE_RESOLUTION
+                        bake_resolution_y = max_h if max_h > 0 else DEFAULT_BAKE_RESOLUTION
+                        mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
+                        safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
+                        hash_for_filename = material_hash[:8] if material_hash else f"NOHSH_{uuid.uuid4().hex[:6]}"
+                        output_filename = f"{safe_mat_name}_{hash_for_filename}_BaseColor.png"
+                        output_path = os.path.join(bake_dir, output_filename)
+                        tasks.append({
+                            "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
+                            "bake_type": "EMIT", "target_socket_name": "Base Color", "output_path": output_path,
+                            "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
+                            "uv_layer": obj.data.uv_layers.active.name, "material_hash": material_hash,
+                            "bake_method": bake_method_for_all_tasks, "is_simple_decal_composite": True,
+                            "original_base_color_path": original_base_color_path
+                        })
+                        if material_hash:
+                            if material_hash not in global_material_hash_cache: global_material_hash_cache[material_hash] = {}
+                            global_material_hash_cache[material_hash]['Base Color'] = output_path
+                            for socket_name in ["Metallic", "Roughness", "Normal"]:
+                                 path = self._get_texture_path_from_socket(bsdf_node.inputs[socket_name])
+                                 if path: global_material_hash_cache[material_hash][socket_name] = path
 
-                    original_base_color_path = self._get_texture_path_from_socket(bsdf_node.inputs['Base Color'])
-                    if not original_base_color_path:
-                        logging.warning(f"    - Could not find a valid source texture for 'Base Color' on simple material '{mat.name}'. It will be treated as black.")
-
-                    max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
-                    bake_resolution_x = max_w if max_w > 0 else DEFAULT_BAKE_RESOLUTION
-                    bake_resolution_y = max_h if max_h > 0 else DEFAULT_BAKE_RESOLUTION
-                    mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-                    safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
-                    hash_for_filename = material_hash[:8] if material_hash else f"NOHSH_{uuid.uuid4().hex[:6]}"
-                    output_filename = f"{safe_mat_name}_{hash_for_filename}_BaseColor.png"
-                    output_path = os.path.join(bake_dir, output_filename)
-            
-                    tasks.append({
-                        "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
-                        "bake_type": "EMIT", "target_socket_name": "Base Color", "output_path": output_path,
-                        "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
-                        "uv_layer": obj.data.uv_layers.active.name, "material_hash": material_hash,
-                        "bake_method": bake_method_for_all_tasks, "is_simple_decal_composite": True,
-                        "original_base_color_path": original_base_color_path
-                    })
-            
-                    if material_hash:
-                        if material_hash not in global_material_hash_cache: global_material_hash_cache[material_hash] = {}
-                        global_material_hash_cache[material_hash]['Base Color'] = output_path
-                        for socket_name in ["Metallic", "Roughness", "Normal"]:
-                             path = self._get_texture_path_from_socket(bsdf_node.inputs[socket_name])
-                             if path: global_material_hash_cache[material_hash][socket_name] = path
-
-                else: # Truly simple material (no decals, no complexity)
+                else: # Truly simple material
                     logging.info(f"  - Material '{mat.name}' is simple. Checking for existing special textures to use directly.")
                     bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
                     output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
                     if not output_node: output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-
                     sockets_to_scan = {}
                     if bsdf:
-                        sockets_to_scan.update({
-                            "Emission Color": bsdf.inputs.get("Emission Color"),
-                            "Alpha": bsdf.inputs.get("Alpha"),
-                        })
+                        sockets_to_scan.update({"Emission Color": bsdf.inputs.get("Emission Color"), "Alpha": bsdf.inputs.get("Alpha")})
                     if output_node:
                         sockets_to_scan["Displacement"] = output_node.inputs.get("Displacement")
 
-                    found_simple_special_maps = False
                     for socket_name, socket in sockets_to_scan.items():
                         if socket and socket.is_linked:
                             texture_path = self._get_texture_path_from_socket(socket)
@@ -4414,21 +4436,13 @@ class OBJECT_OT_export_and_ingest(Operator):
                                 server_texture_type = SPECIAL_TEXTURE_MAP.get(socket_name)
                                 if server_texture_type:
                                     logging.info(f"    > Found direct-use special map for '{socket_name}' at: {os.path.basename(texture_path)}")
-                                    # Add the ORIGINAL file path to the to-do list for ingestion
                                     bake_info['special_texture_info'][(obj.name, mat.name)].append({
-                                        'path': texture_path,
-                                        'type': server_texture_type
+                                        'path': texture_path, 'type': server_texture_type
                                     })
-                                    found_simple_special_maps = True
-
-                    if not found_simple_special_maps:
-                        logging.info(f"    > No special maps found for simple material '{mat.name}'.")
-
 
         bake_info['tasks'] = tasks
         if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
         if bake_info['cached_materials']: logging.info(f"Reusing cached textures for {len(bake_info['cached_materials'])} material contexts.")
-
         return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
     
     def _launch_persistent_worker(self):
