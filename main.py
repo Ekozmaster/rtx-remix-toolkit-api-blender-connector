@@ -6369,11 +6369,11 @@ class VIEW3D_PT_remix_ingestor(Panel):
                 base_name_box.label(text="Base OBJ Name", icon='FILE_BLEND')
                 base_name_box.prop(addon_prefs, "remix_base_obj_name", text="")
 
-        export_box.prop(addon_prefs, "mirror_on_export", text="Mirror on Export")
-        export_box.prop(addon_prefs, "apply_modifiers")
-
         export_box.prop(addon_prefs, "remix_replace_stock_mesh", text="Replace Stock Mesh")
+        export_box.prop(addon_prefs, "mirror_on_export", text="Mirror on Export")
         export_box.prop(addon_prefs, "flip_faces_export", text="Flip Normals During Export")
+
+        export_box.prop(addon_prefs, "apply_modifiers")
     
         row = export_box.row(align=True)
         row.label(text="Forward Axis:")
