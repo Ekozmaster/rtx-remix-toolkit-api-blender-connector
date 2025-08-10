@@ -72,27 +72,61 @@ BAKE_WORKER_PY = None
 MAX_CONCURRENT_BAKE_WORKERS = 4
 BAKE_BATCH_SIZE_PER_WORKER = 5
 
+def get_sentinel_path():
+    """
+    Returns the path to a 'restart.required' sentinel file inside the addon's root directory.
+    This provides a persistent, file-based flag for managing the post-installation restart message.
+    """
+    try:
+        addon_root_dir = os.path.dirname(os.path.realpath(__file__))
+        return os.path.join(addon_root_dir, "restart.required")
+    except NameError:
+        # Fallback for edge cases.
+        addon_folder_name = __name__.split('.')[0]
+        scripts_path = bpy.utils.user_resource('SCRIPTS')
+        return os.path.join(scripts_path, 'addons', addon_folder_name, "restart.required")
+
+def get_addon_lib_path():
+    """
+    Returns the absolute path to the 'lib' directory within this addon.
+    This ensures dependencies are installed and located in a private folder,
+    avoiding issues with different Python environments in Blender forks like Bforartists.
+    """
+    try:
+        # __file__ is the path to the currently executing Python script.
+        # This is the most reliable way to find the addon's location.
+        addon_root_dir = os.path.dirname(os.path.realpath(__file__))
+        lib_path = os.path.join(addon_root_dir, "lib")
+        # The installer will create the directory, but we can ensure it exists here too.
+        os.makedirs(lib_path, exist_ok=True)
+        return lib_path
+    except NameError:
+        # Fallback for edge cases where __file__ might not be defined.
+        addon_folder_name = __name__.split('.')[0]
+        scripts_path = bpy.utils.user_resource('SCRIPTS')
+        lib_path = os.path.join(scripts_path, 'addons', addon_folder_name, 'lib')
+        os.makedirs(lib_path, exist_ok=True)
+        return lib_path
+
 def check_dependencies():
     """
-    (CORRECTED) Checks if psutil and Pillow are installed and updates the global state.
-    This version dynamically adds the user's site-packages directory to Blender's
-    Python path to ensure modules installed there can be found.
+    (CORRECTED FOR BFORARTISTS) Checks if psutil and Pillow are installed.
+    This version adds the addon's own 'lib' directory to the Python path,
+    making the dependency check robust and portable across Blender forks.
     """
     # --- THIS IS THE FIX ---
-    # Ensure Blender's Python can find modules installed in the user's local directory.
-    import sys
-    import site
-    # Get the platform-specific user site-packages directory
-    user_site_packages = site.getusersitepackages()
-    # If this directory is not already in Python's list of search paths, add it.
-    if user_site_packages not in sys.path:
-        sys.path.append(user_site_packages)
-        logging.info(f"Dynamically added user site-packages to system path: {user_site_packages}")
+    # Get the path to our addon's private library folder.
+    lib_path = get_addon_lib_path()
+
+    # If this directory exists and is not already in Python's list of search paths, add it.
+    if os.path.isdir(lib_path) and lib_path not in sys.path:
+        sys.path.insert(0, lib_path) # Insert at the beginning to ensure it's checked first
+        logging.info(f"Dynamically added addon 'lib' directory to system path: {lib_path}")
     # --- END OF FIX ---
 
     global PSUTIL_INSTALLED, PILLOW_INSTALLED
     try:
-        # Now, this import will search the newly added path and should succeed.
+        # Now, this import will search the newly added path first.
         import psutil
         PSUTIL_INSTALLED = True
         logging.info("Dependency 'psutil' is installed.")
@@ -108,55 +142,90 @@ def check_dependencies():
         logging.warning("Dependency 'Pillow' is NOT installed.")
 
 class REMIX_OT_install_dependency(Operator):
-    """Attempts to install a specified Python library using pip."""
+    """(CORRECTED V4 - Sentinel File) Installs a library into a local 'lib' folder and creates a persistent restart flag."""
     bl_idname = "remix.install_dependency"
     bl_label = "Install Dependency"
     bl_description = "Downloads and installs a required library. Blender may need to be restarted."
     bl_options = {'REGISTER', 'INTERNAL'}
 
-    dependency: StringProperty(
-        name="Dependency Name",
-        description="The name of the library to install (e.g., 'psutil', 'Pillow')",
-        default=""
-    )
+    dependency: StringProperty(default="")
+    _timer = None
+    _thread = None
+    _queue = None
+
+    def _install_in_thread(self, py_exec, dependency_name, target_dir, queue_ref):
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            subprocess.run([py_exec, "-m", "ensurepip"], check=True, capture_output=True)
+            subprocess.run([py_exec, "-m", "pip", "install", "--upgrade", "pip"], check=True, capture_output=True)
+            result = subprocess.run(
+                [py_exec, "-m", "pip", "install", f"--target={target_dir}", dependency_name],
+                capture_output=True, text=True, check=True
+            )
+            logging.info(f"{dependency_name} installation successful:\n" + result.stdout)
+            queue_ref.put(('INFO', f"{dependency_name} installed successfully!"))
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to install {dependency_name}. See System Console. Error:\n{e.stderr}")
+            queue_ref.put(('ERROR', "Installation failed. Check System Console."))
+        except FileNotFoundError:
+            logging.error(f"Failed to install {dependency_name}: Python executable not found.")
+            queue_ref.put(('ERROR', "Python executable not found."))
+        finally:
+            check_dependencies()
+            queue_ref.put(('FINISHED', ''))
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        is_finished = False
+        try:
+            while True:
+                report_type, message = self._queue.get_nowait()
+                if report_type == 'FINISHED':
+                    is_finished = True
+                else:
+                    self.report({report_type}, message)
+                    # --- THIS IS THE FIX ---
+                    # If an install is successful, create the sentinel file.
+                    if report_type == 'INFO':
+                        sentinel_path = get_sentinel_path()
+                        try:
+                            with open(sentinel_path, 'w') as f:
+                                f.write(datetime.now().isoformat())
+                            logging.info(f"Created restart sentinel file at: {sentinel_path}")
+                        except Exception as e:
+                            logging.error(f"Could not create sentinel file: {e}")
+                    # --- END OF FIX ---
+        except Empty:
+            pass
+
+        if is_finished:
+            context.scene.remix_is_installing_dependency = False
+            context.window_manager.event_timer_remove(self._timer)
+            context.workspace.status_text_set(None)
+            for region in context.area.regions:
+                if region.type == 'UI':
+                    region.tag_redraw()
+            return {'FINISHED'}
+            
+        return {'PASS_THROUGH'}
 
     def execute(self, context):
         if not self.dependency:
             self.report({'ERROR'}, "No dependency specified.")
             return {'CANCELLED'}
-
-        try:
-            py_exec = sys.executable
-            # Ensure pip is available and updated
-            subprocess.run([py_exec, "-m", "ensurepip"], check=True, capture_output=True)
-            subprocess.run([py_exec, "-m", "pip", "install", "--upgrade", "pip"], check=True, capture_output=True)
-            # Install the dependency
-            result = subprocess.run(
-                [py_exec, "-m", "pip", "install", self.dependency],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            logging.info(f"{self.dependency} installation successful:\n" + result.stdout)
-            self.report({'INFO'}, f"{self.dependency} installed successfully! Please restart Blender to apply.")
-            context.scene.remix_install_complete = True # Generic flag for restart button
-
-        except subprocess.CalledProcessError as e:
-            error_message = (f"Failed to install {self.dependency}. See System Console for details. Error:\n{e.stderr}")
-            logging.error(error_message)
-            self.report({'ERROR'}, "Installation failed. Check System Console.")
-            context.scene.remix_install_complete = False
-        except FileNotFoundError:
-            error_message = f"Failed to install {self.dependency}: Python executable not found."
-            logging.error(error_message)
-            self.report({'ERROR'}, error_message)
-            context.scene.remix_install_complete = False
-
-        check_dependencies() # Re-check after installation attempt
-        return {'FINISHED'}
-
-# Call the check immediately when the script is loaded
-check_dependencies()
+        
+        context.scene.remix_is_installing_dependency = True
+        self._queue = Queue()
+        py_exec = sys.executable
+        target_install_dir = get_addon_lib_path()
+        self._thread = threading.Thread(target=self._install_in_thread, args=(py_exec, self.dependency, target_install_dir, self._queue))
+        self._thread.start()
+        self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        context.workspace.status_text_set(f"Installing {self.dependency} in the background...")
+        return {'RUNNING_MODAL'}
 
 def cleanup_orphan_directories():
     """
@@ -229,80 +298,6 @@ def cleanup_orphan_directories():
                             logging.error(f"Could not delete corrupted temp dir '{orphan_path}': {e_del}")
         except Exception as e:
             logging.error(f"An unexpected error occurred during orphan cleanup scan for '{base_path}': {e}")
-
-class REMIX_OT_install_dependency(Operator):
-    """(CORRECTED V2) Installs a specified Python library using pip without freezing Blender."""
-    bl_idname = "remix.install_dependency"
-    bl_label = "Install Dependency"
-    bl_description = "Downloads and installs a required library. Blender may need to be restarted."
-    bl_options = {'REGISTER', 'INTERNAL'}
-
-    dependency: StringProperty(default="")
-    _timer = None
-    _thread = None
-    _queue = None
-
-    def _install_in_thread(self, py_exec, dependency_name, queue_ref):
-        try:
-            subprocess.run([py_exec, "-m", "ensurepip"], check=True, capture_output=True)
-            subprocess.run([py_exec, "-m", "pip", "install", "--upgrade", "pip"], check=True, capture_output=True)
-            result = subprocess.run([py_exec, "-m", "pip", "install", dependency_name], capture_output=True, text=True, check=True)
-            logging.info(f"{dependency_name} installation successful:\n" + result.stdout)
-            queue_ref.put(('INFO', f"{dependency_name} installed successfully!"))
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to install {dependency_name}. See System Console. Error:\n{e.stderr}")
-            queue_ref.put(('ERROR', "Installation failed. Check System Console."))
-        except FileNotFoundError:
-            logging.error(f"Failed to install {dependency_name}: Python executable not found.")
-            queue_ref.put(('ERROR', "Python executable not found."))
-        finally:
-            check_dependencies()
-            queue_ref.put(('FINISHED', ''))
-
-    def modal(self, context, event):
-        if event.type != 'TIMER':
-            return {'PASS_THROUGH'}
-
-        is_finished = False
-        try:
-            while True:
-                report_type, message = self._queue.get_nowait()
-                if report_type == 'FINISHED':
-                    is_finished = True
-                else:
-                    self.report({report_type}, message)
-                    # --- THE ONLY FLAG IT SETS ---
-                    # If any install is successful, set this to True.
-                    if report_type == 'INFO':
-                        context.scene.remix_dependency_was_installed = True
-        except Empty:
-            pass
-
-        if is_finished:
-            context.scene.remix_is_installing_dependency = False
-            context.window_manager.event_timer_remove(self._timer)
-            context.workspace.status_text_set(None)
-            for region in context.area.regions:
-                if region.type == 'UI':
-                    region.tag_redraw()
-            return {'FINISHED'}
-            
-        return {'PASS_THROUGH'}
-
-    def execute(self, context):
-        if not self.dependency:
-            self.report({'ERROR'}, "No dependency specified.")
-            return {'CANCELLED'}
-        
-        context.scene.remix_is_installing_dependency = True
-        self._queue = Queue()
-        py_exec = sys.executable
-        self._thread = threading.Thread(target=self._install_in_thread, args=(py_exec, self.dependency, self._queue))
-        self._thread.start()
-        self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
-        context.window_manager.modal_handler_add(self)
-        context.workspace.status_text_set(f"Installing {self.dependency} in the background...")
-        return {'RUNNING_MODAL'}
 
 class REMIX_OT_restart_blender(Operator):
     """Saves the file and restarts Blender."""
@@ -6394,29 +6389,29 @@ class VIEW3D_PT_remix_ingestor(Panel):
         layout = self.layout
         addon_prefs = context.preferences.addons[__name__].preferences
 
-        # --- SECTION 1: Handle Dependency UI ---
-        # First, check if both dependencies are fully installed.
-        if PSUTIL_INSTALLED and PILLOW_INSTALLED:
-            # If they are, but an installation just happened in this session, show the restart button.
-            if getattr(context.scene, 'remix_dependency_was_installed', False):
-                box = layout.box()
-                box.label(text="Restart Required", icon='ERROR')
-                box.label(text="All dependencies are now installed.")
-                box.operator("remix.restart_blender", text="Save and Restart Blender", icon='RECOVER_LAST')
-            # If they are installed and no recent installation happened, we show nothing and proceed.
-        else:
-            # If we are here, at least one dependency is missing.
+        # --- THIS IS THE FIX ---
+        # Check for the physical sentinel file to decide if a restart is needed.
+        sentinel_path = get_sentinel_path()
+        
+        # Condition 1: Dependencies are installed AND a restart is required.
+        if PSUTIL_INSTALLED and PILLOW_INSTALLED and os.path.exists(sentinel_path):
+            box = layout.box()
+            box.label(text="Restart Required", icon='ERROR')
+            box.label(text="Dependencies were installed successfully.")
+            box.label(text="Please restart to enable the addon.")
+            box.operator("remix.restart_blender", text="Save and Restart", icon='RECOVER_LAST')
+            return # Stop drawing here
+
+        # Condition 2: Dependencies are NOT installed.
+        if not PSUTIL_INSTALLED or not PILLOW_INSTALLED:
             box = layout.box()
             box.label(text="Dependencies Required", icon='ERROR')
 
             if getattr(context.scene, 'remix_is_installing_dependency', False):
-                # If an installation is currently running, show the busy message.
                 info_box = box.box()
                 info_row = info_box.row(align=True)
                 info_row.label(text="Installing dependency...", icon='SORTTIME')
-                info_row.label(text="Wait 10 seconds")
             else:
-                # If no installation is running, show buttons for what's missing.
                 if not PSUTIL_INSTALLED:
                     col = box.column(align=True)
                     col.label(text="'psutil' is needed for resource management.")
@@ -6425,16 +6420,17 @@ class VIEW3D_PT_remix_ingestor(Panel):
 
                 if not PILLOW_INSTALLED:
                     col = box.column(align=True)
-                    col.label(text="'Pillow' is needed for texture fixing.")
+                    col.label(text="'Pillow' is needed for texture processing.")
                     op = col.operator("remix.install_dependency", text="Install Pillow", icon='CONSOLE')
                     op.dependency = 'Pillow'
-            # Stop drawing the rest of the panel if we are in the dependency section.
-            return
+            return # Stop drawing here
+        # --- END OF FIX ---
 
         # --- SECTION 2: Main Addon UI ---
-        # This section will only be drawn if all dependencies are installed and no restart is pending.
+        # This section is now only drawn if dependencies are installed and no restart is pending.
         export_box = layout.box()
         export_box.label(text="Export & Ingest", icon='EXPORT')
+        # ... (rest of your panel's UI code is unchanged)
         export_box.prop(addon_prefs, "remix_ingest_directory", text="Ingest Directory")
         export_box.prop(addon_prefs, "remix_use_selection_only", text="Export Selected Objects Only")
 
@@ -6505,7 +6501,22 @@ def register():
     global BAKE_WORKER_PY
     log = logging.getLogger(__name__)
 
+    # --- THIS IS THE FIX ---
+    # Call check_dependencies() first to set up the sys.path and global flags.
     check_dependencies()
+    
+    # After checking, see if a restart was pending.
+    sentinel_path = get_sentinel_path()
+    # If all dependencies are now present and the sentinel file exists, it's the first
+    # successful launch post-installation. We can now remove the file.
+    if PSUTIL_INSTALLED and PILLOW_INSTALLED and os.path.exists(sentinel_path):
+        try:
+            os.remove(sentinel_path)
+            logging.info("Dependencies found, removing restart sentinel file.")
+        except OSError as e:
+            logging.warning(f"Could not remove sentinel file '{sentinel_path}': {e}")
+    # --- END OF FIX ---
+    
     cleanup_orphan_directories()
 
     try:
@@ -6520,10 +6531,8 @@ def register():
         bpy.types.Scene.remix_custom_settings_backup = PointerProperty(type=CustomSettingsBackup)
         bpy.types.Scene.remix_asset_number = CollectionProperty(type=AssetNumberItem)
         
-        # --- MODIFIED FLAGS ---
+        # This flag is still useful for showing the "Installing..." message.
         bpy.types.Scene.remix_is_installing_dependency = BoolProperty(default=False)
-        # This new flag remembers if an install happened, so we know to show the restart button.
-        bpy.types.Scene.remix_dependency_was_installed = BoolProperty(default=False)
 
         atexit.register(_kill_all_active_workers)
         log.info("Remix Ingestor addon registration complete with orphan process handler and startup cleanup.")
@@ -6536,7 +6545,6 @@ def unregister():
     _kill_all_active_workers()
 
     try:
-        import atexit
         if hasattr(atexit, 'unregister'):
             atexit.unregister(_kill_all_active_workers)
             log.info("atexit handler for orphan processes has been unregistered.")
@@ -6550,9 +6558,8 @@ def unregister():
     try:
         del bpy.types.Scene.remix_asset_number
         del bpy.types.Scene.remix_custom_settings_backup
-        # --- DELETE MODIFIED FLAGS ---
+        # Remove the now-unused property.
         del bpy.types.Scene.remix_is_installing_dependency
-        del bpy.types.Scene.remix_dependency_was_installed
     except (AttributeError, TypeError):
         pass
         
