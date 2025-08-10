@@ -73,9 +73,26 @@ MAX_CONCURRENT_BAKE_WORKERS = 4
 BAKE_BATCH_SIZE_PER_WORKER = 5
 
 def check_dependencies():
-    """Checks if psutil and Pillow are installed and updates the global state."""
+    """
+    (CORRECTED) Checks if psutil and Pillow are installed and updates the global state.
+    This version dynamically adds the user's site-packages directory to Blender's
+    Python path to ensure modules installed there can be found.
+    """
+    # --- THIS IS THE FIX ---
+    # Ensure Blender's Python can find modules installed in the user's local directory.
+    import sys
+    import site
+    # Get the platform-specific user site-packages directory
+    user_site_packages = site.getusersitepackages()
+    # If this directory is not already in Python's list of search paths, add it.
+    if user_site_packages not in sys.path:
+        sys.path.append(user_site_packages)
+        logging.info(f"Dynamically added user site-packages to system path: {user_site_packages}")
+    # --- END OF FIX ---
+
     global PSUTIL_INSTALLED, PILLOW_INSTALLED
     try:
+        # Now, this import will search the newly added path and should succeed.
         import psutil
         PSUTIL_INSTALLED = True
         logging.info("Dependency 'psutil' is installed.")
@@ -213,45 +230,79 @@ def cleanup_orphan_directories():
         except Exception as e:
             logging.error(f"An unexpected error occurred during orphan cleanup scan for '{base_path}': {e}")
 
-class REMIX_OT_install_psutil(Operator):
-    """Attempts to install the psutil library using pip."""
-    bl_idname = "remix.install_psutil"
-    bl_label = "Install Dependency (psutil)"
-    bl_description = "Downloads and installs the 'psutil' library required for dynamic resource management. Blender may need to be restarted."
+class REMIX_OT_install_dependency(Operator):
+    """(CORRECTED V2) Installs a specified Python library using pip without freezing Blender."""
+    bl_idname = "remix.install_dependency"
+    bl_label = "Install Dependency"
+    bl_description = "Downloads and installs a required library. Blender may need to be restarted."
     bl_options = {'REGISTER', 'INTERNAL'}
 
-    def execute(self, context):
+    dependency: StringProperty(default="")
+    _timer = None
+    _thread = None
+    _queue = None
+
+    def _install_in_thread(self, py_exec, dependency_name, queue_ref):
         try:
-            py_exec = sys.executable
-            # Using 'subprocess.run' is simpler for one-off commands.
-            # It waits for the command to complete.
-            result = subprocess.run(
-                [py_exec, "-m", "pip", "install", "psutil"],
-                capture_output=True,
-                text=True,
-                check=True # This will raise a CalledProcessError if pip fails
-            )
-            logging.info("psutil installation successful:\n" + result.stdout)
-            self.report({'INFO'}, "psutil installed successfully! Please restart Blender.")
-            # Set a flag to show the restart button
-            context.scene.remix_install_complete = True
-
+            subprocess.run([py_exec, "-m", "ensurepip"], check=True, capture_output=True)
+            subprocess.run([py_exec, "-m", "pip", "install", "--upgrade", "pip"], check=True, capture_output=True)
+            result = subprocess.run([py_exec, "-m", "pip", "install", dependency_name], capture_output=True, text=True, check=True)
+            logging.info(f"{dependency_name} installation successful:\n" + result.stdout)
+            queue_ref.put(('INFO', f"{dependency_name} installed successfully!"))
         except subprocess.CalledProcessError as e:
-            error_message = (
-                "Failed to install psutil. See System Console for details. "
-                f"Error:\n{e.stderr}"
-            )
-            logging.error(error_message)
-            self.report({'ERROR'}, "Installation failed. Check System Console for details.")
-            context.scene.remix_install_complete = False
+            logging.error(f"Failed to install {dependency_name}. See System Console. Error:\n{e.stderr}")
+            queue_ref.put(('ERROR', "Installation failed. Check System Console."))
         except FileNotFoundError:
-            error_message = "Failed to install psutil: Python executable or pip not found."
-            logging.error(error_message)
-            self.report({'ERROR'}, error_message)
-            context.scene.remix_install_complete = False
+            logging.error(f"Failed to install {dependency_name}: Python executable not found.")
+            queue_ref.put(('ERROR', "Python executable not found."))
+        finally:
+            check_dependencies()
+            queue_ref.put(('FINISHED', ''))
 
-        return {'FINISHED'}
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
 
+        is_finished = False
+        try:
+            while True:
+                report_type, message = self._queue.get_nowait()
+                if report_type == 'FINISHED':
+                    is_finished = True
+                else:
+                    self.report({report_type}, message)
+                    # --- THE ONLY FLAG IT SETS ---
+                    # If any install is successful, set this to True.
+                    if report_type == 'INFO':
+                        context.scene.remix_dependency_was_installed = True
+        except Empty:
+            pass
+
+        if is_finished:
+            context.scene.remix_is_installing_dependency = False
+            context.window_manager.event_timer_remove(self._timer)
+            context.workspace.status_text_set(None)
+            for region in context.area.regions:
+                if region.type == 'UI':
+                    region.tag_redraw()
+            return {'FINISHED'}
+            
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        if not self.dependency:
+            self.report({'ERROR'}, "No dependency specified.")
+            return {'CANCELLED'}
+        
+        context.scene.remix_is_installing_dependency = True
+        self._queue = Queue()
+        py_exec = sys.executable
+        self._thread = threading.Thread(target=self._install_in_thread, args=(py_exec, self.dependency, self._queue))
+        self._thread.start()
+        self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        context.workspace.status_text_set(f"Installing {self.dependency} in the background...")
+        return {'RUNNING_MODAL'}
 
 class REMIX_OT_restart_blender(Operator):
     """Saves the file and restarts Blender."""
@@ -4225,11 +4276,10 @@ class OBJECT_OT_export_and_ingest(Operator):
     # --- MODIFIED TASK COLLECTION FUNCTION ---
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [DEFINITIVE V3 - Cache-Aware UDIM Flagging]
-        Generates bake tasks. This version fixes a critical caching bug by ensuring
-        that a material is flagged as using UDIMs *before* the cache is checked.
-        This guarantees that the stitching process is always triggered for UDIM
-        materials, even when a bake is skipped due to a cache hit.
+        [DEFINITIVE V5 - SURGICAL CACHE FIX]
+        Generates bake tasks. This version correctly populates the bake_info['cached_materials']
+        dictionary on a cache hit, ensuring that the finalization step can construct
+        a material from the reused textures. All original complex logic is preserved.
         """
         tasks = []
         if not is_blend_file_saved():
@@ -4290,12 +4340,9 @@ class OBJECT_OT_export_and_ingest(Operator):
                 if not mat or not mat.use_nodes:
                     continue
             
-                # --- THIS IS THE FIX: UDIM check is now BEFORE the cache check ---
-                # This ensures bake_info['udim_materials'] is populated even on a cache hit.
                 uses_udims = self._material_uses_udims(mat)
                 if uses_udims and mat.name not in bake_info['udim_materials']:
                     bake_info['udim_materials'].add(mat.name)
-                # --- END OF FIX ---
 
                 material_hash = get_material_hash(
                     mat, obj, slot_index, image_hash_cache=global_image_hash_cache,
@@ -4306,6 +4353,12 @@ class OBJECT_OT_export_and_ingest(Operator):
                 if material_hash and material_hash in global_material_hash_cache:
                     logging.info(f"  CACHE HIT: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) is cached. Reusing.")
                     cached_data = global_material_hash_cache[material_hash]
+                    
+                    # <<< THIS IS THE ONLY CHANGE NEEDED >>>
+                    # This line tells the finalization step which textures to use for this cached material.
+                    bake_info['cached_materials'][material_hash] = cached_data
+                    
+                    # This part of your original code was already correct.
                     for socket_name, path in cached_data.items():
                         if socket_name in SPECIAL_TEXTURE_MAP:
                              bake_info['special_texture_info'][(obj.name, mat.name)].append({
@@ -4442,9 +4495,9 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         bake_info['tasks'] = tasks
         if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
-        if bake_info['cached_materials']: logging.info(f"Reusing cached textures for {len(bake_info['cached_materials'])} material contexts.")
+        if bake_info['cached_materials']: logging.info(f"Will reuse cached textures for {len(bake_info['cached_materials'])} material contexts.")
         return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
-    
+        
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
         if self._persistent_worker:
@@ -6211,12 +6264,18 @@ class OBJECT_OT_reset_options(Operator):
 
     def execute(self, context):
         addon_prefs = context.preferences.addons[__name__].preferences
+        
+        # --- Reset All Options to Default Values ---
         addon_prefs.remix_use_selection_only = False
         addon_prefs.remix_use_custom_name = False
         addon_prefs.remix_import_original_textures = False
         addon_prefs.remix_import_scale = 1.0
         addon_prefs.flip_faces_export = False
+        addon_prefs.mirror_on_export = False
         addon_prefs.mirror_import = False
+        addon_prefs.flip_normals_import = False
+        addon_prefs.remix_replace_stock_mesh = False
+        
         addon_prefs.obj_export_forward_axis = 'NEGATIVE_Z'
         addon_prefs.obj_export_up_axis = 'Y'
         addon_prefs.remix_server_url = "http://localhost:8011/stagecraft"
@@ -6224,11 +6283,15 @@ class OBJECT_OT_reset_options(Operator):
         addon_prefs.remix_export_scale = 1.0
         addon_prefs.remix_preset = 'CUSTOM'
         addon_prefs.remix_verify_ssl = True
-        addon_prefs.remix_import_original_textures = False
         addon_prefs.apply_modifiers = True
 
-        self.report({'INFO'}, "Remix Ingestor options have been reset to default, except for the custom base OBJ name.")
-        logging.info("Remix Ingestor options have been reset to default, except for the custom base OBJ name.")
+        # --- THIS IS THE FIX ---
+        # Reset the custom base name string to its default.
+        addon_prefs.remix_base_obj_name = "exported_object"
+        # --- END OF FIX ---
+        
+        self.report({'INFO'}, "Remix Ingestor options have been reset to their default values.")
+        logging.info("Remix Ingestor options have been reset to their default values.")
         return {'FINISHED'}
 
 class EXPORT_OT_SubstancePainterExporter(Operator):
@@ -6331,32 +6394,45 @@ class VIEW3D_PT_remix_ingestor(Panel):
         layout = self.layout
         addon_prefs = context.preferences.addons[__name__].preferences
 
-        # --- NEW: Combined Dependency Check ---
-        if not PSUTIL_INSTALLED or not PILLOW_INSTALLED:
+        # --- SECTION 1: Handle Dependency UI ---
+        # First, check if both dependencies are fully installed.
+        if PSUTIL_INSTALLED and PILLOW_INSTALLED:
+            # If they are, but an installation just happened in this session, show the restart button.
+            if getattr(context.scene, 'remix_dependency_was_installed', False):
+                box = layout.box()
+                box.label(text="Restart Required", icon='ERROR')
+                box.label(text="All dependencies are now installed.")
+                box.operator("remix.restart_blender", text="Save and Restart Blender", icon='RECOVER_LAST')
+            # If they are installed and no recent installation happened, we show nothing and proceed.
+        else:
+            # If we are here, at least one dependency is missing.
             box = layout.box()
             box.label(text="Dependencies Required", icon='ERROR')
-        
-            if not PSUTIL_INSTALLED:
-                col = box.column(align=True)
-                col.label(text="'psutil' is needed for resource management.")
-                op = col.operator("remix.install_dependency", text="Install psutil", icon='CONSOLE')
-                op.dependency = 'psutil'
 
-            if not PILLOW_INSTALLED:
-                col = box.column(align=True)
-                col.label(text="'Pillow' is needed for texture fixing.")
-                op = col.operator("remix.install_dependency", text="Install Pillow", icon='CONSOLE')
-                op.dependency = 'Pillow'
+            if getattr(context.scene, 'remix_is_installing_dependency', False):
+                # If an installation is currently running, show the busy message.
+                info_box = box.box()
+                info_row = info_box.row(align=True)
+                info_row.label(text="Installing dependency...", icon='SORTTIME')
+                info_row.label(text="Wait 10 seconds")
+            else:
+                # If no installation is running, show buttons for what's missing.
+                if not PSUTIL_INSTALLED:
+                    col = box.column(align=True)
+                    col.label(text="'psutil' is needed for resource management.")
+                    op = col.operator("remix.install_dependency", text="Install psutil", icon='CONSOLE')
+                    op.dependency = 'psutil'
 
-            if getattr(context.scene, 'remix_install_complete', False):
-                    info_box = box.box()
-                    info_box.label(text="Installation successful!", icon='CHECKMARK')
-                    info_box.label(text="Please restart Blender now to apply.")
-                    box.operator("remix.restart_blender", text="Save and Restart Blender", icon='RECOVER_LAST')
-        
-            return # Stop drawing the rest of the panel
+                if not PILLOW_INSTALLED:
+                    col = box.column(align=True)
+                    col.label(text="'Pillow' is needed for texture fixing.")
+                    op = col.operator("remix.install_dependency", text="Install Pillow", icon='CONSOLE')
+                    op.dependency = 'Pillow'
+            # Stop drawing the rest of the panel if we are in the dependency section.
+            return
 
-        # --- Main Addon UI (only drawn if all dependencies are installed) ---
+        # --- SECTION 2: Main Addon UI ---
+        # This section will only be drawn if all dependencies are installed and no restart is pending.
         export_box = layout.box()
         export_box.label(text="Export & Ingest", icon='EXPORT')
         export_box.prop(addon_prefs, "remix_ingest_directory", text="Ingest Directory")
@@ -6372,7 +6448,6 @@ class VIEW3D_PT_remix_ingestor(Panel):
         export_box.prop(addon_prefs, "remix_replace_stock_mesh", text="Replace Stock Mesh")
         export_box.prop(addon_prefs, "mirror_on_export", text="Mirror on Export")
         export_box.prop(addon_prefs, "flip_faces_export", text="Flip Normals During Export")
-
         export_box.prop(addon_prefs, "apply_modifiers")
     
         row = export_box.row(align=True)
@@ -6383,7 +6458,6 @@ class VIEW3D_PT_remix_ingestor(Panel):
         row.prop(addon_prefs, "obj_export_up_axis", text="")
     
         export_box.prop(addon_prefs, "remix_export_scale", text="Export Scale")
-    
         export_box.operator("object.export_and_ingest", text="Export and Ingest", icon='PLAY')
 
         import_box = layout.box()
@@ -6426,19 +6500,13 @@ classes = [
     REMIX_OT_install_dependency,
     REMIX_OT_restart_blender,
 ]
-     
-      
-      
+           
 def register():
     global BAKE_WORKER_PY
     log = logging.getLogger(__name__)
 
-    # ################################################################## #
-    # THIS IS THE FIRST CRITICAL CHANGE                                  #
-    # Run the orphan cleanup routine every time the addon loads.         #
     check_dependencies()
     cleanup_orphan_directories()
-    # ################################################################## #
 
     try:
         setup_logger()
@@ -6451,13 +6519,12 @@ def register():
 
         bpy.types.Scene.remix_custom_settings_backup = PointerProperty(type=CustomSettingsBackup)
         bpy.types.Scene.remix_asset_number = CollectionProperty(type=AssetNumberItem)
-        bpy.types.Scene.remix_install_complete = BoolProperty(
-            name="Remix Install Complete",
-            description="Tracks if a dependency installation has been attempted.",
-            default=False
-        )
         
-        # We can still keep the atexit handler for graceful shutdowns, but it's no longer the primary defense
+        # --- MODIFIED FLAGS ---
+        bpy.types.Scene.remix_is_installing_dependency = BoolProperty(default=False)
+        # This new flag remembers if an install happened, so we know to show the restart button.
+        bpy.types.Scene.remix_dependency_was_installed = BoolProperty(default=False)
+
         atexit.register(_kill_all_active_workers)
         log.info("Remix Ingestor addon registration complete with orphan process handler and startup cleanup.")
     except Exception as e:
@@ -6466,38 +6533,26 @@ def register():
 
 def unregister():
     log = logging.getLogger(__name__)
-
-    # --- THIS IS THE FIX ---
-    # First, gracefully shut down any workers that might be running
-    # and clear the global registry. This effectively disables the atexit handler.
     _kill_all_active_workers()
 
-    # The atexit documentation notes that unregistering can be problematic.
-    # The safest method is to ensure the registered function does nothing
-    # after the module is unlinked, which is what clearing the list achieves.
-    # For good measure, we can try to unregister it, but we'll wrap it in a
-    # try...except block as it's not guaranteed to exist or work in all
-    # Blender shutdown scenarios.
     try:
         import atexit
-        # This is a less-common function and was only added in Python 3.9
-        # so we check for its existence before calling.
         if hasattr(atexit, 'unregister'):
             atexit.unregister(_kill_all_active_workers)
             log.info("atexit handler for orphan processes has been unregistered.")
     except Exception as e:
         log.warning(f"Could not explicitly unregister atexit handler: {e}")
-    # --- END OF FIX ---
 
     for cls in reversed(classes):
-        try:
-            bpy.utils.unregister_class(cls)
-        except RuntimeError:
-            pass
+        try: bpy.utils.unregister_class(cls)
+        except RuntimeError: pass
+        
     try:
         del bpy.types.Scene.remix_asset_number
         del bpy.types.Scene.remix_custom_settings_backup
-        del bpy.types.Scene.remix_install_complete
+        # --- DELETE MODIFIED FLAGS ---
+        del bpy.types.Scene.remix_is_installing_dependency
+        del bpy.types.Scene.remix_dependency_was_installed
     except (AttributeError, TypeError):
         pass
         
