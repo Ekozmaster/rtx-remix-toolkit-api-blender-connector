@@ -13,6 +13,7 @@ import uuid     # <-- ADD THIS LINE
 import collections
 from threading import Lock, RLock
 from collections import defaultdict
+from collections import deque
 
 # --- Worker-Specific Globals & Functions ---
 
@@ -244,132 +245,182 @@ def _find_bsdf_and_output_nodes(node_tree):
         output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
     return bsdf_node, output_node
 
-def _find_universal_decal_mixer(current_node, end_node, visited_nodes):
-    """The recursive engine for finding an intermediate mix or add shader."""
-    if current_node in visited_nodes or current_node == end_node:
-        return None
-    visited_nodes.add(current_node)
+def _find_universal_decal_mixer(start_node, end_node, visited_nodes):
+    """
+    [ITERATIVE VERSION] Finds an intermediate mix shader between a start and end node.
+    This version uses a queue to perform a breadth-first search, making it immune to
+    stack overflows. It correctly handles nested node groups.
+    
+    Returns:
+        A tuple (found_node, group_instance_node) or None.
+        - found_node: The Mix Shader that was found.
+        - group_instance_node: The Group Node that contains the found_node, or None if it's in the main tree.
+    """
+    # The queue stores tuples of: (node_to_check, parent_group_instance)
+    q = deque([(start_node, None)])
+    visited_nodes.add(start_node)
 
-    if current_node.type == 'MIX_SHADER':
-        log(f"      - [Search] SUCCESS: Found Mix Shader '{current_node.name}'.")
-        return (current_node, None)
+    while q:
+        current_node, parent_group = q.popleft()
 
-    if current_node.type == 'GROUP' and current_node.node_tree:
-        log(f"      - [Search] Traversing into Group Node: '{current_node.name}' (Tree: '{current_node.node_tree.name}')")
-        group_tree = current_node.node_tree
-        internal_output = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT' and n.is_active_output), None)
-        if internal_output:
-            shader_input = next((s for s in internal_output.inputs if s.type == 'SHADER' and s.is_linked), None)
-            if shader_input:
-                found_result = _find_universal_decal_mixer(shader_input.links[0].from_node, end_node, visited_nodes)
-                if found_result:
-                    found_node, _ = found_result
-                    log(f"      - [Search] SUCCESS: Found target '{found_node.name}' within group '{current_node.name}'.")
-                    return (found_node, current_node)
-        log(f"      - [Search] Finished traversing group '{current_node.name}'.")
+        if current_node == end_node:
+            continue
 
-    next_input = next((inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked), None)
-    if next_input:
-        return _find_universal_decal_mixer(next_input.links[0].from_node, end_node, visited_nodes)
+        # --- Base Case: Success ---
+        if current_node.type == 'MIX_SHADER':
+            log(f"      - [Iterative Search] SUCCESS: Found Mix Shader '{current_node.name}'.")
+            return (current_node, parent_group)
+
+        # --- Iteration Case 1: Traverse into a Group Node ---
+        if current_node.type == 'GROUP' and current_node.node_tree:
+            log(f"      - [Iterative Search] Traversing into Group Node: '{current_node.name}' (Tree: '{current_node.node_tree.name}')")
+            group_tree = current_node.node_tree
+            internal_output = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT' and n.is_active_output), None)
+            
+            if internal_output:
+                shader_input = next((s for s in internal_output.inputs if s.type == 'SHADER' and s.is_linked), None)
+                if shader_input:
+                    # The next node to check is inside the group, and its "parent" is the current_node group instance.
+                    next_node_in_group = shader_input.links[0].from_node
+                    if next_node_in_group not in visited_nodes:
+                        visited_nodes.add(next_node_in_group)
+                        q.append((next_node_in_group, current_node))
+
+        # --- Iteration Case 2: Traverse to the previous node in the chain ---
+        next_input_to_follow = next((inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked), None)
+        if next_input_to_follow:
+            previous_node = next_input_to_follow.links[0].from_node
+            if previous_node not in visited_nodes:
+                visited_nodes.add(previous_node)
+                # The parent_group context carries over to the previous node.
+                q.append((previous_node, parent_group))
+                
+    # If the queue empties, no mix shader was found in the path.
     return None
 
 def _find_intermediate_mix_shader(start_node, end_node, visited_nodes):
     """
-    The recursive engine for finding an intermediate mix or add shader.
+    [ITERATIVE VERSION] Recursively finds an intermediate Mix or Add shader.
+    This version uses a queue to perform a breadth-first search, making it
+    immune to stack overflows.
     """
-    if start_node == end_node:
-        return None
+    # The queue stores the nodes to visit.
+    q = deque([start_node])
     visited_nodes.add(start_node)
-    if start_node.type in {'MIX_SHADER', 'ADD_SHADER'}:
-        return start_node
-    if start_node.type == 'GROUP' and start_node.node_tree:
-        internal_output = next((n for n in start_node.node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
-        if internal_output:
-            for grp_input in (i for i in internal_output.inputs if i.type == 'SHADER' and i.is_linked):
-                prev_node = grp_input.links[0].from_node
-                if prev_node not in visited_nodes:
-                    found = _find_intermediate_mix_shader(prev_node, end_node, visited_nodes)
-                    if found:
-                        return found
-    for shader_input in (i for i in start_node.inputs if i.type == 'SHADER' and i.is_linked):
-        prev_node = shader_input.links[0].from_node
-        if prev_node not in visited_nodes:
-            found = _find_intermediate_mix_shader(prev_node, end_node, visited_nodes)
-            if found:
-                return found
+
+    while q:
+        current_node = q.popleft()
+
+        if current_node == end_node:
+            continue
+
+        # --- Base Case: Success ---
+        if current_node.type in {'MIX_SHADER', 'ADD_SHADER'}:
+            return current_node
+
+        # --- Iteration Case 1: Dive into a Group Node ---
+        if current_node.type == 'GROUP' and current_node.node_tree:
+            internal_output = next((n for n in current_node.node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+            if internal_output:
+                for grp_input in (i for i in internal_output.inputs if i.type == 'SHADER' and i.is_linked):
+                    prev_node_in_group = grp_input.links[0].from_node
+                    if prev_node_in_group not in visited_nodes:
+                        visited_nodes.add(prev_node_in_group)
+                        q.append(prev_node_in_group)
+        
+        # --- Iteration Case 2: Follow all shader inputs backwards ---
+        # This is more thorough than the original, checking all inputs, not just the first one.
+        for shader_input in (i for i in current_node.inputs if i.type == 'SHADER' and i.is_linked):
+            prev_node = shader_input.links[0].from_node
+            if prev_node not in visited_nodes:
+                visited_nodes.add(prev_node)
+                q.append(prev_node)
+                
+    # If the queue empties, no suitable shader was found.
     return None
 
 def _get_socket_to_bake(node_tree, target_socket_name):
     """
-    [DEFINITIVE V3 - NODE GROUP AWARE] Finds a target socket by recursively
+    [DEFINITIVE V4 - ITERATIVE] Finds a target socket by iteratively
     traversing the shader graph backwards from the material output. This version
-    is fully aware of node groups and can trace inputs through them.
+    is immune to stack overflows from deep node graphs and is fully aware of
+    nested node groups.
     """
-    log(f" > Starting robust recursive search for socket '{target_socket_name}'...")
+    log(f" > Starting robust ITERATIVE search for socket '{target_socket_name}'...")
 
-    # Find the active Material Output node.
     output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
     if not output_node:
-        log("   - ERROR: Could not find an active Material Output node.")
+        # Fallback to any material output if the active one isn't found
+        output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        if not output_node:
+            log("   - ERROR: Could not find any Material Output node.")
+            return None
+
+    if not output_node.inputs['Surface'].is_linked:
+        # As a final fallback for some channels, check the displacement socket directly
+        if target_socket_name == 'Displacement' and 'Displacement' in output_node.inputs:
+             log(" > Surface is unlinked. Checking direct Displacement output as a fallback.")
+             return output_node.inputs['Displacement']
+        log("   - ERROR: Material Output node's Surface is not connected.")
         return None
 
-    # This is the recursive engine.
-    def find_source_recursively(current_node, visited_nodes):
-        # Prevent infinite loops.
-        if current_node in visited_nodes:
-            return None
-        visited_nodes.add(current_node)
+    # --- Iterative Search Setup ---
+    # The deque will store tuples of (node_to_visit, node_tree_it_belongs_to)
+    q = deque()
+    # The visited set will store tuples of (node.name, node_tree.name) to prevent reprocessing
+    visited = set()
 
-        # Base Case 1: Success. The socket is an input on the current node.
+    # Start the search from the node connected to the material output
+    start_node = output_node.inputs['Surface'].links[0].from_node
+    q.append(start_node)
+    visited.add((start_node.name, node_tree.name))
+    log(f"   - Starting search from node: '{start_node.name}'")
+
+    while q:
+        current_node = q.popleft()
+
+        # --- Base Case 1: Success ---
+        # The target socket is a direct input on the current node.
         if target_socket_name in current_node.inputs:
             log(f"      - SUCCESS: Found target socket '{target_socket_name}' on node '{current_node.name}'.")
             return current_node.inputs[target_socket_name]
 
-        # Recursive Case 1: The current node is a group. Dive into it.
+        # --- Iteration Case 1: The current node is a Group. Dive into it. ---
         if current_node.type == 'GROUP' and current_node.node_tree:
             log(f"      - Traversing into Group Node: '{current_node.name}'")
-            group_output_node = next((n for n in current_node.node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+            group_tree = current_node.node_tree
+            # Find the group's own output node to trace backwards from.
+            group_output_node = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+            
             if group_output_node:
-                # Find the shader input on the group's output node
+                # Find the shader input on the group's output node, as that's the "end" of the internal graph.
                 shader_input = next((s for s in group_output_node.inputs if s.type == 'SHADER' and s.is_linked), None)
                 if shader_input:
-                    # Continue the search from the node connected to the group's internal output.
-                    found_socket = find_source_recursively(shader_input.links[0].from_node, visited_nodes)
-                    if found_socket:
-                        return found_socket
+                    # The next node to check is the one connected to the group's internal output.
+                    internal_node_to_visit = shader_input.links[0].from_node
+                    if (internal_node_to_visit.name, group_tree.name) not in visited:
+                        q.append(internal_node_to_visit)
+                        visited.add((internal_node_to_visit.name, group_tree.name))
+                        log(f"        - Queued internal node for visit: '{internal_node_to_visit.name}'")
 
-        # Recursive Case 2: Traverse backwards through any shader input.
+        # --- Iteration Case 2: Traverse backwards through any shader input. ---
+        # This handles Mix Shaders, Add Shaders, etc.
         for shader_input in (inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked):
             previous_node = shader_input.links[0].from_node
-            log(f"      - Traversing from '{current_node.name}' backwards to '{previous_node.name}'...")
-            found_socket = find_source_recursively(previous_node, visited_nodes)
-            if found_socket:
-                return found_socket
+            if (previous_node.name, node_tree.name) not in visited:
+                log(f"      - Traversing from '{current_node.name}' backwards to '{previous_node.name}'...")
+                q.append(previous_node)
+                visited.add((previous_node.name, node_tree.name))
 
-        # Base Case 2: Dead end.
-        return None
-
-    # Start the search from the node connected to the material output.
-    if not output_node.inputs['Surface'].is_linked:
-        log("   - ERROR: Material Output node's Surface is not connected.")
-        return None
-        
-    start_node = output_node.inputs['Surface'].links[0].from_node
-    log(f"   - Starting search from node: '{start_node.name}'")
-    
-    final_socket = find_source_recursively(start_node, set())
-
-    if final_socket:
-        log(f" > Search complete. Successfully found '{final_socket.name}' on '{final_socket.node.name}'.")
-    else:
-        # --- NEW: Also check the Displacement socket as a final fallback ---
-        if target_socket_name == 'Displacement' and 'Displacement' in output_node.inputs:
-             log(" > Search failed for shader, checking direct Displacement output.")
-             return output_node.inputs['Displacement']
-        log(f" > FINAL WARNING: Robust search could not find a source for '{target_socket_name}'.")
-        
-    return final_socket
-
+    # --- Base Case 2: Failure ---
+    # If the queue becomes empty, we've explored all paths.
+    # Check the direct Displacement socket as a final fallback.
+    if target_socket_name == 'Displacement' and 'Displacement' in output_node.inputs:
+         log(" > Search failed for shader path, but found a direct connection to Material Output Displacement.")
+         return output_node.inputs['Displacement']
+         
+    log(f" > FINAL WARNING: Iterative search could not find a source for '{target_socket_name}'.")
+    return None
 
 def _setup_bake_environment(task, obj, original_mat):
     """
@@ -739,8 +790,9 @@ def _composite_decal_bakes(img, decal_albedo_img, decal_alpha_img):
 
 def _perform_simple_bake(setup_data, task, active_output_node):
     """
-    [CORRECTED] Performs a simple, single-pass bake with proper handling for
-    different bake types and robust cleanup.
+    [CORRECTED - V2] Performs a simple, single-pass bake and now correctly
+    calls the ITERATIVE version of _get_socket_to_bake, preventing stack overflows
+    on complex but "simple" materials.
     """
     nt = setup_data['nt']
     img = setup_data['img']
@@ -749,28 +801,33 @@ def _perform_simple_bake(setup_data, task, active_output_node):
 
     if bake_type == 'EMIT':
         log(f" > Performing EMIT bake for socket '{task['target_socket_name']}'...")
+        
+        # --- THIS IS THE CRITICAL FIX ---
+        # This now calls the robust, iterative version of the function.
         socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
+        # --- END OF CRITICAL FIX ---
 
         if not socket_to_bake:
             log(f" > SIMPLE BAKE WARNING: Could not find socket '{task['target_socket_name']}'. Skipping.")
             return
 
-        # --- THIS IS THE FIX FOR THE ReferenceError ---
-        # Store the sockets themselves, NOT the link object.
+        # Store the sockets themselves, NOT the link object, to avoid ReferenceErrors.
         original_from_socket = None
         original_to_socket = None
         if active_output_node and active_output_node.inputs['Surface'].is_linked:
             link = active_output_node.inputs['Surface'].links[0]
             original_from_socket, original_to_socket = link.from_socket, link.to_socket
             nt.links.remove(link)
-        # --- END OF FIX ---
 
         emission_node = nt.nodes.new('ShaderNodeEmission')
         try:
             if socket_to_bake.is_linked:
-                nt.links.new(socket_to_bake.links[0].from_socket, emission_node.inputs['Color' if not task.get('is_value_bake') else 'Strength'])
+                # Determine if the bake is for a value (grayscale) or color (RGB)
+                input_socket_name = 'Strength' if task.get('is_value_bake') else 'Color'
+                nt.links.new(socket_to_bake.links[0].from_socket, emission_node.inputs[input_socket_name])
             else:
-                input_socket = emission_node.inputs['Color' if not task.get('is_value_bake') else 'Strength']
+                # Also handle the default value correctly
+                input_socket = emission_node.inputs['Strength' if task.get('is_value_bake') else 'Color']
                 input_socket.default_value = socket_to_bake.default_value
 
             if active_output_node:
@@ -784,11 +841,13 @@ def _perform_simple_bake(setup_data, task, active_output_node):
             img.save()
 
         finally:
-            # Cleanup the hijack
-            nt.nodes.remove(emission_node)
-            # Restore the connection using the safely stored sockets.
+            # Cleanup the node hijacking
+            if emission_node.name in nt.nodes:
+                nt.nodes.remove(emission_node)
+            # Restore the original connection using the safely stored sockets.
             if original_from_socket and original_to_socket:
-                nt.links.new(original_from_socket, original_to_socket)
+                if original_from_socket.node.name in nt.nodes and original_to_socket.node.name in nt.nodes:
+                    nt.links.new(original_from_socket, original_to_socket)
     else:
         log(f" > Performing NATIVE bake for type '{bake_type}'...")
         bpy.ops.object.select_all(action='DESELECT')
