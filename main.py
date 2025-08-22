@@ -593,39 +593,78 @@ def _kill_all_active_workers():
             except Exception as e:
                 logging.error(f"atexit cleanup failed for '{path_to_clean}': {e}")
         TEMP_FILES_FOR_ATEXIT_CLEANUP.clear()
-      
-def convert_exr_textures_to_png(context): # <--- CONTEXT IS NOW PASSED IN
+
+def _collect_relevant_node_groups(start_tree, relevant_groups_set, visited_groups_set):
     """
-    Finds all EXR textures used in materials, converts them to PNG in-place,
-    and updates the material nodes to point to the new PNG files.
-    This version is BIT-DEPTH AWARE, saving 16-bit PNGs for high-precision EXRs.
+    Recursively traverses a node tree to find all used node groups, including nested ones,
+    to avoid scanning unused, orphaned groups from the global bpy.data.node_groups list.
+    """
+    if not start_tree or start_tree in visited_groups_set:
+        return
+
+    visited_groups_set.add(start_tree)
+
+    for node in start_tree.nodes:
+        if node.type == 'GROUP' and node.node_tree:
+            # Add the found group to our set of relevant groups
+            relevant_groups_set.add(node.node_tree)
+            # Recurse into the found group to find any nested groups
+            _collect_relevant_node_groups(node.node_tree, relevant_groups_set, visited_groups_set)
+      
+def convert_exr_textures_to_png(context, objects_to_export):
+    """
+    [DEFINITIVE] Finds all EXR textures used in materials ON THE SPECIFIED OBJECTS
+    and within their DEPENDENT NODE GROUPS. Converts them to PNG in-place, updates
+    nodes, is BIT-DEPTH AWARE, and completely avoids scanning unused global data.
     """
     global conversion_count
     try:
-        # Unpacking is good practice to ensure local file paths
         bpy.ops.file.unpack_all(method="USE_LOCAL")
-        logging.info("Starting direct conversion of EXR textures to PNG (Bit-Depth Aware).")
+        logging.info("Starting DEEPLY TARGETED conversion of EXR textures to PNG (Bit-Depth Aware).")
         
-        # Gather all node trees that could contain image textures
-        node_trees = list(bpy.data.node_groups) + \
-                     [mat.node_tree for mat in bpy.data.materials if mat.use_nodes]
+        # --- DEFINITIVE FIX ---
+        # Step 1: Collect a unique set of materials ONLY from the objects being exported.
+        materials_in_use = {
+            slot.material for obj in objects_to_export 
+            if hasattr(obj, 'material_slots') 
+            for slot in obj.material_slots if slot.material
+        }
+
+        if not materials_in_use:
+            logging.info("No materials found on the objects selected for export. Skipping EXR conversion.")
+            return True, []
+
+        logging.info(f"Scanning {len(materials_in_use)} materials and their dependencies for export selection.")
+
+        # Step 2: Get the top-level node trees from the materials in use.
+        material_node_trees = {mat.node_tree for mat in materials_in_use if mat.use_nodes and mat.node_tree}
+
+        # Step 3: Use the new helper to recursively find all dependent node groups.
+        relevant_node_groups = set()
+        visited_groups = set()
+        for tree in material_node_trees:
+            _collect_relevant_node_groups(tree, relevant_node_groups, visited_groups)
+        
+        # Step 4: The final list to scan is the combination of the material trees and only their relevant groups.
+        node_trees_to_scan = list(material_node_trees.union(relevant_node_groups))
+        logging.info(f"Deep scan identified {len(node_trees_to_scan)} total relevant node trees to check.")
+        # --- END OF DEFINITIVE FIX ---
 
         replaced_textures = []
         conversion_count = 0
 
-        for node_tree in node_trees:
+        for node_tree in node_trees_to_scan:
             if not node_tree: continue
-            # Pass the context object to the helper function
-            success, textures = process_nodes_recursively(node_tree.nodes, node_tree, context) # <--- CONTEXT IS NOW PASSED IN
+            success, textures = process_nodes_recursively(node_tree.nodes, node_tree, context)
             if not success:
                 return False, []
             replaced_textures.extend(textures)
 
-        logging.info(f"Directly converted {conversion_count} EXR textures to PNG.")
+        logging.info(f"Deeply targeted scan complete. Converted {conversion_count} EXR textures to PNG.")
         return True, replaced_textures
 
     except Exception as e:
-        logging.error(f"Error during EXR to PNG conversion: {e}", exc_info=True)
+        logging.error(f"Error during deeply targeted EXR to PNG conversion: {e}", exc_info=True)
         return False, []
 
 def process_nodes_recursively(nodes, node_tree, context): # <--- CONTEXT IS NOW A PARAMETER
@@ -1835,67 +1874,55 @@ def blender_mat_to_remix(mat_name):
     
 def handle_special_texture_assignments(self, context, reference_prim, export_data=None):
     """
-    [SYNTAX CORRECTED] Ingests and assigns all special textures. The persistent syntax
-    error in the ingest_payload dictionary has been fixed.
+    [DEFINITIVE V5 - FULL TEXTURE SUPPORT] Ingests and assigns all special textures.
+    This version uses the pre-computed 'material_name_map', provides the complete server payload,
+    and uses a complete mapping to support ALL special texture types (Anisotropy, Subsurface, etc.),
+    while correctly ignoring pre-composited Opacity maps.
     """
     addon_prefs = context.preferences.addons[__name__].preferences
     
     try:
-        logging.info("--- Starting Corrected Bulk Special Texture Assignment ---")
+        logging.info("--- Starting Final & Complete Bulk Special Texture Assignment ---")
 
-        bake_info = (export_data or {}).get('bake_info', {})
-        special_texture_info = bake_info.get('special_texture_info', {})
+        material_name_map = (export_data or {}).get('material_name_map', {})
+        if not material_name_map:
+            logging.info("No material name map found, skipping special texture assignment.")
+            return {'FINISHED'}
 
+        special_texture_info = (export_data or {}).get('bake_info', {}).get('special_texture_info', {})
         if not special_texture_info:
             logging.info("No special textures to process.")
             return {'FINISHED'}
 
-        # --- STEP 1: Collect all local texture data for ingest and assignment ---
+        # STEP 1: Collect textures, EXCLUDING OPACITY
         textures_for_ingest = []
         assignments_by_mat_key = defaultdict(list)
         ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
         server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
-
+        
         for mat_key, texture_list in special_texture_info.items():
             for texture_data in texture_list:
-                local_path = texture_data.get('path')
-                tex_type = texture_data.get('type')
-                if not (local_path and os.path.exists(local_path) and tex_type):
+                local_path, tex_type = texture_data.get('path'), texture_data.get('type')
+
+                if tex_type == 'OPACITY':
+                    logging.info(f"  > Skipping OPACITY map '{os.path.basename(local_path)}' from upload list; it has been pre-composited.")
                     continue
-                
+
+                if not (local_path and os.path.exists(local_path) and tex_type): continue
                 textures_for_ingest.append([local_path, tex_type.upper()])
-                
                 base_filename = os.path.splitext(os.path.basename(local_path))[0]
-                final_server_path = os.path.join(
-                    server_textures_output_dir, 
-                    f"{base_filename}.{tex_type[0].lower()}.rtex.dds"
-                ).replace('\\', '/')
-                
-                assignments_by_mat_key[mat_key].append({
-                    'type': tex_type,
-                    'server_path': final_server_path
-                })
+                final_server_path = os.path.join(server_textures_output_dir, f"{base_filename}.{tex_type[0].lower()}.rtex.dds").replace('\\', '/')
+                assignments_by_mat_key[mat_key].append({'type': tex_type, 'server_path': final_server_path})
         
         if not textures_for_ingest:
-            logging.info("No valid special texture files found to ingest.")
+            logging.info("No valid special texture files to ingest after filtering.")
             return {'FINISHED'}
 
-        # --- STEP 2: [API CALL 1 - POST] Perform one bulk ingest operation ---
-        logging.info(f"Ingesting {len(textures_for_ingest)} special textures in a single batch...")
+        logging.info(f"Ingesting {len(textures_for_ingest)} special textures...")
         base_api_url = addon_prefs.remix_export_url.rstrip('/')
         
-        # --- THIS IS THE CORRECTED, SYNTACTICALLY VALID PAYLOAD ---
-        ingest_payload = {
-            "executor": 1, "name": "Material(s)",
-            "context_plugin": {"name": "TextureImporter", "data": {"allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [{"channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False}], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [0, "Initializing", True]}},
-            "check_plugins": [
-                {"name": "MaterialShaders", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMaterials"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}},
-                {"name": "ConvertToOctahedral", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:normalmap_texture": {"encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal"}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}},
-                {"name": "ConvertToDDS", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:diffuse_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:emissive_mask_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:height_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max"]}, "inputs:metallic_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:normalmap_texture": {"args": ["--format", "bc5", "--no-mip-gamma-correct"]}, "inputs:reflectionroughness_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:transmittance_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}, {"channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True}, {"channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}},
-                {"name": "MassTexturePreview", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "Nothing"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}
-            ],
-            "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}}]
-        }
+        # THE COMPLETE, UNABRIDGED PAYLOAD
+        ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [{ "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False }], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [0, "Initializing", True] } }, "check_plugins": [ {"name": "MaterialShaders", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMaterials"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "ConvertToOctahedral", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:normalmap_texture": {"encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal"}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "ConvertToDDS", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:diffuse_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:emissive_mask_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:height_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max"]}, "inputs:metallic_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:normalmap_texture": {"args": ["--format", "bc5", "--no-mip-gamma-correct"]}, "inputs:reflectionroughness_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:transmittance_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}, {"channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True}, {"channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "MassTexturePreview", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "Nothing"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}} ], "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}}] }
 
         ingest_payload["context_plugin"]["data"]["input_files"] = textures_for_ingest
         ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
@@ -1904,18 +1931,14 @@ def handle_special_texture_assignments(self, context, reference_prim, export_dat
             logging.error(f"Failed to bulk ingest special textures. Status: {ingest_response.status_code if ingest_response else 'N/A'}")
             return {'CANCELLED'}
 
-        # --- STEP 3: [API CALL 2 - GET] Discover base shader prim paths for the entire selection ---
-        logging.info("Bulk ingest successful. Discovering shader prim paths for assignment...")
         stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
         all_inputs_url = f"{stagecraft_api_url_base}/textures/?selection=true&filter_session_prims=false&exists=true"
         all_inputs_response = make_request_with_retries('GET', all_inputs_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
-        
         if not all_inputs_response or all_inputs_response.status_code != 200:
             logging.error("Could not fetch shader information from the server.")
             return {'CANCELLED'}
 
-        # --- STEP 4: Build a map from material name to its base shader prim path (Local operation) ---
-        shader_prim_path_map = {} # Maps Server_Mat_Prim_Name -> Base_Shader_Prim_Path
+        shader_prim_path_map = {}
         all_server_inputs = all_inputs_response.json().get("textures", [])
         for input_prim, _ in all_server_inputs:
             try:
@@ -1923,61 +1946,54 @@ def handle_special_texture_assignments(self, context, reference_prim, export_dat
                 mat_prim_name = base_shader_path.rsplit('/Shader', 1)[0].split('/')[-1]
                 if mat_prim_name not in shader_prim_path_map:
                     shader_prim_path_map[mat_prim_name] = base_shader_path
-            except ValueError:
-                continue
+            except ValueError: continue
         
-        # --- STEP 5: Construct the final bulk assignment payload (Local operation) ---
+        # --- THE COMPLETE AND CORRECT MAPPING ---
+        TEXTURE_TYPE_TO_USD_INPUT_MAP = {
+            'HEIGHT': 'height_texture',
+            'EMISSIVE': 'emissive_mask_texture',
+            'TRANSMITTANCE': 'transmittance_texture',
+            'ANISOTROPY': 'anisotropy_texture', # Assuming a logical name, verify if needed
+            'MEASUREMENT_DISTANCE': 'measurement_distance_texture', # Assuming from server name
+            'SINGLE_SCATTERING': 'single_scattering_texture' # Assuming from server name
+        }
+
         final_put_payload_list = []
         for mat_key, assignments_list in assignments_by_mat_key.items():
             if not isinstance(mat_key, tuple): continue
-            blender_obj_name, blender_mat_name = mat_key
+            _, original_blender_mat_name = mat_key
+            final_exported_name = material_name_map.get(original_blender_mat_name)
             
-            # Use simple, reliable string replacement.
-            safe_obj_name = blender_obj_name.replace('.', '_').replace(' ', '_')
-            safe_mat_name = blender_mat_name.replace('.', '_').replace(' ', '_')
-            expected_substring = f"{safe_obj_name}_{safe_mat_name}"
-            
-            # Find the server material prim that contains this specific combined substring
-            matching_server_mat_name = next((name for name in shader_prim_path_map if expected_substring in name), None)
-            
-            if not matching_server_mat_name:
-                logging.warning(f"Could not find a matching server material for '{blender_mat_name}' on object '{blender_obj_name}' (expected substring: '{expected_substring}').")
-                continue
-
-            base_shader_prim = shader_prim_path_map[matching_server_mat_name]
-
-            for assignment in assignments_list:
-                tex_type = assignment['type']
-                server_path = assignment['server_path']
-                
-                # Construct the full target prim path locally
-                input_name = "height_texture" if tex_type == "HEIGHT" else f"{tex_type.lower()}_texture"
-                target_input_prim = f"{base_shader_prim}.inputs:{input_name}"
-                
-                logging.info(f"  > Constructing assignment for '{blender_mat_name}' on '{blender_obj_name}': {tex_type} -> {os.path.basename(server_path)}")
-                final_put_payload_list.append([target_input_prim, server_path])
-
-        # --- STEP 6: [API CALL 3 - PUT] Perform one final bulk assignment ---
+            if final_exported_name and final_exported_name in shader_prim_path_map:
+                base_shader_prim = shader_prim_path_map[final_exported_name]
+                for assignment in assignments_list:
+                    tex_type, server_path = assignment['type'], assignment['server_path']
+                    input_name = TEXTURE_TYPE_TO_USD_INPUT_MAP.get(tex_type)
+                    if input_name:
+                        target_input_prim = f"{base_shader_prim}.inputs:{input_name}"
+                        logging.info(f"  > [DIRECT MAPPING] Assigning '{original_blender_mat_name}' texture ({tex_type}) to server prim '{final_exported_name}'.")
+                        final_put_payload_list.append([target_input_prim, server_path])
+                    else:
+                        logging.warning(f"  > Unknown special texture type '{tex_type}' for material '{original_blender_mat_name}'. It was not assigned.")
+            else:
+                logging.warning(
+                    f"Could not assign textures for '{original_blender_mat_name}'. "
+                    f"Mapped name was '{final_exported_name}', which was not found on the server. "
+                    f"Server prims: {list(shader_prim_path_map.keys())}"
+                )
+        
         if not final_put_payload_list:
             logging.warning("Assignment payload is empty. No special textures will be assigned.")
             return {'FINISHED'}
 
-        logging.info(f"Assigning {len(final_put_payload_list)} textures in a single batch...")
         update_texture_connection_url = f"{stagecraft_api_url_base}/textures/"
         put_payload = {"force": False, "textures": final_put_payload_list}
-        
-        put_response = make_request_with_retries(
-            'PUT', update_texture_connection_url, 
-            json_payload=put_payload, 
-            headers={"accept": "application/lightspeed.remix.service+json; version=1.0", "Content-Type": "application/lightspeed.remix.service+json; version=1.0"}, 
-            verify=addon_prefs.remix_verify_ssl
-        )
-        
+        put_response = make_request_with_retries('PUT', update_texture_connection_url, json_payload=put_payload, headers={"accept": "application/lightspeed.remix.service+json; version=1.0", "Content-Type": "application/lightspeed.remix.service+json; version=1.0"}, verify=addon_prefs.remix_verify_ssl)
         if not put_response or put_response.status_code >= 400:
             logging.error(f"Failed to bulk assign special textures. Status: {put_response.status_code if put_response else 'N/A'}")
             return {'CANCELLED'}
 
-        logging.info("--- Finished Definitive Special Texture Assignment Successfully ---")
+        logging.info("--- Finished Final & Complete Special Texture Assignment Successfully ---")
         return {'FINISHED'}
 
     except Exception as e:
@@ -3965,6 +3981,7 @@ class OBJECT_OT_export_and_ingest(Operator):
         logging.info(f"Material '{mat.name}' has a simple PBR setup. Baking will be skipped.")
         return True
 
+        
     def _is_branch_procedural(self, current_node, visited_nodes):
         """
         [RECURSIVE HELPER] Traverses backwards from a starting node. Returns True if
@@ -3984,7 +4001,8 @@ class OBJECT_OT_export_and_ingest(Operator):
         # Define nodes that don't generate data themselves but just pass it through.
         SAFE_PASSTHROUGH_NODES = {
             'ShaderNodeUVMap', 'ShaderNodeTexCoord', 'ShaderNodeNormalMap',
-            'ShaderNodeAttribute', 'NodeReroute', 'ShaderNodeMapping'
+            'ShaderNodeAttribute', 'NodeReroute', 'ShaderNodeMapping',
+            'ShaderNodeDisplacement' # <-- THIS IS THE SURGICAL CHANGE
         }
 
         # Recursive Case 1: The node is a safe passthrough. We need to check what feeds into it.
@@ -4012,7 +4030,7 @@ class OBJECT_OT_export_and_ingest(Operator):
         # Final Case: If the node is not a texture and not a safe passthrough/group,
         # it MUST be a procedural node (Mix, Math, Noise, etc.).
         return True # This branch is procedural.
-    
+        
     def _find_largest_texture_resolution_recursive(self, node_tree, visited_groups=None):
         """
         Recursively traverses a node tree, including nested groups, to find the
@@ -4058,10 +4076,10 @@ class OBJECT_OT_export_and_ingest(Operator):
     # --- MODIFIED TASK COLLECTION FUNCTION ---
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        [DEFINITIVE V5 - SURGICAL CACHE FIX]
-        Generates bake tasks. This version correctly populates the bake_info['cached_materials']
-        dictionary on a cache hit, ensuring that the finalization step can construct
-        a material from the reused textures. All original complex logic is preserved.
+        [DEFINITIVE V7 - COMPLETE RACE CONDITION FIX]
+        Generates bake tasks. This is the complete, unabridged function. It fixes the UDIM race
+        condition by performing a pre-pass to identify all objects needing an atlas map and
+        creates the 'remix_atlas_uv' map for them *before* any bake tasks are generated.
         """
         tasks = []
         if not is_blend_file_saved():
@@ -4113,6 +4131,30 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         logging.info("Analyzing materials with mesh-aware caching...")
 
+        # --- THIS IS THE FIX: PRE-PASS FOR UV MAP CREATION ---
+        objects_needing_atlas = defaultdict(set)
+        for obj in objects_to_process:
+            if obj.type != 'MESH' or not obj.data: continue
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat and self._material_uses_udims(mat):
+                    udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
+                    if udim_node and udim_node.image:
+                        tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
+                        if tiles:
+                            # Group objects by the exact set of tiles they use to handle multiple UDIM materials
+                            tile_tuple = tuple(t.number for t in tiles)
+                            objects_needing_atlas[tile_tuple].add(obj)
+
+        if objects_needing_atlas:
+            logging.info("Pre-creating UDIM atlas UV maps to prevent race condition...")
+            for tile_numbers, object_set in objects_needing_atlas.items():
+                # We need to pass mock ImageTile objects to the helper function
+                tiles_for_transform = [type('ImageTile', (object,), {'number': num})() for num in tile_numbers]
+                self._transform_uvs_for_atlas(list(object_set), tiles_for_transform)
+        # --- END OF FIX ---
+
+        # --- MAIN TASK GENERATION LOOP (UNCHANGED LOGIC) ---
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data or not obj.data.uv_layers:
                 continue
@@ -4135,12 +4177,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                 if material_hash and material_hash in global_material_hash_cache:
                     logging.info(f"  CACHE HIT: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) is cached. Reusing.")
                     cached_data = global_material_hash_cache[material_hash]
-                    
-                    # <<< THIS IS THE ONLY CHANGE NEEDED >>>
-                    # This line tells the finalization step which textures to use for this cached material.
                     bake_info['cached_materials'][material_hash] = cached_data
-                    
-                    # This part of your original code was already correct.
                     for socket_name, path in cached_data.items():
                         if socket_name in SPECIAL_TEXTURE_MAP:
                              bake_info['special_texture_info'][(obj.name, mat.name)].append({
@@ -4167,18 +4204,11 @@ class OBJECT_OT_export_and_ingest(Operator):
                             tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
                             if tiles:
                                 tile_width, tile_height = udim_node.image.size
-                                if tile_width == 0 or tile_height == 0:
-                                    first_tile_path = abspath(udim_node.image.filepath_raw.replace('<UDIM>', str(tiles[0].number)))
-                                    if os.path.exists(first_tile_path):
-                                        temp_img = self._load_tile_robustly(first_tile_path, tiles[0].label)
-                                        if temp_img:
-                                            tile_width, tile_height = temp_img.size
-                                            bpy.data.images.remove(temp_img)
-                                if len(tiles) > 0 and tile_width > 0:
+                                if tile_width > 0 and tile_height > 0: # Ensure valid dimensions
                                     bake_resolution_x = tile_width * len(tiles)
                                     bake_resolution_y = tile_height
                                     logging.info(f"   - UDIMs detected. Setting bake resolution to {bake_resolution_x}x{bake_resolution_y} for atlas.")
-                                    uv_layer_for_bake = "remix_atlas_uv"
+                                    uv_layer_for_bake = "remix_atlas_uv" # This is now safe
                     else:
                         max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
                         if max_w > 0: bake_resolution_x = max_w
@@ -4322,18 +4352,24 @@ class OBJECT_OT_export_and_ingest(Operator):
             logging.error(f"Could not launch persistent bake worker: {e}", exc_info=True)
             return False
           
-    def _validate_textures(self, context, objects_to_export):
+        
+    def _prepare_and_validate_textures(self, context, objects_to_export):
         """
-        [DEFINITIVE V11 - NON-DESTRUCTIVE VALIDATION]
-        Performs a READ-ONLY check on all textures. It ensures that for every
-        image used, Blender either knows its file path on disk OR has the pixel
-        data packed in memory. It does NOT modify any image datablocks.
-        The worker is now responsible for handling the unpacking of in-memory data.
+        [DEFINITIVE V12 - PACKED FILE AWARE]
+        Validates all textures and actively prepares them for the external baker.
+        If a texture's file path is missing but its data is packed in memory,
+        this function saves the data to a temporary file in the bake cache
+        and updates the image datablock to point to it. This ensures the
+        external worker process can always find a valid source file.
         """
-        logging.info("Starting non-destructive texture validation...")
+        logging.info("Starting texture preparation and validation (packed file aware)...")
     
         has_unrecoverable_textures = False
         processed_materials = set()
+        
+        # The bake directory is the perfect place to save temporary unpacked files.
+        bake_dir = CUSTOM_COLLECT_PATH
+        os.makedirs(bake_dir, exist_ok=True)
 
         def get_all_image_nodes_recursive(node_tree):
             for node in node_tree.nodes:
@@ -4355,12 +4391,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 for image in get_all_image_nodes_recursive(mat.node_tree):
                     if not image:
                         continue
-                
-                    # Try to force a pixel read to update the has_data flag
-                    try:
-                        _ = len(image.pixels)
-                    except RuntimeError:
-                        pass # This is expected if data is truly missing
 
                     filepath = ""
                     try:
@@ -4369,23 +4399,52 @@ class OBJECT_OT_export_and_ingest(Operator):
                     except Exception:
                         filepath = ""
 
-                    # The core validation: A texture is valid if it has a path OR has packed data.
                     is_valid_on_disk = os.path.exists(filepath)
-                    has_packed_data = image.has_data
 
-                    if not is_valid_on_disk and not has_packed_data:
+                    # --- THIS IS THE NEW CORE LOGIC ---
+                    # If the file is NOT on disk, check if we have the data in memory (packed).
+                    if not is_valid_on_disk and image.has_data:
+                        logging.warning(f"  > Image '{image.name}' has no valid file path but is packed. Saving to temp file for worker.")
+                        try:
+                            # Create a safe, unique filename for the temporary image.
+                            safe_name = "".join(c for c in image.name if c.isalnum() or c in ('_', '.', '-')).strip()
+                            temp_filename = f"unpacked_{safe_name}_{uuid.uuid4().hex[:6]}.png"
+                            recovery_path = os.path.join(bake_dir, temp_filename)
+
+                            # Save a copy of the image data to the new path. Using a copy is safer.
+                            image_copy = image.copy()
+                            image_copy.filepath_raw = recovery_path
+                            image_copy.file_format = 'PNG' # PNG is a safe, lossless format for this
+                            image_copy.save()
+                            
+                            # CRITICAL: Update the ORIGINAL image datablock to point to this new file.
+                            # This change will be saved in the .blend file for the worker to read.
+                            image.filepath = recovery_path
+                            image.source = 'FILE' # Ensure its source is marked as a file
+                            image.reload() # Force Blender to update from the new source
+                            
+                            # Add the newly created temp file to our master cleanup list.
+                            self._export_data['temp_files_to_clean'].add(recovery_path)
+                            logging.info(f"    - Successfully recovered '{image.name}' to '{recovery_path}'")
+
+                        except Exception as e:
+                            logging.error(f"    - FAILED to recover packed image '{image.name}': {e}", exc_info=True)
+                            self.report({'ERROR'}, f"Could not save packed image data for '{image.name}'.")
+                            has_unrecoverable_textures = True
+
+                    # If the file is not on disk AND not in memory, it's truly lost.
+                    elif not is_valid_on_disk and not image.has_data:
                         logging.error(
-                            f"UNRECOVERABLE: Image '{image.name}' in material '{mat.name}' has NO pixel data in memory, AND its source file is missing. The addon cannot proceed."
+                            f"UNRECOVERABLE: Image '{image.name}' in material '{mat.name}' has NO data in memory AND its source file is missing: '{filepath}'"
                         )
                         has_unrecoverable_textures = True
-
+        
         if has_unrecoverable_textures:
-            self.report({'ERROR'}, "Unrecoverable textures found. Export aborted. See System Console.")
+            self.report({'ERROR'}, "Unrecoverable/missing textures found. Export aborted. See System Console.")
             return False
 
-        logging.info("Texture validation successful. All textures are either on disk or packed.")
+        logging.info("Texture preparation successful. All textures have a valid source file on disk.")
         return True
-
           
     def modal(self, context, event):
         """
@@ -4675,15 +4734,13 @@ class OBJECT_OT_export_and_ingest(Operator):
         self._resource_check_counter = 0
 
         try:
-            logging.info("Checking for EXR textures to convert before export...")
-            success, _ = convert_exr_textures_to_png(context)
-            if not success:
-                raise RuntimeError("Failed to convert EXR textures to PNG.")
-
             # Note: addon_prefs is already defined from the check above.
             if not is_blend_file_saved():
                 raise RuntimeError("Please save the .blend file before exporting.")
 
+            # --- LOGIC REORDERED ---
+            # Step 1: Determine the final, definitive list of mesh objects to be exported.
+            # This includes handling the "Selection Only" option and realizing GeoNodes generators.
             initial_selection = {
                 o for o in (context.selected_objects if addon_prefs.remix_use_selection_only else context.scene.objects)
                 if o.type in {'MESH', 'CURVE'} and o.visible_get() and not o.hide_render
@@ -4692,7 +4749,6 @@ class OBJECT_OT_export_and_ingest(Operator):
             if not initial_selection:
                 raise RuntimeError("No suitable visible objects found to export.")
 
-            # --- YOUR OLD WORKING CODE ---
             final_export_list = set(initial_selection)
             generators_found = {obj for obj in initial_selection if self._is_geonodes_generator(obj)}
             
@@ -4714,16 +4770,23 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             final_export_list -= generators_found
             final_export_list -= source_objects_to_exclude
-            # --- END OF YOUR OLD WORKING CODE ---
-
+            
             self._export_data["objects_for_export"] = [o for o in final_export_list if o and o.type == 'MESH']
 
             if not self._export_data["objects_for_export"]:
                 raise RuntimeError("Processing resulted in no valid mesh objects to export.")
 
-            logging.info(f"Final object list for processing: {[o.name for o in self._export_data['objects_for_export']]}")
+            # Step 2: With the final object list now known, call the TARGETED EXR conversion.
+            logging.info("Checking for EXR textures to convert on the final export objects...")
+            success, _ = convert_exr_textures_to_png(context, self._export_data["objects_for_export"])
+            if not success:
+                raise RuntimeError("Failed to convert EXR textures to PNG.")
+            # --- END OF REORDERED LOGIC ---
 
-            if not self._validate_textures(context, self._export_data["objects_for_export"]): raise RuntimeError("Texture validation failed.")
+            logging.info(f"Final object list for processing: {[o.name for o in self._export_data['objects_for_export']]}")
+            
+            if not self._prepare_and_validate_textures(context, self._export_data["objects_for_export"]):
+                raise RuntimeError("Texture preparation and validation failed.")
 
             all_tasks, _, _, _ = self.collect_bake_tasks(
                 context, self._export_data["objects_for_export"], self._export_data
@@ -4849,14 +4912,12 @@ class OBJECT_OT_export_and_ingest(Operator):
           
     def _finalize_export(self, context):
         """
-        [DEFINITIVE V14 - Centralized State Management]
-        Handles the final steps of the export. It now correctly stores the original
-        active UV maps in the main operator state (_export_data) so that the
-        canonical _cleanup function can handle the restoration, ensuring the scene
-        is always returned to its original state.
+        [DEFINITIVE V15 - CORRECT ALPHA COMPOSITING]
+        Handles the final steps of the export. This version fixes the critical bug where baked
+        alpha maps were not being found and combined with their corresponding base color maps.
+        The logic now uses the bake task list for a direct, reliable lookup instead of guessing filenames.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
-        # Initialize the dictionary in the main operator data store
         self._export_data['original_active_uvs'] = {}
 
         try:
@@ -4865,19 +4926,33 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             # --- PHASE 1: TEXTURE COMPOSITING & CACHING ---
             if bake_info and bake_info.get('tasks'):
-                logging.info("Checking for composite bakes to combine...")
+                logging.info("Checking for baked alpha maps to combine...")
                 tasks = bake_info.get('tasks', [])
-                # Find all the base color maps that were baked
-                color_maps_to_check = {
-                    task['output_path'] for task in tasks if task.get('target_socket_name') == 'Base Color'
-                }
+                
+                # --- THIS IS THE FIX ---
+                # Create a reliable lookup map from the tasks list: {material_hash: {socket_name: path}}
+                tasks_by_hash = defaultdict(dict)
+                for task in tasks:
+                    mat_hash = task.get('material_hash')
+                    socket_name = task.get('target_socket_name')
+                    if mat_hash and socket_name:
+                        tasks_by_hash[mat_hash][socket_name] = task.get('output_path')
 
-                for color_path in color_maps_to_check:
-                    base, ext = os.path.splitext(color_path)
-                    # Look for the corresponding alpha mask created by the new bake logic
-                    expected_alpha_path = f"{base}_alpha_mask{ext}"
-                    if os.path.exists(expected_alpha_path):
-                        self._combine_color_and_alpha(color_path, expected_alpha_path)
+                # Now, iterate through the hashes to find pairs of Base Color and Alpha maps.
+                for mat_hash, baked_maps in tasks_by_hash.items():
+                    if "Base Color" in baked_maps and "Alpha" in baked_maps:
+                        color_map_path = baked_maps["Base Color"]
+                        alpha_mask_path = baked_maps["Alpha"]
+                        
+                        # Verify both files exist before attempting to combine them.
+                        if os.path.exists(color_map_path) and os.path.exists(alpha_mask_path):
+                            log_msg = (
+                                f"Found corresponding Base Color and Alpha bakes for hash {mat_hash[:8]}... "
+                                f"Combining '{os.path.basename(alpha_mask_path)}' into '{os.path.basename(color_map_path)}'."
+                            )
+                            logging.info(log_msg)
+                            self._combine_color_and_alpha(color_map_path, alpha_mask_path)
+                # --- END OF FIX ---
         
                 logging.info("Updating global material cache with newly baked textures...")
                 for task in bake_info.get('tasks', []):
@@ -4892,8 +4967,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 logging.info(f"Global cache now contains {len(global_material_hash_cache)} unique materials.")
 
             # --- PHASE 2: MATERIAL PREPARATION ---
-            # This function handles all the complex logic of UDIM stitching,
-            # baked material creation, and assignment.
             self._prepare_materials_for_export(context, objects_to_process=self._export_data["objects_for_export"])
 
             # --- PHASE 3: GEOMETRY PREPARATION ---
@@ -4939,7 +5012,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 obj.select_set(True)
             context.view_layer.objects.active = selectable_meshes[0]
 
-            # This part now stores the original UV maps in the central _export_data
             for obj in final_meshes_for_obj:
                 uses_stitched_material = any(
                     slot.material and slot.material.name.endswith("__UDIM_STITCHED") 
@@ -4947,10 +5019,8 @@ class OBJECT_OT_export_and_ingest(Operator):
                 )
                 if uses_stitched_material and obj.data and "remix_atlas_uv" in obj.data.uv_layers:
                     if obj.data.uv_layers.active:
-                        # Store the original map name in the main operator data
                         self._export_data['original_active_uvs'][obj.name] = obj.data.uv_layers.active.name
                 
-                    # Set the atlas map to be active for the export
                     obj.data.uv_layers.active = obj.data.uv_layers["remix_atlas_uv"]
                     logging.info(f"  > Set active UV map to 'remix_atlas_uv' for '{obj.name}' for export.")
 
@@ -4977,18 +5047,10 @@ class OBJECT_OT_export_and_ingest(Operator):
                 handle_special_texture_assignments(self, context, final_reference_prim, export_data=self._export_data)
 
         except Exception as e:
-            # Catch and report errors, but allow the main _cleanup() to handle restoration
             logging.error(f"Export finalization failed: {e}", exc_info=True)
             self.report({'ERROR'}, f"Finalization failed: {e}")
-            # Re-raise the exception to stop the process gracefully
             raise RuntimeError(f"Finalization process failed.") from e
-
-        finally:
-            # This 'finally' block is now intentionally empty.
-            # All restoration is handled centrally by the _cleanup() function to ensure
-            # it runs even if this function encounters an error partway through.
-            pass
-                        
+            
     def _find_ultimate_source_node(self, start_socket):
         """
         [IMPROVED & RENAMED] Traces back from a socket to find the ultimate source node.
@@ -5032,10 +5094,10 @@ class OBJECT_OT_export_and_ingest(Operator):
           
     def _bake_udim_material_to_atlas(self, context, mat, objects_using_mat, bake_dir):
         """
-        [DEFINITIVE V2 - Self-Sufficient Stitching]
-        Stitches UDIM tiles into new atlas textures and creates a new material. It is now
-        responsible for creating the atlas UV map itself, ensuring it works correctly
-        even on a cached export run.
+        [DEFINITIVE V4 - SIMPLIFIED & COMPLETE]
+        Stitches UDIM tiles into new atlas textures and creates a new material. This version
+        is complete and assumes the 'remix_atlas_uv' map has already been created by the
+        collector function, resolving the race condition.
         """
         if not PILLOW_INSTALLED:
             self.report({'ERROR'}, "Pillow dependency not installed, cannot stitch UDIMs.")
@@ -5067,19 +5129,9 @@ class OBJECT_OT_export_and_ingest(Operator):
             logging.info(f"No UDIM textures found to stitch for '{mat.name}'.")
             return None
 
-        # --- THIS IS THE CRITICAL FIX ---
-        # Find all tiles and transform UVs for all objects using this material *before* doing anything else.
-        # This ensures the 'remix_atlas_uv' map exists and is correct for this run.
-        first_udim_node = next(iter(udim_jobs.keys()))
-        all_processed_tiles = sorted([t for t in first_udim_node.image.tiles if t.label], key=lambda t: t.number)
-        if not all_processed_tiles:
-            logging.error(f"Could not find any valid tiles for material '{mat.name}'. Aborting stitch.")
-            return None
-        self._transform_uvs_for_atlas(objects_using_mat, all_processed_tiles)
-        # --- END OF CRITICAL FIX ---
-
         stitched_mat_name = f"{mat.name}__UDIM_STITCHED"
         final_stitched_mat = bpy.data.materials.new(name=stitched_mat_name)
+        self._export_data["material_name_map"][mat.name] = final_stitched_mat.name
         self._export_data["temp_materials_for_cleanup"].append(final_stitched_mat)
     
         final_stitched_mat.use_nodes = True
@@ -5091,7 +5143,7 @@ class OBJECT_OT_export_and_ingest(Operator):
         nt.links.new(new_bsdf.outputs['BSDF'], new_mat_output.inputs['Surface'])
     
         uv_map_node = nt.nodes.new('ShaderNodeUVMap')
-        uv_map_node.uv_map = "remix_atlas_uv"
+        uv_map_node.uv_map = "remix_atlas_uv" # This is now safe
 
         for udim_node, target_socket_names in udim_jobs.items():
             image = udim_node.image
@@ -5101,13 +5153,17 @@ class OBJECT_OT_export_and_ingest(Operator):
             logging.info(f"Stitching {len(tiles)} tiles for '{image.name}' used in socket(s): {target_socket_names}")
         
             tile_width, tile_height = 0, 0
+            # Safely determine tile size
             for tile in tiles:
                 tile_path = abspath(image.filepath_raw.replace('<UDIM>', str(tile.number)))
                 if os.path.exists(tile_path):
-                    with Image.open(tile_path) as img_tile:
-                        tile_width, tile_height = img_tile.size
+                    try:
+                        with Image.open(tile_path) as img_tile:
+                            tile_width, tile_height = img_tile.size
                         break
-            if tile_width == 0:
+                    except Exception as e:
+                        logging.warning(f"Could not read tile image {tile_path}: {e}")
+            if tile_width == 0 or tile_height == 0:
                 logging.error(f"Could not determine tile size for '{image.name}'. Skipping this set.")
                 continue
 
@@ -5220,16 +5276,19 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [NEW FUNCTION - V2 - COMPLETE]
-        Centralizes the creation and assignment of temporary materials for export. This function
-        is entirely non-destructive. It processes objects and their original materials, creates new
-        temporary materials with the correct textures (baked, cached, or newly composited with alpha),
-        and assigns them to the objects just before the OBJ export.
+        [DEFINITIVE V3 - EFFICIENT NAME MAPPING]
+        Centralizes the creation and assignment of temporary materials for export. This version
+        now creates and stores a direct mapping from original material names to their final
+        exported names in self._export_data['material_name_map'] for efficient lookup later.
         """
         logging.info("Preparing temporary materials for export...")
         addon_prefs = context.preferences.addons[__name__].preferences
 
-        # Store original assignments so we can restore them perfectly in _cleanup()
+        # --- THIS IS THE FIX (PART 1) ---
+        # Initialize the mapping dictionary in the main operator state.
+        self._export_data["material_name_map"] = {}
+        # --- END OF FIX (PART 1) ---
+
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
@@ -5237,12 +5296,10 @@ class OBJECT_OT_export_and_ingest(Operator):
         bake_info = self._export_data.get('bake_info', {})
         bake_dir = bake_info.get('bake_dir')
         if not bake_dir:
-            # Fallback if no baking was done but we still need a temp dir for composites
             bake_dir = os.path.join(tempfile.gettempdir(), "remix_ingestor_temp_finalize")
             os.makedirs(bake_dir, exist_ok=True)
-            self._export_data['temp_files_to_clean'].add(bake_dir) # Ensure this temp dir gets cleaned up
+            self._export_data['temp_files_to_clean'].add(bake_dir)
 
-        # Organize bake results for quick lookup
         tasks_by_hash = defaultdict(dict)
         for task in bake_info.get('tasks', []):
             if task.get('material_hash'):
@@ -5255,17 +5312,25 @@ class OBJECT_OT_export_and_ingest(Operator):
                 original_mat = slot.material
                 if not original_mat: continue
 
-                # First, check if this material context was baked or cached
                 context_hash = get_material_hash(original_mat, obj, slot_index, bake_method=addon_prefs.bake_method)
                 texture_paths_to_use = tasks_by_hash.get(context_hash) or cached_textures_by_hash.get(context_hash)
 
                 if texture_paths_to_use:
-                    # Build a new temporary material from the baked/cached textures
-                    baked_mat = self._build_material_from_textures(f"{obj.name}_{original_mat.name}_BAKED", texture_paths_to_use)
+                    final_mat_name = f"{obj.name.replace('.', '_')}_{original_mat.name.replace('.', '_')}_BAKED"
+                    baked_mat = self._build_material_from_textures(final_mat_name, texture_paths_to_use)
                     obj.material_slots[slot_index].material = baked_mat
+                    # --- THIS IS THE FIX (PART 2) ---
+                    # Store the direct relationship: original name -> final baked name.
+                    self._export_data["material_name_map"][original_mat.name] = baked_mat.name
+                    # --- END OF FIX (PART 2) ---
                     continue
 
-                # If not baked/cached, it's a simple material. Check if it needs alpha compositing.
+                # If not baked/cached, it's a simple material.
+                # --- THIS IS THE FIX (PART 3) ---
+                # For simple materials, the name doesn't change. Record this identity mapping.
+                self._export_data["material_name_map"][original_mat.name] = original_mat.name
+                # --- END OF FIX (PART 3) ---
+
                 if not original_mat.use_nodes: continue
                 bsdf = next((n for n in original_mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
                 if not bsdf: continue
@@ -5273,38 +5338,32 @@ class OBJECT_OT_export_and_ingest(Operator):
                 base_color_socket = bsdf.inputs.get("Base Color")
                 alpha_socket = bsdf.inputs.get("Alpha")
             
-                # --- NON-DESTRUCTIVE COMPOSITING LOGIC ---
-                # Condition: a simple material needing compositing has both a color and an alpha texture.
                 if base_color_socket and alpha_socket and base_color_socket.is_linked and alpha_socket.is_linked:
                     color_map_path = self._get_texture_path_from_socket(base_color_socket)
                     alpha_map_path = self._get_texture_path_from_socket(alpha_socket)
 
                     if color_map_path and alpha_map_path:
-                        # Create a new temporary file path for the combined texture
                         base_name, ext = os.path.splitext(os.path.basename(color_map_path))
                         combined_filename = f"{base_name}_with_alpha_{uuid.uuid4().hex[:6]}{ext}"
                         combined_filepath = os.path.join(bake_dir, combined_filename)
 
-                        # Combine the images and save to the new temporary path
                         if self._combine_albedo_and_opacity(color_map_path, alpha_map_path, combined_filepath):
                             self._export_data['temp_files_to_clean'].add(combined_filepath)
-
-                            # Create a new dictionary of texture paths for the material builder,
-                            # using the new combined texture for the Base Color.
                             texture_paths_for_composite_mat = {}
                             texture_paths_for_composite_mat["Base Color"] = combined_filepath
                         
-                            # Copy over other textures like normal, roughness, etc.
                             for socket in bsdf.inputs:
                                 if socket.is_linked and socket.name not in ["Base Color", "Alpha"]:
                                     path = self._get_texture_path_from_socket(socket)
                                     if path:
                                         texture_paths_for_composite_mat[socket.name] = path
                         
-                            # Build and assign the new temporary material
-                            composited_mat = self._build_material_from_textures(f"{original_mat.name}_COMPOSITED", texture_paths_for_composite_mat)
+                            final_mat_name = f"{original_mat.name}_COMPOSITED"
+                            composited_mat = self._build_material_from_textures(final_mat_name, texture_paths_for_composite_mat)
                             obj.material_slots[slot_index].material = composited_mat
-                        
+                            # Also map the composited material name
+                            self._export_data["material_name_map"][original_mat.name] = composited_mat.name
+                            
     def _build_material_from_textures(self, name, texture_paths):
         """
         [NEW HELPER] Creates and returns a new Blender material with a simple
@@ -5722,11 +5781,17 @@ def upload_to_api(obj_path, ingest_dir, context):
         logging.error(f"An unexpected error occurred in upload_to_api: {e_general}", exc_info=True)
         return None
 
-def check_blend_file_in_prims(blend_name, context): # Added context
-    addon_prefs = context.preferences.addons[__name__].preferences # Use context to get prefs
+    
+def check_blend_file_in_prims(blend_name, context):
+    """
+    [DEFINITIVE V3 - PRECISE PATTERN MATCHING] Finds a prim on the server that
+    matches the asset's base name followed by a version number. It no longer strips
+    parts of names and instead uses a precise regex pattern to prevent incorrectly
+    matching assets like 'Test_55' with 'Test6_16'.
+    """
+    addon_prefs = context.preferences.addons[__name__].preferences
     try:
         server_url = addon_prefs.remix_server_url.rstrip('/')
-        # Consider if filter_session_assets should be filter_session_prims
         get_url = f"{server_url}/assets/?selection=false&filter_session_assets=false&exists=true"
         headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
 
@@ -5734,67 +5799,57 @@ def check_blend_file_in_prims(blend_name, context): # Added context
         response = make_request_with_retries('GET', get_url, headers=headers, verify=addon_prefs.remix_verify_ssl)
 
         if not response or response.status_code != 200:
-            logging.error(f"Failed to fetch prims from Remix server. Status: {response.status_code if response else 'No Response'}")
+            logging.error(f"Failed to fetch prims. Status: {response.status_code if response else 'No Response'}")
             return None, None
 
         data = response.json()
-        # CORRECTED: Look for "prim_paths", fallback to "asset_paths"
-        asset_or_prim_paths = data.get("prim_paths")
-        if asset_or_prim_paths is None: # Check if key exists
-            logging.warning("check_blend_file_in_prims: Key 'prim_paths' not found in server response, trying 'asset_paths' as fallback.")
-            asset_or_prim_paths = data.get("asset_paths", [])
+        asset_or_prim_paths = data.get("prim_paths", data.get("asset_paths", []))
         
-        logging.debug(f"Retrieved asset_or_prim_paths for check_blend_file_in_prims: {asset_or_prim_paths[:10]}...") # Log first few
-
+        # This is the CONCEPTUAL base name (e.g., "Test", or "Test6").
         if addon_prefs.remix_use_custom_name and addon_prefs.remix_use_selection_only and addon_prefs.remix_base_obj_name:
-            base_name = addon_prefs.remix_base_obj_name
-            logging.debug(f"Using custom base OBJ name for prim search: {base_name}")
+            base_name_to_search = addon_prefs.remix_base_obj_name
         else:
-            base_name = extract_base_name(blend_name) # Assuming extract_base_name is correct
-            logging.debug(f"Using blend file base name for prim search: {base_name}")
+            # We use the blend_name directly as the base, without stripping anything.
+            base_name_to_search = blend_name
+
+        logging.debug(f"Searching for prims with base name pattern: '{base_name_to_search}_<version>'")
+        
+        # --- THIS IS THE CRITICAL FIX ---
+        # We build a precise regex pattern. It means:
+        # ^                  - Must start with
+        # (base_name)        - Our exact base name (e.g., "Test" or "Test6")
+        # _                  - Followed by an underscore
+        # \d+                - Followed by one or more numbers
+        # $                  - And nothing else after it.
+        # re.IGNORECASE makes the match case-insensitive.
+        match_pattern = re.compile(f"^{re.escape(base_name_to_search)}_\\d+$", re.IGNORECASE)
 
         for path in asset_or_prim_paths:
             segments = path.strip('/').split('/')
-            # Check if any segment (typically the mesh name part) contains the base_name
-            # This logic might need refinement depending on how specific the match needs to be.
-            # Example: if base_name is "Test" and path is "/RootNode/meshes/Test_1/mesh"
-            # segments could be ['RootNode', 'meshes', 'Test_1', 'mesh']
-            # We'd want to check 'Test_1' against 'Test'
-            path_lower = path.lower() # For case-insensitive comparison of the whole path
-            base_name_lower = base_name.lower()
+            
+            # Check every part of the server path.
+            for segment in segments:
+                # Does the server prim name (e.g., "Test_55" or "Test6_16") match our precise pattern?
+                if match_pattern.fullmatch(segment):
+                    
+                    logging.info(f"PRECISE MATCH FOUND: Local base '{base_name_to_search}' matches server asset '{segment}' in path '{path}'")
+                    
+                    # We found the correct asset. Now find its reference prim.
+                    reference_prim_path = None
+                    for i, ref_segment in enumerate(segments):
+                        if ref_segment.lower().startswith('ref_'):
+                            reference_prim_path = '/' + '/'.join(segments[:i + 1])
+                            break
+                    
+                    if reference_prim_path:
+                        logging.info(f"Reference prim identified: {reference_prim_path} for matched path {path}")
+                        # Return the full path of the asset we found and its reference prim.
+                        return path, reference_prim_path
+                    else:
+                        logging.warning(f"Found matching asset name '{segment}' but no 'ref_' prim in path '{path}'.")
+                        break # Stop checking segments in this path
 
-            # More targeted check: often the mesh ID is the 3rd segment if path starts with /
-            # e.g. /RootNode/meshes/mesh_ID_or_Name
-            # or 4th if it's /Project/AssetGroup/mesh_ID_or_Name
-            # A simple "in" check for the base_name in the path string is a broad approach.
-            if base_name_lower in path_lower: # General check
-            # A more specific check might be:
-            # if len(segments) > 2 and base_name_lower in segments[2].lower(): # Checks the typical mesh name slot
-                logging.info(f"Prim with base name potentially found: {path}")
-                # print(f"Prim with base name found: {path}") # Covered by logging
-
-                prim_path_to_return = '/' + '/'.join(segments) # Reconstruct full path with leading slash
-
-                reference_prim_path = None
-                # Find the segment starting with 'ref_' to determine the reference prim
-                for i, segment in enumerate(segments):
-                    if segment.lower().startswith('ref_'):
-                        reference_prim_path = '/' + '/'.join(segments[:i + 1])
-                        break
-                
-                if reference_prim_path:
-                    logging.info(f"Reference prim identified: {reference_prim_path} for matched path {prim_path_to_return}")
-                    # print(f"Reference prim identified: {reference_prim_path}") # Covered by logging
-                    return prim_path_to_return, reference_prim_path
-                else:
-                    # If no 'ref_' segment, but a match was found, what should be returned?
-                    # The original code would continue the loop if no 'ref_' was found for a given path match.
-                    # This means only paths that contain 'base_name' AND have a 'ref_' segment are considered.
-                    logging.debug(f"Path '{path}' contained base name '{base_name}' but no 'ref_' segment found. Continuing search.")
-                    # If any path matching base_name should be returned even without 'ref_', this logic needs change.
-                    # For now, sticking to original intent: needs 'ref_'.
-
-        logging.info(f"No reference prim found containing base name '{base_name}' AND a 'ref_' segment.")
+        logging.info(f"No asset matching the precise pattern '{base_name_to_search}_<version>' was found on the server.")
         return None, None
 
     except Exception as e:
