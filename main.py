@@ -410,6 +410,11 @@ class RemixIngestorPreferences(AddonPreferences):
         description="Replace the selected stock mesh in Remix",
         default=False
     )
+    remix_bake_material_only: BoolProperty(
+        name="Enable simplistic hashing to bake less.",
+        description="Do not enable if you are using the same procedral material across different objects.",
+        default=True
+    )
     remix_export_scale: FloatProperty(
         name="Export Scale",
         description="Scale factor for exporting OBJ",
@@ -853,16 +858,22 @@ class SYSTEM_OT_check_gpu_settings(bpy.types.Operator):
         
         return {'FINISHED'}
 
+    
 def batch_flip_normals_optimized(meshes_to_flip, context):
     """
-    Flips normals for a list of mesh objects in a batch using a single
-    Edit Mode session, which is much faster and more reliable.
-    This is the complete, non-simplified version.
+    [DEFINITIVE PERFORMANCE & STABILITY FIX] Flips normals for a list of mesh
+    objects by iterating through each one and using the bmesh API directly.
+    This avoids the progressive slowdown caused by Undo System and Scene Update
+    overhead from repeated bpy.ops calls in a loop. This method provides
+
+    consistent, reliable performance for any number of objects.
     """
     if not meshes_to_flip:
         return
 
-    logging.info(f"Batch flip normals: Preparing to flip {len(meshes_to_flip)} meshes.")
+    num_meshes = len(meshes_to_flip)
+    logging.info(f"Batch flip normals (Direct API Mode): Preparing to flip {num_meshes} meshes.")
+    start_time = time.time()
 
     # Store original state to restore it perfectly
     original_active = context.view_layer.objects.active
@@ -871,62 +882,68 @@ def batch_flip_normals_optimized(meshes_to_flip, context):
     if context.object and hasattr(context.object, 'mode'):
         original_mode = context.object.mode
 
-    # Ensure we are in Object Mode to safely change selection and active object
+    # A single mode_set at the beginning is safe and ensures correct state
     if context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
 
+    processed_count = 0
+    failed_objects = []
     try:
-        # Deselect everything and then select only the meshes we need to flip
-        bpy.ops.object.select_all(action='DESELECT')
-        
-        valid_meshes_to_flip = []
-        for obj in meshes_to_flip:
-            if obj and obj.type == 'MESH' and obj.name in context.view_layer.objects:
-                obj.select_set(True)
-                valid_meshes_to_flip.append(obj)
-        
-        if not valid_meshes_to_flip:
-            logging.warning("No valid meshes were available for normal flipping.")
-            return
+        # --- CORE LOGIC: Iterate and use the direct, fast bmesh API ---
+        for i, obj in enumerate(meshes_to_flip):
+            # Provide UI feedback to prevent the appearance of a freeze
+            if i % 25 == 0: # Update status every 25 objects
+                elapsed = time.time() - start_time
+                status_text = f"Flipping normals: {i}/{num_meshes} ({elapsed:.1f}s)"
+                context.workspace.status_text_set(status_text)
 
-        # Set one of the valid meshes as the active object to allow entering Edit Mode
-        context.view_layer.objects.active = valid_meshes_to_flip[0]
+            if not obj or obj.type != 'MESH' or not obj.data:
+                continue
 
-        # Switch to Edit Mode for all selected meshes at once
-        bpy.ops.object.mode_set(mode='EDIT')
+            try:
+                # The bmesh API is the correct, lightweight way to handle this in a script
+                bm = bmesh.new()
+                bm.from_mesh(obj.data)
+                
+                for face in bm.faces:
+                    face.normal_flip()
+                
+                # Write the changes back to the mesh data block
+                bm.to_mesh(obj.data)
+                bm.free()
+                obj.data.update() # Mark the mesh for a viewport update
+                processed_count += 1
+            except Exception as e:
+                logging.error(f"Failed to flip normals for '{obj.name}' using bmesh API. The object may have corrupt data. Error: {e}")
+                failed_objects.append(obj.name)
         
-        # THE CORE FIX: Check for 'EDIT_MESH' instead of 'EDIT'
-        if context.mode == 'EDIT_MESH':
-            # Perform the operations
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.mesh.flip_normals()
-            logging.info(f"Flipped normals for {len(valid_meshes_to_flip)} meshes.")
-            # Go back to Object mode
-            bpy.ops.object.mode_set(mode='OBJECT')
-        else:
-            logging.warning(f"Could not switch to EDIT_MESH mode (current mode: {context.mode}). Normals not flipped.")
-            # Ensure we still exit to Object mode if something went wrong
-            if context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
+        logging.info(f"Successfully flipped normals for {processed_count}/{num_meshes} meshes.")
+        if failed_objects:
+            logging.warning(f"Could not process the following objects: {', '.join(failed_objects)}")
 
     finally:
-        # Restore the original selection and active object
+        # --- State Restoration ---
+        context.workspace.status_text_set(None) # Clear the status bar
+        
         bpy.ops.object.select_all(action='DESELECT')
         for obj in original_selected:
             if obj and obj.name in context.view_layer.objects:
-                obj.select_set(True)
+                try:
+                    obj.select_set(True)
+                except (ReferenceError, RuntimeError):
+                    pass
         
         if original_active and original_active.name in context.view_layer.objects:
             context.view_layer.objects.active = original_active
         
-        # Restore the original mode if it was something other than Object mode
         if original_mode != 'OBJECT' and context.view_layer.objects.active:
             try:
                 bpy.ops.object.mode_set(mode=original_mode)
             except RuntimeError:
-                # It's okay if we can't restore the mode, Object mode is a safe default.
                 pass
-        logging.info("Batch flip normals: Operation finished.")
+        
+        end_time = time.time()
+        logging.info(f"Batch flip normals operation finished in {end_time - start_time:.2f} seconds.")
 
 def batch_mirror_objects_optimized(meshes_to_mirror, context):
     """
@@ -1874,130 +1891,118 @@ def blender_mat_to_remix(mat_name):
     
 def handle_special_texture_assignments(self, context, reference_prim, export_data=None):
     """
-    [DEFINITIVE V5 - FULL TEXTURE SUPPORT] Ingests and assigns all special textures.
-    This version uses the pre-computed 'material_name_map', provides the complete server payload,
-    and uses a complete mapping to support ALL special texture types (Anisotropy, Subsurface, etc.),
-    while correctly ignoring pre-composited Opacity maps.
+    [DEFINITIVE V18 - CORRECTED DATA LOOKUP]
+    This version fixes the logical flaw where special texture information was stored
+    by an (object, material) key but retrieved only by material. This version reorganizes
+    the data purely by material, ensuring a correct lookup and assignment.
     """
     addon_prefs = context.preferences.addons[__name__].preferences
     
     try:
-        logging.info("--- Starting Final & Complete Bulk Special Texture Assignment ---")
+        logging.info("--- Starting Special Texture Assignment (Corrected Data Lookup) ---")
 
-        material_name_map = (export_data or {}).get('material_name_map', {})
-        if not material_name_map:
-            logging.info("No material name map found, skipping special texture assignment.")
-            return {'FINISHED'}
+        final_mtl_name_map = (export_data or {}).get("material_name_map", {})
+        special_texture_info_by_obj_mat = (export_data or {}).get('bake_info', {}).get('special_texture_info', {})
 
-        special_texture_info = (export_data or {}).get('bake_info', {}).get('special_texture_info', {})
-        if not special_texture_info:
+        if not special_texture_info_by_obj_mat:
             logging.info("No special textures to process.")
             return {'FINISHED'}
 
-        # STEP 1: Collect textures, EXCLUDING OPACITY
+        # --- THIS IS THE FIX: Reorganize the data ---
+        # Create a new dictionary keyed ONLY by the original material name.
+        assignments_by_original_mat_name = defaultdict(list)
+        for (obj_name, mat_name), texture_list in special_texture_info_by_obj_mat.items():
+            for texture_data in texture_list:
+                 assignments_by_original_mat_name[mat_name].append(texture_data)
+        # --- END OF FIX ---
+
         textures_for_ingest = []
-        assignments_by_mat_key = defaultdict(list)
         ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
         server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
-        
-        for mat_key, texture_list in special_texture_info.items():
+
+        SPECIAL_TEXTURE_MAP = {
+            "HEIGHT": "height_texture",
+            "EMISSIVE": "emissive_mask_texture",
+            "ANISOTROPY": "anisotropy_texture",
+            "TRANSMITTANCE": "transmittance_texture",
+        }
+
+        # This loop now correctly builds the list of files to upload
+        for mat_name, texture_list in assignments_by_original_mat_name.items():
             for texture_data in texture_list:
                 local_path, tex_type = texture_data.get('path'), texture_data.get('type')
-
-                if tex_type == 'OPACITY':
-                    logging.info(f"  > Skipping OPACITY map '{os.path.basename(local_path)}' from upload list; it has been pre-composited.")
+                if not (local_path and tex_type and os.path.exists(local_path)):
                     continue
-
-                if not (local_path and os.path.exists(local_path) and tex_type): continue
+                
+                # Add to the upload list and update the server path in our assignment dictionary
                 textures_for_ingest.append([local_path, tex_type.upper()])
-                base_filename = os.path.splitext(os.path.basename(local_path))[0]
-                final_server_path = os.path.join(server_textures_output_dir, f"{base_filename}.{tex_type[0].lower()}.rtex.dds").replace('\\', '/')
-                assignments_by_mat_key[mat_key].append({'type': tex_type, 'server_path': final_server_path})
-        
+                base_name = os.path.splitext(os.path.basename(local_path))[0]
+                server_path = os.path.join(server_textures_output_dir, f"{base_name}.{tex_type[0].lower()}.rtex.dds").replace('\\', '/')
+                texture_data['server_path'] = server_path # Add the final server path back to the dict
+                texture_data['usd_input'] = SPECIAL_TEXTURE_MAP.get(tex_type)
+
         if not textures_for_ingest:
-            logging.info("No valid special texture files to ingest after filtering.")
+            logging.warning("No valid special textures found to upload.")
             return {'FINISHED'}
 
-        logging.info(f"Ingesting {len(textures_for_ingest)} special textures...")
+        # (The ingestion payload and request can remain the same)
+        logging.info(f"Ingesting {len(textures_for_ingest)} total special textures...")
         base_api_url = addon_prefs.remix_export_url.rstrip('/')
-        
-        # THE COMPLETE, UNABRIDGED PAYLOAD
-        ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [{ "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False }], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [0, "Initializing", True] } }, "check_plugins": [ {"name": "MaterialShaders", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMaterials"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "ConvertToOctahedral", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:normalmap_texture": {"encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal"}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "ConvertToDDS", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:diffuse_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:emissive_mask_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:height_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max"]}, "inputs:metallic_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:normalmap_texture": {"args": ["--format", "bc5", "--no-mip-gamma-correct"]}, "inputs:reflectionroughness_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]}, "inputs:transmittance_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}, {"channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True}, {"channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "MassTexturePreview", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "Nothing"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}} ], "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}}] }
-
+        ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [{ "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False }], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [0, "Initializing", True] } }, "check_plugins": [ {"name": "MaterialShaders", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMaterials"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "ConvertToDDS", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:diffuse_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:emissive_mask_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:height_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max"]}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}, {"channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True}, {"channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "suffix": ".rtex.dds"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, ], "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}}] }
         ingest_payload["context_plugin"]["data"]["input_files"] = textures_for_ingest
         ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
         ingest_response = make_request_with_retries('POST', f"{base_api_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl)
-        if not ingest_response or ingest_response.status_code >= 400:
-            logging.error(f"Failed to bulk ingest special textures. Status: {ingest_response.status_code if ingest_response else 'N/A'}")
-            return {'CANCELLED'}
+        if not ingest_response or ingest_response.status_code >= 400: return {'CANCELLED'}
 
         stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
         all_inputs_url = f"{stagecraft_api_url_base}/textures/?selection=true&filter_session_prims=false&exists=true"
         all_inputs_response = make_request_with_retries('GET', all_inputs_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
-        if not all_inputs_response or all_inputs_response.status_code != 200:
-            logging.error("Could not fetch shader information from the server.")
-            return {'CANCELLED'}
+        if not all_inputs_response or all_inputs_response.status_code != 200: return {'CANCELLED'}
 
-        shader_prim_path_map = {}
-        all_server_inputs = all_inputs_response.json().get("textures", [])
-        for input_prim, _ in all_server_inputs:
+        server_mat_name_to_prim_map = {}
+        for prim_path, _ in all_inputs_response.json().get("textures", []):
             try:
-                base_shader_path, _ = input_prim.rsplit('.inputs:', 1)
-                mat_prim_name = base_shader_path.rsplit('/Shader', 1)[0].split('/')[-1]
-                if mat_prim_name not in shader_prim_path_map:
-                    shader_prim_path_map[mat_prim_name] = base_shader_path
+                if "/Looks/" in prim_path:
+                    base_shader_path, _ = prim_path.rsplit('.inputs:', 1)
+                    material_name_from_server = base_shader_path.rsplit('/Looks/', 1)[-1].split('/')[0]
+                    if material_name_from_server not in server_mat_name_to_prim_map:
+                        server_mat_name_to_prim_map[material_name_from_server] = base_shader_path
             except ValueError: continue
         
-        # --- THE COMPLETE AND CORRECT MAPPING ---
-        TEXTURE_TYPE_TO_USD_INPUT_MAP = {
-            'HEIGHT': 'height_texture',
-            'EMISSIVE': 'emissive_mask_texture',
-            'TRANSMITTANCE': 'transmittance_texture',
-            'ANISOTROPY': 'anisotropy_texture', # Assuming a logical name, verify if needed
-            'MEASUREMENT_DISTANCE': 'measurement_distance_texture', # Assuming from server name
-            'SINGLE_SCATTERING': 'single_scattering_texture' # Assuming from server name
-        }
-
+        # This final lookup loop is now correct
         final_put_payload_list = []
-        for mat_key, assignments_list in assignments_by_mat_key.items():
-            if not isinstance(mat_key, tuple): continue
-            _, original_blender_mat_name = mat_key
-            final_exported_name = material_name_map.get(original_blender_mat_name)
+        for original_blender_name, assignments_list in assignments_by_original_mat_name.items():
+            final_exported_name = final_mtl_name_map.get(original_blender_name)
+            if not final_exported_name:
+                logging.warning(f"  Could not find a temporary name mapping for '{original_blender_name}'.")
+                continue
+
+            sanitized_name_to_find = final_exported_name.replace('-', '_')
+            server_shader_prim = server_mat_name_to_prim_map.get(sanitized_name_to_find)
             
-            if final_exported_name and final_exported_name in shader_prim_path_map:
-                base_shader_prim = shader_prim_path_map[final_exported_name]
+            if server_shader_prim:
+                logging.info(f"  SUCCESS: Matched Blender material '{original_blender_name}' to server prim '{server_shader_prim}' using sanitized name '{sanitized_name_to_find}'.")
                 for assignment in assignments_list:
-                    tex_type, server_path = assignment['type'], assignment['server_path']
-                    input_name = TEXTURE_TYPE_TO_USD_INPUT_MAP.get(tex_type)
-                    if input_name:
-                        target_input_prim = f"{base_shader_prim}.inputs:{input_name}"
-                        logging.info(f"  > [DIRECT MAPPING] Assigning '{original_blender_mat_name}' texture ({tex_type}) to server prim '{final_exported_name}'.")
-                        final_put_payload_list.append([target_input_prim, server_path])
-                    else:
-                        logging.warning(f"  > Unknown special texture type '{tex_type}' for material '{original_blender_mat_name}'. It was not assigned.")
+                    if assignment.get('usd_input') and assignment.get('server_path'):
+                        final_put_payload_list.append([f"{server_shader_prim}.inputs:{assignment['usd_input']}", assignment['server_path']])
             else:
-                logging.warning(
-                    f"Could not assign textures for '{original_blender_mat_name}'. "
-                    f"Mapped name was '{final_exported_name}', which was not found on the server. "
-                    f"Server prims: {list(shader_prim_path_map.keys())}"
-                )
-        
+                 logging.warning(f"  FAILED: Could not find server prim for sanitized name '{sanitized_name_to_find}'. Available server names: {list(server_mat_name_to_prim_map.keys())}")
+
         if not final_put_payload_list:
-            logging.warning("Assignment payload is empty. No special textures will be assigned.")
+            logging.warning("Assignment payload is empty after matching. No special textures will be assigned.")
             return {'FINISHED'}
 
         update_texture_connection_url = f"{stagecraft_api_url_base}/textures/"
         put_payload = {"force": False, "textures": final_put_payload_list}
         put_response = make_request_with_retries('PUT', update_texture_connection_url, json_payload=put_payload, headers={"accept": "application/lightspeed.remix.service+json; version=1.0", "Content-Type": "application/lightspeed.remix.service+json; version=1.0"}, verify=addon_prefs.remix_verify_ssl)
-        if not put_response or put_response.status_code >= 400:
-            logging.error(f"Failed to bulk assign special textures. Status: {put_response.status_code if put_response else 'N/A'}")
-            return {'CANCELLED'}
+        
+        if not put_response or put_response.status_code >= 400: return {'CANCELLED'}
 
-        logging.info("--- Finished Final & Complete Special Texture Assignment Successfully ---")
+        logging.info("--- Finished Special Texture Assignment Successfully ---")
         return {'FINISHED'}
 
     except Exception as e:
-        logging.error(f"A critical error occurred in handle_special_texture_assignments: {e}", exc_info=True)
+        logging.error(f"A critical error occurred: {e}", exc_info=True)
         return {'CANCELLED'}
         
 def trim_prim_path(prim_path, segments_to_trim=0):
@@ -2572,6 +2577,19 @@ def _hash_image(img, image_hash_cache):
         image_hash_cache[cache_key] = calculated_digest
 
     return calculated_digest
+
+def _ensure_image_uuids(context):
+    """
+    [DEFINITIVE UUID TAGGING]
+    Iterates through all image datablocks in the current blend file and assigns a
+    unique, persistent UUID to a custom property if it doesn't already have one.
+    This provides a stable identifier for tracking images across processes.
+    """
+    logging.info("Ensuring all image datablocks have a persistent UUID...")
+    for image in bpy.data.images:
+        if 'remix_bake_uuid' not in image:
+            image['remix_bake_uuid'] = str(uuid.uuid4())
+    logging.info("UUID tagging complete.")
     
 def _find_bsdf_and_output_nodes(node_tree):
     """Finds the active Principled BSDF and Material Output nodes."""
@@ -2622,157 +2640,85 @@ def _material_has_decal_setup(mat):
         
     return False
 
-def get_material_hash(mat, obj=None, material_slot_index=None, force=True, image_hash_cache=None, bake_method='EMIT_HIJACK'):
+def get_material_hash(mat, obj=None, material_slot_index=None, force=True, image_hash_cache=None, bake_method='EMIT_HIJACK', ignore_mesh_context=False):
     """
-    [PRODUCTION VERSION - BAKE AWARE] Calculates a highly detailed hash that now 
-    includes the bake_method to invalidate the cache when the baking engine changes.
+    [PRODUCTION VERSION - HYBRID HASHING] Calculates a highly detailed hash.
+    Includes a switch to completely ignore all mesh context (including UVs) for
+    the most aggressive caching, controlled by the 'ignore_mesh_context' parameter.
     """
-    # Incrementing the version string invalidates all previous, incorrect caches.
-    HASH_VERSION = "v_STRUCTURAL_UV_AWARE_8_BAKE_AWARE"
+    HASH_VERSION = "v_HYBRID_UV_AWARE_11"
 
     if not mat:
         return None
 
-    mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial'))
+    recipe_parts = [f"VERSION:{HASH_VERSION}", f"BAKE_METHOD:{bake_method}"]
 
-    try:
-        # The bake method is now the first and most important part of the hash recipe.
-        recipe_parts = [f"VERSION:{HASH_VERSION}", f"BAKE_METHOD:{bake_method}"]
+    # --- Material and Node Hashing (This part remains unchanged) ---
+    if not mat.use_nodes or not mat.node_tree:
+        recipe_parts.append("NON_NODE_MATERIAL")
+        recipe_parts.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
+        recipe_parts.append(f"Metallic:{_stable_repr(mat.metallic)}")
+        recipe_parts.append(f"Roughness:{_stable_repr(mat.roughness)}")
+    else:
+        if image_hash_cache is None: image_hash_cache = {}
+        all_node_recipes, all_link_recipes = [], []
+        trees_to_process, processed_trees = deque([mat.node_tree]), {mat.node_tree}
+        while trees_to_process:
+            current_tree = trees_to_process.popleft()
+            for node in current_tree.nodes:
+                node_parts = [f"NODE:{node.name}", f"TYPE:{node.bl_idname}"]
+                for prop in node.bl_rna.properties:
+                    if prop.is_readonly or prop.identifier in ['rna_type', 'name', 'label', 'inputs', 'outputs', 'parent', 'internal_links', 'color_ramp', 'image', 'node_tree', 'outputs']: continue
+                    try:
+                        value = getattr(node, prop.identifier)
+                        node_parts.append(f"PROP:{prop.identifier}={_stable_repr(value)}")
+                    except AttributeError: continue
+                for inp in node.inputs:
+                    if not inp.is_linked and hasattr(inp, 'default_value'):
+                        node_parts.append(f"INPUT_DEFAULT:{inp.identifier}={_stable_repr(inp.default_value)}")
+                if node.type == 'VALUE' and hasattr(node.outputs[0], 'default_value'):
+                    node_parts.append(f"VALUE_NODE_OUTPUT={_stable_repr(node.outputs[0].default_value)}")
+                if node.type == 'TEX_IMAGE' and node.image:
+                    node_parts.append(f"SPECIAL_CONTENT_HASH:{_hash_image(node.image, image_hash_cache)}")
+                elif node.type == 'ShaderNodeValToRGB':
+                    cr = node.color_ramp
+                    if cr: node_parts.append(f"SPECIAL_CONTENT_STOPS:[{','.join([f'STOP({_stable_repr(s.position)}, {_stable_repr(s.color)})' for s in cr.elements])}]")
+                if node.type == 'GROUP' and node.node_tree and node.node_tree not in processed_trees:
+                    trees_to_process.append(node.node_tree)
+                    processed_trees.add(node.node_tree)
+                all_node_recipes.append("||".join(sorted(node_parts)))
+            for link in current_tree.links:
+                all_link_recipes.append(f"LINK:{link.from_node.name}.{link.from_socket.identifier}->{link.to_node.name}.{link.to_socket.identifier}")
+        recipe_parts.extend(sorted(all_node_recipes))
+        recipe_parts.extend(sorted(all_link_recipes))
 
-        if not mat.use_nodes or not mat.node_tree:
-            # Handle non-node materials (older Blender Internal style)
-            recipe_parts.append("NON_NODE_MATERIAL")
-            recipe_parts.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
-            recipe_parts.append(f"Metallic:{_stable_repr(mat.metallic)}")
-            recipe_parts.append(f"Roughness:{_stable_repr(mat.roughness)}")
+    # --- THE CORRECTED LOGIC SWITCH ---
+    # The entire mesh context block is now skipped if ignore_mesh_context is True.
+    if not ignore_mesh_context and obj and obj.type == 'MESH' and obj.data and material_slot_index is not None:
+        mesh_context_parts = ["MESH_CONTEXT_START"]
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+
+        active_uv_layer = obj.data.uv_layers.active
+        if active_uv_layer:
+            mesh_context_parts.append(f"UV_MAP_NAME:{active_uv_layer.name}")
+            uv_data_string = "".join(f"{i}:{l.uv.x:.6f},{l.uv.y:.6f};" for i, l in enumerate(active_uv_layer.data))
+            uv_hash = hashlib.md5(uv_data_string.encode('utf-8')).hexdigest()
+            mesh_context_parts.append(f"UV_HASH:{uv_hash}")
         else:
-            # This is the main logic for node-based materials
-            if image_hash_cache is None:
-                image_hash_cache = {}
+            mesh_context_parts.append("UV_HASH:NONE")
 
-            all_node_recipes = []
-            all_link_recipes = []
+        topo_string = "".join(f"{f.index}:{','.join(str(v.index) for v in f.verts)};" for f in sorted(bm.faces, key=lambda face: face.index))
+        mesh_context_parts.append(f"TOPO_HASH:{hashlib.md5(topo_string.encode('utf-8')).hexdigest()}")
+        assigned_face_indices_string = ",".join(str(f.index) for f in sorted(bm.faces, key=lambda face: face.index) if f.material_index == material_slot_index)
+        mesh_context_parts.append(f"ASSIGN_HASH:{hashlib.md5(assigned_face_indices_string.encode('utf-8')).hexdigest()}")
 
-            trees_to_process = deque([mat.node_tree])
-            processed_trees = {mat.node_tree}
+        recipe_parts.extend(mesh_context_parts)
+        bm.free()
 
-            while trees_to_process:
-                current_tree = trees_to_process.popleft()
-
-                for node in current_tree.nodes:
-                    node_parts = [f"NODE:{node.name}", f"TYPE:{node.bl_idname}"]
-
-                    # Generic Properties (dropdowns, checkboxes, etc.)
-                    for prop in node.bl_rna.properties:
-                        if prop.is_readonly or prop.identifier in [
-                            'rna_type', 'name', 'label', 'inputs', 'outputs', 'parent', 'internal_links',
-                            'color_ramp', 'image', 'node_tree', 'outputs'
-                        ]:
-                            continue
-                        try:
-                            value = getattr(node, prop.identifier)
-                            node_parts.append(f"PROP:{prop.identifier}={_stable_repr(value)}")
-                        except AttributeError:
-                            continue
-
-                    # Unconnected Input Values (sliders, color fields, etc.)
-                    for inp in node.inputs:
-                        if not inp.is_linked and hasattr(inp, 'default_value'):
-                            node_parts.append(f"INPUT_DEFAULT:{inp.identifier}={_stable_repr(inp.default_value)}")
-
-                    # Specific fix for ShaderNodeValue output values
-                    if node.type == 'VALUE' and hasattr(node.outputs[0], 'default_value'):
-                        output_val = node.outputs[0].default_value
-                        node_parts.append(f"VALUE_NODE_OUTPUT={_stable_repr(output_val)}")
-
-                    # Special Content Node Handlers
-                    if node.type == 'TEX_IMAGE' and node.image:
-                        image_content_hash = _hash_image(node.image, image_hash_cache)
-                        node_parts.append(f"SPECIAL_CONTENT_HASH:{image_content_hash}")
-                    elif node.type == 'ShaderNodeValToRGB':  # ColorRamp
-                        cr = node.color_ramp
-                        if cr:
-                            elements_str = [f"STOP({_stable_repr(s.position)}, {_stable_repr(s.color)})" for s in cr.elements]
-                            node_parts.append(f"SPECIAL_CONTENT_STOPS:[{','.join(elements_str)}]")
-
-                    # Queue up Node Groups for processing
-                    if node.type == 'GROUP' and node.node_tree:
-                        if node.node_tree not in processed_trees:
-                            trees_to_process.append(node.node_tree)
-                            processed_trees.add(node.node_tree)
-
-                    all_node_recipes.append("||".join(sorted(node_parts)))
-
-                # Process all connections in the current tree
-                for link in current_tree.links:
-                    link_repr = (f"LINK:"
-                                 f"{link.from_node.name}.{link.from_socket.identifier}->"
-                                 f"{link.to_node.name}.{link.to_socket.identifier}")
-                    all_link_recipes.append(link_repr)
-
-            recipe_parts.extend(sorted(all_node_recipes))
-            recipe_parts.extend(sorted(all_link_recipes))
-
-        # --- Mesh Context Hashing (Now including UVs) ---
-        if obj and obj.type == 'MESH' and obj.data and material_slot_index is not None:
-            mesh_context_parts = ["MESH_CONTEXT_START"]
-            
-            bm = bmesh.new()
-            bm.from_mesh(obj.data)
-            bm.verts.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-
-            # 1. Hashing vertex positions to detect geometry changes.
-            vert_co_string = "".join(f"{v.co.x:.6f},{v.co.y:.6f},{v.co.z:.6f};" for v in bm.verts)
-            geom_hash = hashlib.md5(vert_co_string.encode('utf-8')).hexdigest()
-            mesh_context_parts.append(f"GEOM_HASH:{geom_hash}")
-
-            # 2. Hashing topology (face vertex indices), sorted by face index for stability.
-            topo_string = "".join(
-                f"{f.index}:{','.join(str(v.index) for v in f.verts)};"
-                for f in sorted(bm.faces, key=lambda face: face.index)
-            )
-            topo_hash = hashlib.md5(topo_string.encode('utf-8')).hexdigest()
-            mesh_context_parts.append(f"TOPO_HASH:{topo_hash}")
-
-            # 3. Hashing the list of faces this specific material is assigned to.
-            assigned_face_indices_string = ",".join(str(f.index)
-                for f in sorted(bm.faces, key=lambda face: face.index)
-                if f.material_index == material_slot_index
-            )
-            assignment_hash = hashlib.md5(assigned_face_indices_string.encode('utf-8')).hexdigest()
-            mesh_context_parts.append(f"ASSIGN_HASH:{assignment_hash}")
-            
-            # 4. --- THIS IS THE CRITICAL FIX ---
-            # Hashing the UV coordinates from the active UV layer.
-            active_uv_layer = obj.data.uv_layers.active
-            if active_uv_layer:
-                mesh_context_parts.append(f"UV_MAP_NAME:{active_uv_layer.name}")
-                # Create a stable string from all UV coordinates in the active layer.
-                # Use enumerate to get a stable index; 'MeshUVLoop' has no '.index'.
-                uv_data_string = "".join(
-                    f"{i}:{l.uv.x:.6f},{l.uv.y:.6f};"
-                    for i, l in enumerate(active_uv_layer.data)
-                )
-                uv_hash = hashlib.md5(uv_data_string.encode('utf-8')).hexdigest()
-                mesh_context_parts.append(f"UV_HASH:{uv_hash}")
-            else:
-                mesh_context_parts.append("UV_HASH:NONE")
-            # --- END OF FIX ---
-
-            recipe_parts.extend(mesh_context_parts)
-            bm.free()
-
-        # Final hash calculation
-        final_recipe_string = "|||".join(recipe_parts)
-        digest = hashlib.md5(final_recipe_string.encode('utf-8')).hexdigest()
-
-        return digest
-
-    except Exception as e:
-        print(f"[get_material_hash] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        return None
+    final_recipe_string = "|||".join(recipe_parts)
+    return hashlib.md5(final_recipe_string.encode('utf-8')).hexdigest()
 
 class OBJECT_OT_import_captures(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
     """Import multiple USD files, treating base_name.### as the same asset, with per-file texture handling."""
@@ -3510,7 +3456,7 @@ class OBJECT_OT_import_usd_from_remix(Operator):
                 bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
             remix_import_lock = False
             logging.info("Lock released for USD import process (Remix).")
-
+    
 class OBJECT_OT_export_and_ingest(Operator):
     bl_idname = "object.export_and_ingest"
     bl_label = "Export and Ingest (Dynamic Workers)"
@@ -3520,25 +3466,56 @@ class OBJECT_OT_export_and_ingest(Operator):
     _timer = None
     _op_lock: Lock = None
     _export_data: dict = {}
+    _operator_state: str = 'INITIALIZING' 
 
     # --- Dynamic Worker Management State ---
-    _worker_slots: list = [] # Replaces _worker_pool. Tracks status of each potential worker.
-    _task_batches: list = [] # Pre-calculated batches of tasks for each worker slot.
+    _worker_slots: list = []
+    _master_task_queue: collections.deque = None
     _comm_threads: list = []
     _results_queue: Queue = None
     _log_queue: Queue = None
     _total_tasks: int = 0
     _finished_tasks: int = 0
     _failed_tasks: int = 0
-    _resource_check_counter: int = 0
+    
+    # --- Configuration for Smart Scaling ---
+    MAX_POTENTIAL_WORKERS: int = max(1, os.cpu_count()) 
+    INITIAL_WORKER_COUNT: int = 3
+    
+    # --- Event-Driven Stabilization ---
+    _initial_tasks_finished_count: int = 0
 
-    # --- Configuration for Dynamic Workers ---
-    MAX_POTENTIAL_WORKERS: int = max(1, os.cpu_count()) # Sane upper limit
-    RESOURCE_CHECK_INTERVAL_SEC: int = 2 # How often to check system resources
-    CPU_HIGH_THRESHOLD: int = 90 # % CPU to trigger worker termination
-    RAM_HIGH_THRESHOLD: int = 90 # % RAM to trigger worker termination
-    CPU_LOW_THRESHOLD: int = 80  # % CPU to allow new worker launch
-    RAM_LOW_THRESHOLD: int = 80  # % RAM to allow new worker launch
+    # Time in seconds between dynamic scaling decisions.
+    RESOURCE_CHECK_INTERVAL_SEC: int = 0.5
+    _next_resource_check_time: float = 0.0
+    
+    # How many consecutive checks must be "high" before scaling down.
+    HIGH_USAGE_SUSTAINED_CHECKS: int = 3
+    _high_usage_counter: int = 0
+
+    # Resource usage thresholds (as percentages).
+    CPU_HIGH_THRESHOLD: int = 95
+    RAM_HIGH_THRESHOLD: int = 95
+    CPU_LOW_THRESHOLD: int = 85
+    RAM_LOW_THRESHOLD: int = 85
+    
+    # --- START OF DEBUGGING SIMULATION ---
+    def _get_system_resources(self):
+        """
+        [DEBUG SIMULATION] This method is modified to always report 99% CPU usage
+        to trigger the worker scale-down logic for debugging purposes.
+        """
+        # In a real scenario, this would use psutil.
+        # We are forcing a high CPU value here.
+        simulated_cpu = 99.0
+        simulated_ram = 50.0 # Keep RAM normal to isolate the CPU trigger
+
+        if PSUTIL_INSTALLED:
+            import psutil
+            # We still get the real RAM usage.
+            simulated_ram = psutil.virtual_memory().percent
+        
+        return simulated_cpu, simulated_ram
 
     def _communication_thread_target(self, worker_process):
         """Dedicated thread to read stdout from a single worker."""
@@ -3555,59 +3532,49 @@ class OBJECT_OT_export_and_ingest(Operator):
             for line in iter(worker_process.stderr.readline, ''):
                 if line: self._log_queue.put(line.strip())
         except Exception: pass
-
-          
-          
+                       
+        
     def _launch_new_worker(self, slot_index):
-        """
-        [FINAL CORRECTED] Launches a worker with the correct Windows process flags
-        to ensure it is terminated when the parent (Blender) closes, and registers
-        it with the atexit handler for graceful shutdown.
-        """
-        if slot_index >= len(self._worker_slots):
-            return
-
+        if slot_index >= len(self._worker_slots): return
         slot = self._worker_slots[slot_index]
-        if slot['process'] is not None and slot['process'].poll() is None:
-            logging.warning(f"Attempted to launch worker for slot {slot_index}, but a process already exists.")
+        if slot['process'] is not None and slot['process'].poll() is None: return
+
+        lib_path = get_persistent_lib_path()
+        if not lib_path:
+            logging.error("CRITICAL: Could not get persistent library path. Cannot launch workers.")
+            slot['status'] = 'failed'
             return
 
-        logging.info(f"→ Launching ISOLATED worker for slot {slot_index}...")
+        logging.info(f"→ Launching PERSISTENT worker for slot {slot_index}...")
+        
+        # --- THIS IS THE MODIFIED COMMAND ---
         cmd = [
-            bpy.app.binary_path,
-            "--factory-startup",
-            "--background",
-            "--python", BAKE_WORKER_PY,
-            "--",
-            "--persistent"
+            bpy.app.binary_path, 
+            "--factory-startup", 
+            "--background", 
+            "--python", BAKE_WORKER_PY, 
+            "--", 
+            "--persistent", # <-- ADDED THIS FLAG
+            "--lib-path", lib_path
         ]
     
         try:
-            # --- THIS IS THE FIX ---
-            creation_flags = 0
-            if sys.platform == "win32":
-                # This flag is crucial. It groups the new process with its own
-                # children, allowing terminate() to work reliably and preventing orphans
-                # if the main Blender process is killed forcefully.
-                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
-            # --- END OF FIX ---
-
+            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
             worker = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=creation_flags, # Use the new flags here
-                text=True,
-                encoding='utf-8',
+                cmd, 
+                stdin=subprocess.PIPE, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                creationflags=creation_flags, 
+                text=True, 
+                encoding='utf-8', 
                 bufsize=1
             )
-        
-            # Add the newly created process to our global registry for atexit.
             ACTIVE_WORKER_PROCESSES.append(worker)
         
             slot['process'] = worker
             slot['status'] = 'launching'
+            slot['launch_time'] = time.monotonic()
 
             comm_thread = threading.Thread(target=self._communication_thread_target, args=(worker,), daemon=True)
             log_thread = threading.Thread(target=self._log_thread_target, args=(worker,), daemon=True)
@@ -3615,22 +3582,23 @@ class OBJECT_OT_export_and_ingest(Operator):
             log_thread.start()
             self._comm_threads.extend([comm_thread, log_thread])
 
-            load_command = json.dumps({
-                "action": "load_blend",
-                "blend_file": abspath(bpy.data.filepath),
-                "total_tasks": self._total_tasks
-            }) + "\n"
-            worker.stdin.write(load_command)
-            worker.stdin.flush()
+            # --- [REMOVED] ---
+            # The initial load command is no longer sent. The worker will start,
+            # report its readiness, and then wait for its first task. We do not
+            # write anything to its stdin upon launch.
+            # --- [END OF REMOVAL] ---
 
         except Exception as e:
             logging.error(f"Could not launch worker for slot {slot_index}: {e}", exc_info=True)
             slot['status'] = 'failed'
+            
         
     def _terminate_worker(self, slot_index):
         """
-        [CORRECTED] Terminates a worker and REMOVES it from the global
-        atexit registry to prevent double-killing.
+        [HYBRID SHUTDOWN V2 - AGGRESSIVE FAILSAFE] Gracefully shuts down a worker.
+        1. Sends a 'quit' command and waits for a clean exit.
+        2. If it times out, sends a terminate signal and waits 0.5 seconds.
+        3. If it's still running, forcefully kills the process immediately.
         """
         if slot_index >= len(self._worker_slots):
             return
@@ -3639,19 +3607,38 @@ class OBJECT_OT_export_and_ingest(Operator):
         worker = slot.get('process')
 
         if worker and worker.poll() is None:
-            logging.warning(f"Terminating worker in slot {slot_index} (PID: {worker.pid}).")
+            logging.info(f"Attempting graceful shutdown for worker in slot {slot_index} (PID: {worker.pid})...")
             try:
+                # --- Step 1: The Polite Request ---
+                quit_command = json.dumps({"action": "quit"}) + "\n"
+                worker.stdin.write(quit_command)
+                worker.stdin.flush()
+                worker.stdin.close() # Signal that we're done writing
+
+                # --- Step 2: The Waiting Period (5 seconds) ---
+                worker.wait(timeout=5)
+                logging.info(f"Worker {slot_index} (PID: {worker.pid}) shut down gracefully.")
+
+            except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
+                # --- Step 3: The Forceful Takedown (if graceful shutdown fails) ---
+                logging.warning(f"Worker {slot_index} did not respond to quit command. Forcibly terminating (PID: {worker.pid}).")
                 worker.terminate()
-                worker.wait(timeout=2)
-            except (subprocess.TimeoutExpired, Exception):
-                worker.kill()
+                try:
+                    # --- THIS IS THE MODIFIED LOGIC ---
+                    # Give it only 0.5 seconds to die after the terminate signal.
+                    worker.wait(timeout=0.5)
+                    logging.info(f"Worker {slot_index} (PID: {worker.pid}) terminated successfully.")
+                    # --- END OF MODIFICATION ---
+                except subprocess.TimeoutExpired:
+                    # --- THIS IS THE MODIFIED LOGIC ---
+                    # If it's still alive after 0.5 seconds, use the final, most aggressive method.
+                    logging.error(f"Worker {slot_index} (PID: {worker.pid}) did not terminate. Killing process now.")
+                    worker.kill()
+                    # --- END OF MODIFICATION ---
             finally:
-                # --- THIS IS THE FIX ---
-                # Remove the now-dead process from the global registry.
+                # --- Final Cleanup ---
                 if worker in ACTIVE_WORKER_PROCESSES:
                     ACTIVE_WORKER_PROCESSES.remove(worker)
-                # --- END OF FIX ---
-            
                 slot['process'] = None
                 slot['status'] = 'suspended'
           
@@ -4073,15 +4060,27 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         return None
 
+    def _material_has_decal_setup(self, mat):
+        """
+        Checks if a material has a decal setup by looking for a Mix Shader
+        node anywhere in the path between the main BSDF and the Material Output.
+        """
+        if not mat or not mat.use_nodes or not mat.node_tree:
+            return False
+        
+        nt = mat.node_tree
+        bsdf_node, active_output_node = self._find_bsdf_and_output_nodes(nt)
+
+        if bsdf_node and active_output_node and active_output_node.inputs['Surface'].is_linked:
+            start_node = active_output_node.inputs['Surface'].links[0].from_node
+            found_decal_info = self._find_universal_decal_mixer(start_node, bsdf_node, set())
+            return found_decal_info is not None
+            
+        return False
+
     # --- MODIFIED TASK COLLECTION FUNCTION ---
-    def collect_bake_tasks(self, context, objects_to_process, export_data):
-        """
-        [DEFINITIVE V7 - COMPLETE RACE CONDITION FIX]
-        Generates bake tasks. This is the complete, unabridged function. It fixes the UDIM race
-        condition by performing a pre-pass to identify all objects needing an atlas map and
-        creates the 'remix_atlas_uv' map for them *before* any bake tasks are generated.
-        """
-        tasks = []
+    def _initialize_bake_session(self, export_data):
+        """Initializes the bake directory and data structures for a new session."""
         if not is_blend_file_saved():
             raise RuntimeError("Blend file must be saved to create a bake/temp directory.")
 
@@ -4099,39 +4098,15 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         global global_image_hash_cache
         global_image_hash_cache.clear()
+        
+        logging.info("Bake session initialized and image cache cleared.")
+        return bake_info
 
-        SPECIAL_TEXTURE_MAP = {
-            "Displacement": "HEIGHT", "Emission Color": "EMISSIVE", "Alpha": "OPACITY",
-            "Anisotropy": "ANISOTROPY", "Transmission": "TRANSMITTANCE",
-            "Subsurface Radius": "MEASUREMENT_DISTANCE", "Subsurface Scale": "SINGLE_SCATTERING"
-        }
-
-        addon_prefs = context.preferences.addons[__name__].preferences
-        bake_method_for_all_tasks = addon_prefs.bake_method
-        logging.info(f"  > Using selected Bake Method for all tasks: {bake_method_for_all_tasks}.")
-
-        if bake_method_for_all_tasks == 'NATIVE':
-            CORE_PBR_CHANNELS = [
-                ("Base Color", 'DIFFUSE',   False, True), ("Metallic",   'EMIT',      True,  False),
-                ("Roughness",  'ROUGHNESS', True,  False), ("Normal",     'NORMAL',    False, False),
-            ]
-        else: # EMIT_HIJACK
-            CORE_PBR_CHANNELS = [
-                ("Base Color", 'EMIT', False, True), ("Metallic",   'EMIT', True,  False),
-                ("Roughness",  'EMIT', True,  False), ("Normal",     'NORMAL', False, False),
-            ]
-
-        OPTIONAL_CHANNELS = [
-            ("Alpha", 'EMIT', True, False), ("Displacement", 'EMIT', True, False),
-            ("Emission Color", 'EMIT', False, True), ("Anisotropy", 'EMIT', True, False),
-            ("Transmission", 'EMIT', True, False), ("Subsurface Radius", 'EMIT', False, True),
-            ("Subsurface Scale", 'EMIT', True, False)
-        ]
-        DEFAULT_BAKE_RESOLUTION = 2048
-
-        logging.info("Analyzing materials with mesh-aware caching...")
-
-        # --- THIS IS THE FIX: PRE-PASS FOR UV MAP CREATION ---
+    def _identify_and_prepare_udim_atlases(self, objects_to_process):
+        """
+        Performs a pre-pass to find objects with UDIM materials and creates the
+        necessary 'remix_atlas_uv' map for them to prevent race conditions.
+        """
         objects_needing_atlas = defaultdict(set)
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data: continue
@@ -4142,19 +4117,182 @@ class OBJECT_OT_export_and_ingest(Operator):
                     if udim_node and udim_node.image:
                         tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
                         if tiles:
-                            # Group objects by the exact set of tiles they use to handle multiple UDIM materials
                             tile_tuple = tuple(t.number for t in tiles)
                             objects_needing_atlas[tile_tuple].add(obj)
 
         if objects_needing_atlas:
             logging.info("Pre-creating UDIM atlas UV maps to prevent race condition...")
             for tile_numbers, object_set in objects_needing_atlas.items():
-                # We need to pass mock ImageTile objects to the helper function
                 tiles_for_transform = [type('ImageTile', (object,), {'number': num})() for num in tile_numbers]
                 self._transform_uvs_for_atlas(list(object_set), tiles_for_transform)
-        # --- END OF FIX ---
 
-        # --- MAIN TASK GENERATION LOOP (UNCHANGED LOGIC) ---
+    def _create_bake_task(self, obj, mat, channel_details, bake_settings, bake_info, special_texture_map):
+        """Creates a dictionary for a single bake task."""
+        channel_name, bake_type, is_val, is_color = channel_details
+        safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
+        safe_socket_name = channel_name.replace(' ', '')
+        hash_for_filename = bake_settings['material_hash'][:8] if bake_settings['material_hash'] else f"NOHSH_{uuid.uuid4().hex[:6]}"
+        output_filename = f"{safe_mat_name}_{hash_for_filename}_{safe_socket_name}.png"
+        output_path = os.path.join(bake_info['bake_dir'], output_filename)
+
+        if channel_name in special_texture_map:
+            bake_info['special_texture_info'][(obj.name, mat.name)].append({
+                'path': output_path, 'type': special_texture_map[channel_name]
+            })
+
+        final_bake_type = 'EMIT' if bake_settings['uses_udims'] and bake_type == 'DIFFUSE' else bake_type
+
+        return {
+            "material_name": mat.name, "material_uuid": bake_settings['material_uuid'], "object_name": obj.name,
+            "bake_type": final_bake_type, "output_path": output_path, "target_socket_name": channel_name,
+            "is_value_bake": is_val, "is_color_data": is_color,
+            "resolution_x": bake_settings['resolution_x'], "resolution_y": bake_settings['resolution_y'],
+            "uv_layer": bake_settings['uv_layer'], "material_hash": bake_settings['material_hash'],
+            "bake_method": bake_settings['bake_method']
+        }
+
+    def _generate_tasks_for_material(self, obj, slot_index, mat, bake_info, bake_method, channels, special_texture_map):
+        """
+        Analyzes a single material on a specific object and generates all necessary
+        bake tasks for it, returning an empty list if no baking is needed.
+        """
+        material_tasks = []
+        
+        uses_udims = self._material_uses_udims(mat)
+        if uses_udims and mat.name not in bake_info['udim_materials']:
+            bake_info['udim_materials'].add(mat.name)
+
+        material_hash = get_material_hash(mat, obj, slot_index, image_hash_cache=global_image_hash_cache, bake_method=bake_method)
+        hash_for_log = f"Hash: {material_hash[:8]}..." if material_hash else "Hash: [FAILED]"
+
+        if material_hash and material_hash in global_material_hash_cache:
+            logging.info(f"  CACHE HIT: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) is cached. Reusing.")
+            cached_data = global_material_hash_cache[material_hash]
+            bake_info['cached_materials'][material_hash] = cached_data
+            for socket_name, path in cached_data.items():
+                if socket_name in special_texture_map:
+                     bake_info['special_texture_info'][(obj.name, mat.name)].append({'path': path, 'type': special_texture_map[socket_name]})
+            return []
+
+        logging.info(f"  CACHE MISS: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) will be processed.")
+        is_complex = not self._is_simple_pbr_setup(mat)
+        has_decal = _material_has_decal_setup(mat)
+
+        if is_complex or uses_udims:
+            log_reason_parts = []
+            if is_complex: log_reason_parts.append("complex setup")
+            if uses_udims: log_reason_parts.append("UDIM textures")
+            logging.info(f"  - Queuing FULL BAKE for material '{mat.name}' on '{obj.name}' (Reason: {', '.join(log_reason_parts)}).")
+
+            DEFAULT_BAKE_RESOLUTION = 2048
+            res_x, res_y = DEFAULT_BAKE_RESOLUTION, DEFAULT_BAKE_RESOLUTION
+            uv_layer = obj.data.uv_layers.active.name if obj.data.uv_layers.active else obj.data.uv_layers[0].name
+
+            if uses_udims:
+                udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
+                if udim_node and udim_node.image:
+                    tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
+                    if tiles:
+                        tile_width, tile_height = udim_node.image.size
+                        if tile_width > 0 and tile_height > 0:
+                            res_x, res_y = tile_width * len(tiles), tile_height
+                            logging.info(f"   - UDIMs detected. Setting bake resolution to {res_x}x{res_y} for atlas.")
+                uv_layer = "remix_atlas_uv"
+            else:
+                max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
+                if max_w > 0: res_x = max_w
+                if max_h > 0: res_y = max_h
+                if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {res_x}x{res_y}.")
+
+            mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
+            task_templates = list(channels['core'])
+            bsdf, output_node = _find_bsdf_and_output_nodes(mat.node_tree)
+
+            for channel_details in channels['optional']:
+                channel_name = channel_details[0]
+                socket = (output_node.inputs.get(channel_name) if channel_name == "Displacement" and output_node else (bsdf.inputs.get(channel_name) if bsdf else None))
+                if (socket and socket.is_linked) or (channel_name == "Alpha" and socket and not math.isclose(socket.default_value, 1.0)):
+                    task_templates.append(channel_details)
+            
+            bake_settings = {'material_hash': material_hash, 'resolution_x': res_x, 'resolution_y': res_y, 'uv_layer': uv_layer, 'bake_method': bake_method, 'material_uuid': mat_uuid, 'uses_udims': uses_udims}
+            for channel_details in task_templates:
+                material_tasks.append(self._create_bake_task(obj, mat, channel_details, bake_settings, bake_info, special_texture_map))
+        
+        elif has_decal:
+            logging.info(f"  - Queuing DECAL COMPOSITE task for simple material '{mat.name}' on '{obj.name}'.")
+            bsdf_node, _ = _find_bsdf_and_output_nodes(mat.node_tree)
+            if bsdf_node:
+                original_base_color_path = self._get_texture_path_from_socket(bsdf_node.inputs['Base Color'])
+                if not original_base_color_path:
+                    logging.warning(f"    - Could not find a valid source texture for 'Base Color' on simple material '{mat.name}'. It will be treated as black.")
+                
+                DEFAULT_BAKE_RESOLUTION = 2048
+                max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
+                res_x = max_w if max_w > 0 else DEFAULT_BAKE_RESOLUTION
+                res_y = max_h if max_h > 0 else DEFAULT_BAKE_RESOLUTION
+                mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
+                
+                output_path = os.path.join(bake_info['bake_dir'], f"{''.join(c for c in mat.name if c.isalnum())}_{material_hash[:8]}_BaseColor.png")
+                
+                material_tasks.append({
+                    "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
+                    "bake_type": "EMIT", "target_socket_name": "Base Color", "output_path": output_path,
+                    "resolution_x": res_x, "resolution_y": res_y, "uv_layer": obj.data.uv_layers.active.name,
+                    "material_hash": material_hash, "bake_method": bake_method, "is_simple_decal_composite": True,
+                    "original_base_color_path": original_base_color_path
+                })
+                if material_hash:
+                    if material_hash not in global_material_hash_cache: global_material_hash_cache[material_hash] = {}
+                    global_material_hash_cache[material_hash]['Base Color'] = output_path
+                    for socket_name in ["Metallic", "Roughness", "Normal"]:
+                         path = self._get_texture_path_from_socket(bsdf_node.inputs[socket_name])
+                         if path: global_material_hash_cache[material_hash][socket_name] = path
+        else:
+            logging.info(f"  - Material '{mat.name}' is simple. Checking for existing special textures to use directly.")
+            bsdf, output_node = _find_bsdf_and_output_nodes(mat.node_tree)
+            sockets_to_scan = {}
+            if bsdf:
+                sockets_to_scan.update({"Emission Color": bsdf.inputs.get("Emission Color"), "Alpha": bsdf.inputs.get("Alpha")})
+            if output_node:
+                sockets_to_scan["Displacement"] = output_node.inputs.get("Displacement")
+
+            for socket_name, socket in sockets_to_scan.items():
+                if socket and socket.is_linked:
+                    texture_path = self._get_texture_path_from_socket(socket)
+                    if texture_path and os.path.exists(texture_path):
+                        server_texture_type = special_texture_map.get(socket_name)
+                        if server_texture_type:
+                            logging.info(f"    > Found direct-use special map for '{socket_name}' at: {os.path.basename(texture_path)}")
+                            bake_info['special_texture_info'][(obj.name, mat.name)].append({'path': texture_path, 'type': server_texture_type})
+
+        return material_tasks
+
+    def collect_bake_tasks(self, context, objects_to_process, export_data):
+        """
+        Main entry point to generate all bake tasks. It orchestrates the process by
+        calling its own specialized helper methods.
+        """
+        bake_info = self._initialize_bake_session(export_data)
+        
+        addon_prefs = context.preferences.addons[__name__].preferences
+        bake_method = addon_prefs.bake_method
+        logging.info(f"  > Using selected Bake Method for all tasks: {bake_method}.")
+
+        SPECIAL_TEXTURE_MAP = {
+            "Displacement": "HEIGHT", "Emission Color": "EMISSIVE", "Alpha": "OPACITY",
+            "Anisotropy": "ANISOTROPY", "Transmission": "TRANSMITTANCE",
+            "Subsurface Radius": "MEASUREMENT_DISTANCE", "Subsurface Scale": "SINGLE_SCATTERING"
+        }
+        
+        channels = {
+            'core': [("Base Color", 'DIFFUSE', False, True), ("Metallic", 'EMIT', True, False), ("Roughness", 'ROUGHNESS', True, False), ("Normal", 'NORMAL', False, False)] if bake_method == 'NATIVE' else [("Base Color", 'EMIT', False, True), ("Metallic", 'EMIT', True, False), ("Roughness", 'EMIT', True, False), ("Normal", 'NORMAL', False, False)],
+            'optional': [("Alpha", 'EMIT', True, False), ("Displacement", 'DISPLACEMENT', True, False), ("Emission Color", 'EMIT', False, True), ("Anisotropy", 'EMIT', True, False), ("Transmission", 'EMIT', True, False), ("Subsurface Radius", 'EMIT', False, True), ("Subsurface Scale", 'EMIT', True, False)]
+        }
+
+        logging.info("Analyzing materials with mesh-aware caching...")
+        self._identify_and_prepare_udim_atlases(objects_to_process)
+        
+        all_tasks = []
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data or not obj.data.uv_layers:
                 continue
@@ -4163,152 +4301,17 @@ class OBJECT_OT_export_and_ingest(Operator):
                 mat = slot.material
                 if not mat or not mat.use_nodes:
                     continue
+                
+                material_tasks = self._generate_tasks_for_material(obj, slot_index, mat, bake_info, bake_method, channels, SPECIAL_TEXTURE_MAP)
+                all_tasks.extend(material_tasks)
+
+        bake_info['tasks'] = all_tasks
+        if bake_info['tasks']:
+            logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
+        if bake_info['cached_materials']:
+            logging.info(f"Will reuse cached textures for {len(bake_info['cached_materials'])} material contexts.")
             
-                uses_udims = self._material_uses_udims(mat)
-                if uses_udims and mat.name not in bake_info['udim_materials']:
-                    bake_info['udim_materials'].add(mat.name)
-
-                material_hash = get_material_hash(
-                    mat, obj, slot_index, image_hash_cache=global_image_hash_cache,
-                    bake_method=bake_method_for_all_tasks
-                )
-                hash_for_log = f"Hash: {material_hash[:8]}..." if material_hash else "Hash: [FAILED]"
-
-                if material_hash and material_hash in global_material_hash_cache:
-                    logging.info(f"  CACHE HIT: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) is cached. Reusing.")
-                    cached_data = global_material_hash_cache[material_hash]
-                    bake_info['cached_materials'][material_hash] = cached_data
-                    for socket_name, path in cached_data.items():
-                        if socket_name in SPECIAL_TEXTURE_MAP:
-                             bake_info['special_texture_info'][(obj.name, mat.name)].append({
-                                'path': path, 'type': SPECIAL_TEXTURE_MAP[socket_name]
-                            })
-                    continue
-
-                logging.info(f"  CACHE MISS: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) will be processed.")
-                is_complex = not self._is_simple_pbr_setup(mat)
-                has_decal = _material_has_decal_setup(mat)
-
-                if is_complex or uses_udims:
-                    log_reason_parts = []
-                    if is_complex: log_reason_parts.append("complex setup")
-                    if uses_udims: log_reason_parts.append("UDIM textures")
-                    logging.info(f"  - Queuing FULL BAKE for material '{mat.name}' on '{obj.name}' (Reason: {', '.join(log_reason_parts)}).")
-
-                    bake_resolution_x, bake_resolution_y = DEFAULT_BAKE_RESOLUTION, DEFAULT_BAKE_RESOLUTION
-                    uv_layer_for_bake = obj.data.uv_layers.active.name if obj.data.uv_layers.active else obj.data.uv_layers[0].name
-
-                    if uses_udims:
-                        udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
-                        if udim_node and udim_node.image:
-                            tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
-                            if tiles:
-                                tile_width, tile_height = udim_node.image.size
-                                if tile_width > 0 and tile_height > 0: # Ensure valid dimensions
-                                    bake_resolution_x = tile_width * len(tiles)
-                                    bake_resolution_y = tile_height
-                                    logging.info(f"   - UDIMs detected. Setting bake resolution to {bake_resolution_x}x{bake_resolution_y} for atlas.")
-                                    uv_layer_for_bake = "remix_atlas_uv" # This is now safe
-                    else:
-                        max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
-                        if max_w > 0: bake_resolution_x = max_w
-                        if max_h > 0: bake_resolution_y = max_h
-                        if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {bake_resolution_x}x{bake_resolution_y}.")
-
-                    mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-                    task_templates = list(CORE_PBR_CHANNELS)
-                    output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-                    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-
-                    for channel_name, bake_type, is_val, is_color in OPTIONAL_CHANNELS:
-                        socket = None
-                        if channel_name == "Displacement":
-                            socket = output_node.inputs.get(channel_name) if output_node else None
-                        else:
-                            socket = bsdf.inputs.get(channel_name) if bsdf else None
-
-                        if (socket and socket.is_linked) or \
-                           (channel_name == "Alpha" and socket and not math.isclose(socket.default_value, 1.0)):
-                            task_templates.append((channel_name, bake_type, is_val, is_color))
-
-                    for channel_name, bake_type, is_val, is_color in task_templates:
-                        safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
-                        safe_socket_name = channel_name.replace(' ', '')
-                        hash_for_filename = material_hash[:8] if material_hash else f"NOHSH_{uuid.uuid4().hex[:6]}"
-                        output_filename = f"{safe_mat_name}_{hash_for_filename}_{safe_socket_name}.png"
-                        output_path = os.path.join(bake_dir, output_filename)
-
-                        if channel_name in SPECIAL_TEXTURE_MAP:
-                            bake_info['special_texture_info'][(obj.name, mat.name)].append({
-                                'path': output_path, 'type': SPECIAL_TEXTURE_MAP[channel_name]
-                            })
-
-                        tasks.append({
-                            "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
-                            "bake_type": 'EMIT' if uses_udims and bake_type == 'DIFFUSE' else bake_type,
-                            "output_path": output_path, "target_socket_name": channel_name,
-                            "is_value_bake": is_val, "is_color_data": is_color,
-                            "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
-                            "uv_layer": uv_layer_for_bake,
-                            "material_hash": material_hash,
-                            "bake_method": bake_method_for_all_tasks
-                        })
-                elif has_decal:
-                    logging.info(f"  - Queuing DECAL COMPOSITE task for simple material '{mat.name}' on '{obj.name}'.")
-                    bsdf_node, _ = _find_bsdf_and_output_nodes(mat.node_tree)
-                    if bsdf_node:
-                        original_base_color_path = self._get_texture_path_from_socket(bsdf_node.inputs['Base Color'])
-                        if not original_base_color_path:
-                            logging.warning(f"    - Could not find a valid source texture for 'Base Color' on simple material '{mat.name}'. It will be treated as black.")
-                        max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
-                        bake_resolution_x = max_w if max_w > 0 else DEFAULT_BAKE_RESOLUTION
-                        bake_resolution_y = max_h if max_h > 0 else DEFAULT_BAKE_RESOLUTION
-                        mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-                        safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
-                        hash_for_filename = material_hash[:8] if material_hash else f"NOHSH_{uuid.uuid4().hex[:6]}"
-                        output_filename = f"{safe_mat_name}_{hash_for_filename}_BaseColor.png"
-                        output_path = os.path.join(bake_dir, output_filename)
-                        tasks.append({
-                            "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
-                            "bake_type": "EMIT", "target_socket_name": "Base Color", "output_path": output_path,
-                            "resolution_x": bake_resolution_x, "resolution_y": bake_resolution_y,
-                            "uv_layer": obj.data.uv_layers.active.name, "material_hash": material_hash,
-                            "bake_method": bake_method_for_all_tasks, "is_simple_decal_composite": True,
-                            "original_base_color_path": original_base_color_path
-                        })
-                        if material_hash:
-                            if material_hash not in global_material_hash_cache: global_material_hash_cache[material_hash] = {}
-                            global_material_hash_cache[material_hash]['Base Color'] = output_path
-                            for socket_name in ["Metallic", "Roughness", "Normal"]:
-                                 path = self._get_texture_path_from_socket(bsdf_node.inputs[socket_name])
-                                 if path: global_material_hash_cache[material_hash][socket_name] = path
-
-                else: # Truly simple material
-                    logging.info(f"  - Material '{mat.name}' is simple. Checking for existing special textures to use directly.")
-                    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-                    output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-                    if not output_node: output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-                    sockets_to_scan = {}
-                    if bsdf:
-                        sockets_to_scan.update({"Emission Color": bsdf.inputs.get("Emission Color"), "Alpha": bsdf.inputs.get("Alpha")})
-                    if output_node:
-                        sockets_to_scan["Displacement"] = output_node.inputs.get("Displacement")
-
-                    for socket_name, socket in sockets_to_scan.items():
-                        if socket and socket.is_linked:
-                            texture_path = self._get_texture_path_from_socket(socket)
-                            if texture_path and os.path.exists(texture_path):
-                                server_texture_type = SPECIAL_TEXTURE_MAP.get(socket_name)
-                                if server_texture_type:
-                                    logging.info(f"    > Found direct-use special map for '{socket_name}' at: {os.path.basename(texture_path)}")
-                                    bake_info['special_texture_info'][(obj.name, mat.name)].append({
-                                        'path': texture_path, 'type': server_texture_type
-                                    })
-
-        bake_info['tasks'] = tasks
-        if bake_info['tasks']: logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
-        if bake_info['cached_materials']: logging.info(f"Will reuse cached textures for {len(bake_info['cached_materials'])} material contexts.")
-        return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
+        return all_tasks, {}, bake_info['bake_dir'], bake_info.get('special_texture_info', {})
         
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
@@ -4351,263 +4354,306 @@ class OBJECT_OT_export_and_ingest(Operator):
         except Exception as e:
             logging.error(f"Could not launch persistent bake worker: {e}", exc_info=True)
             return False
-          
-        
+                                        
     def _prepare_and_validate_textures(self, context, objects_to_export):
         """
-        [DEFINITIVE V12 - PACKED FILE AWARE]
-        Validates all textures and actively prepares them for the external baker.
-        If a texture's file path is missing but its data is packed in memory,
-        this function saves the data to a temporary file in the bake cache
-        and updates the image datablock to point to it. This ensures the
-        external worker process can always find a valid source file.
+        [DEFINITIVE V20 - ROBUST NAME-BASED MAPPING]
+        This version abandons the use of custom property UUIDs, which proved unreliable
+        during the 'bpy.data.libraries.write' operation. It now creates a translation map
+        where the key is the original 'image.name' from the main Blender session. The worker
+        will use this name to find the corresponding (potentially renamed) datablock.
         """
-        logging.info("Starting texture preparation and validation (packed file aware)...")
-    
-        has_unrecoverable_textures = False
-        processed_materials = set()
-        
-        # The bake directory is the perfect place to save temporary unpacked files.
+        logging.info("Starting texture preparation (Robust Name-Based Mapping Strategy)...")
+
         bake_dir = CUSTOM_COLLECT_PATH
         os.makedirs(bake_dir, exist_ok=True)
+        texture_translation_map = {}
+        has_unrecoverable_textures = False
 
-        def get_all_image_nodes_recursive(node_tree):
-            for node in node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    yield node.image
-                elif node.type == 'GROUP' and node.node_tree:
-                    yield from get_all_image_nodes_recursive(node.node_tree)
+        # Helper to find only images actively used in the material node graph
+        def _find_live_images(start_node):
+            live_images_in_tree = set()
+            nodes_to_visit = collections.deque([start_node])
+            visited_nodes = {start_node}
+            while nodes_to_visit:
+                current_node = nodes_to_visit.popleft()
+                if current_node.type == 'TEX_IMAGE' and current_node.image:
+                    live_images_in_tree.add(current_node.image)
+                for input_socket in current_node.inputs:
+                    if input_socket.is_linked:
+                        for link in input_socket.links:
+                            prev_node = link.from_node
+                            if prev_node not in visited_nodes:
+                                visited_nodes.add(prev_node)
+                                nodes_to_visit.append(prev_node)
+                if current_node.type == 'GROUP' and current_node.node_tree:
+                    group_tree = current_node.node_tree
+                    group_output = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+                    if group_output and group_output not in visited_nodes:
+                            visited_nodes.add(group_output)
+                            nodes_to_visit.append(group_output)
+            return live_images_in_tree
 
-        for obj in objects_to_export:
-            if obj.type != 'MESH' or not obj.data:
+        materials_to_scan = {
+            slot.material for obj in objects_to_export
+            if obj.data for slot in obj.material_slots if slot.material and slot.material.use_nodes
+        }
+
+        all_live_images = set()
+        for mat in materials_to_scan:
+            output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+            if output_node:
+                all_live_images.update(_find_live_images(output_node))
+
+        for image in all_live_images:
+            image_name_key = image.name
+            if not image_name_key or image_name_key in texture_translation_map:
                 continue
+
+            resolved_path = ""
+            is_on_disk = False
+
+            if image.library:
+                try:
+                    resolved_path = bpy.path.abspath(image.filepath, library=image.library)
+                    if os.path.exists(resolved_path): is_on_disk = True
+                except Exception: pass
+    
+            if not is_on_disk:
+                try:
+                    resolved_path = bpy.path.abspath(image.filepath)
+                    if os.path.exists(resolved_path): is_on_disk = True
+                except Exception: pass
+
+            if is_on_disk:
+                texture_translation_map[image_name_key] = resolved_path
+                continue
+
+            # Attempt aggressive recovery from memory
+            try:
+                if image.size[0] == 0 or image.size[1] == 0: raise RuntimeError("Image has zero dimensions.")
+                _ = image.pixels[0] # Force a pixel read to ensure data is accessible
+
+                safe_name = "".join(c for c in image.name if c.isalnum() or c in ('_', '.', '-')).strip()
+                temp_filename = f"recovered_{safe_name}_{uuid.uuid4().hex[:6]}.png"
+                new_safe_path = os.path.join(bake_dir, temp_filename)
+
+                temp_image = bpy.data.images.new(name=f"temp_save_{image.name}", width=image.size[0], height=image.size[1], alpha=True)
+                temp_image.pixels = image.pixels[:]
+                temp_image.filepath_raw = new_safe_path
+                temp_image.file_format = 'PNG'
+                temp_image.save()
         
-            for slot in obj.material_slots:
-                mat = slot.material
-                if not mat or not mat.use_nodes or mat in processed_materials:
-                    continue
-            
-                processed_materials.add(mat)
-                for image in get_all_image_nodes_recursive(mat.node_tree):
-                    if not image:
-                        continue
+                texture_translation_map[image_name_key] = new_safe_path
+                self._export_data['temp_files_to_clean'].add(new_safe_path)
+                bpy.data.images.remove(temp_image)
+                logging.info(f"  > Successfully recovered '{image.name}' to temp file: {new_safe_path}")
 
-                    filepath = ""
-                    try:
-                        if image.filepath_from_user():
-                            filepath = abspath(image.filepath_from_user())
-                    except Exception:
-                        filepath = ""
+            except Exception as e:
+                logging.error(f"  - UNRECOVERABLE: Image '{image.name}' has no valid path and no readable pixel data. Reason: {e}")
+                texture_translation_map[image_name_key] = "GHOST_DATA_UNRECOVERABLE"
+                has_unrecoverable_textures = True
 
-                    is_valid_on_disk = os.path.exists(filepath)
-
-                    # --- THIS IS THE NEW CORE LOGIC ---
-                    # If the file is NOT on disk, check if we have the data in memory (packed).
-                    if not is_valid_on_disk and image.has_data:
-                        logging.warning(f"  > Image '{image.name}' has no valid file path but is packed. Saving to temp file for worker.")
-                        try:
-                            # Create a safe, unique filename for the temporary image.
-                            safe_name = "".join(c for c in image.name if c.isalnum() or c in ('_', '.', '-')).strip()
-                            temp_filename = f"unpacked_{safe_name}_{uuid.uuid4().hex[:6]}.png"
-                            recovery_path = os.path.join(bake_dir, temp_filename)
-
-                            # Save a copy of the image data to the new path. Using a copy is safer.
-                            image_copy = image.copy()
-                            image_copy.filepath_raw = recovery_path
-                            image_copy.file_format = 'PNG' # PNG is a safe, lossless format for this
-                            image_copy.save()
-                            
-                            # CRITICAL: Update the ORIGINAL image datablock to point to this new file.
-                            # This change will be saved in the .blend file for the worker to read.
-                            image.filepath = recovery_path
-                            image.source = 'FILE' # Ensure its source is marked as a file
-                            image.reload() # Force Blender to update from the new source
-                            
-                            # Add the newly created temp file to our master cleanup list.
-                            self._export_data['temp_files_to_clean'].add(recovery_path)
-                            logging.info(f"    - Successfully recovered '{image.name}' to '{recovery_path}'")
-
-                        except Exception as e:
-                            logging.error(f"    - FAILED to recover packed image '{image.name}': {e}", exc_info=True)
-                            self.report({'ERROR'}, f"Could not save packed image data for '{image.name}'.")
-                            has_unrecoverable_textures = True
-
-                    # If the file is not on disk AND not in memory, it's truly lost.
-                    elif not is_valid_on_disk and not image.has_data:
-                        logging.error(
-                            f"UNRECOVERABLE: Image '{image.name}' in material '{mat.name}' has NO data in memory AND its source file is missing: '{filepath}'"
-                        )
-                        has_unrecoverable_textures = True
-        
         if has_unrecoverable_textures:
             self.report({'ERROR'}, "Unrecoverable/missing textures found. Export aborted. See System Console.")
-            return False
+            return None # Return None on failure
 
-        logging.info("Texture preparation successful. All textures have a valid source file on disk.")
-        return True
-          
+        logging.info("Texture preparation complete. Handing off to workers for baking and final cleanup.")
+        return texture_translation_map
+    
     def modal(self, context, event):
-        """
-        [DEFINITIVE V3 - Corrected Terminate After Task]
-        This is the complete and corrected modal loop. It implements the robust
-        resource manager that flags workers for termination but allows them to finish
-        their current task. The critical bug where successfully completed tasks were
-        requeued has been fixed by calling the worker handler with `requeue_task=False`
-        after a graceful shutdown.
-        """
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
 
         with self._op_lock:
-            # First-tick initialization
-            if not hasattr(self, '_initialized'):
-                self._initialized = True
-                logging.info(f"Saving blend file for {self._total_tasks} bake tasks...")
-                bpy.ops.wm.save_mainfile()
-            
-                self._master_task_queue = collections.deque(
-                    task for batch in self._task_batches for task in batch
-                )
-            
-                num_to_launch = min(len(self._worker_slots), MAX_CONCURRENT_BAKE_WORKERS)
-                for i in range(num_to_launch):
-                    if self._worker_slots[i]['status'] == 'idle':
-                        self._launch_new_worker(i)
-                return {'PASS_THROUGH'}
+            # --- START OF THE DEFINITIVE FIX ---
+            # Phase 0: Check for Completion FIRST. This is the highest priority.
+            if self._finished_tasks >= self._total_tasks and self._operator_state not in ['FINISHING', 'CLEANING_UP']:
+                logging.info("All bake tasks are complete. Moving to finalization.")
+                self._operator_state = 'FINISHING'
+                
+                if self._failed_tasks > 0:
+                    self.report({'ERROR'}, f"{self._failed_tasks} bake task(s) failed. See console.")
+                    return self._cleanup(context, {'CANCELLED'})
+                else:
+                    try:
+                        self._finalize_export(context)
+                        self.report({'INFO'}, f"Export complete. Baked {self._total_tasks} textures.")
+                        return self._cleanup(context, {'FINISHED'})
+                    except Exception as e:
+                        logging.error(f"A critical error occurred during _finalize_export: {e}", exc_info=True)
+                        self.report({'ERROR'}, "Finalization failed. See console for details.")
+                        return self._cleanup(context, {'CANCELLED'})
+            # --- END OF THE DEFINITIVE FIX ---
 
-            # --- Phase 1: Process Logs & Results ---
+            # --- Phase 1: Process Logs & Worker Results ---
             try:
                 while not self._log_queue.empty():
                     print(self._log_queue.get_nowait())
-            except Empty: pass
+            except Empty:
+                pass
 
             try:
                 while not self._results_queue.empty():
                     result_line = self._results_queue.get_nowait()
                     try:
                         result = json.loads(result_line)
-                        status = result.get("status")
                         worker_pid = result.get("pid")
-                        slot_index = -1
-                        if worker_pid:
-                            for i, s in enumerate(self._worker_slots):
-                                if s.get('process') and s['process'].pid == worker_pid:
-                                    slot_index = i; break
-                        if slot_index == -1: continue
+                        slot_index = next((i for i, s in enumerate(self._worker_slots) if s.get('process') and s['process'].pid == worker_pid), -1)
+                        if slot_index == -1:
+                            continue
 
                         slot = self._worker_slots[slot_index]
+                        status = result.get("status")
 
                         if status == "ready":
                             slot['status'] = 'ready'
-                            logging.info(f"Worker in slot {slot_index} (PID: {worker_pid}) is now READY.")
-                    
+                            slot['ready_time'] = time.monotonic()
+                            logging.info(f"Worker in slot {slot_index} (PID: {worker_pid}) is READY. (Init time: {slot['ready_time'] - slot['launch_time']:.2f}s)")
+                
                         elif status in ["success", "failure"]:
                             self._finished_tasks += 1
-                            if status == "failure": self._failed_tasks += 1
-                        
-                            # Check if this worker was flagged for termination
-                            if slot.get('flagged_for_termination'):
-                                logging.warning(f"Worker {slot_index} finished its task and is now being terminated as flagged.")
-                                # THIS IS THE FIX: Terminate the worker, but DO NOT requeue its successfully completed task.
-                                self._handle_failed_worker(slot_index, requeue_task=False)
-                            else:
-                                # If not flagged, it's ready for another task
-                                slot['status'] = 'ready'
-                            
+                            slot['tasks_completed'] += 1
+                            if status == "failure":
+                                self._failed_tasks += 1
+                    
+                            if self._operator_state == 'STABILIZING':
+                                self._initial_tasks_finished_count += 1
+                                logging.info(f"Initial task finished. ({self._initial_tasks_finished_count}/{min(self.INITIAL_WORKER_COUNT, self._total_tasks)} needed to start scaling)")
+
+                            if slot['peak_ram_on_task'] > 0:
+                                n = sum(s['tasks_completed'] for s in self._worker_slots)
+                                self._running_average_peak_ram = self._running_average_peak_ram * (n - 1) / n if n > 1 else slot['peak_ram_on_task']
+                    
+                            slot['status'] = 'ready'
+                            slot['task_start_time'] = 0 # Reset task timer
+                    
                         elif status == "error":
                             logging.error(f"Worker in slot {slot_index} reported a critical error: {result.get('details', 'N/A')}")
-                            # Terminate immediately on critical error and requeue its task by default.
-                            self._handle_failed_worker(slot_index)
-                    except (json.JSONDecodeError, KeyError): pass
-            except Empty: pass
+                            self._handle_failed_worker(slot_index, requeue_task=True)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            except Empty:
+                pass
 
-            # --- Phase 2: Resilient Task Dispatching ---
+            # --- Phase 2: Dispatch Tasks to Ready Workers ---
             for i, slot in enumerate(self._worker_slots):
-                if slot['status'] == 'ready':
-                    if self._master_task_queue:
-                        task_to_dispatch = self._master_task_queue.popleft()
-                        try:
-                            slot['process'].stdin.write(json.dumps(task_to_dispatch) + "\n")
-                            slot['process'].stdin.flush()
-                            slot['status'] = 'running'
-                            slot['current_task'] = task_to_dispatch
-                        except (IOError, BrokenPipeError):
-                            logging.error(f"Pipe to worker {i} was broken. Requeueing task.")
-                            self._master_task_queue.appendleft(task_to_dispatch)
-                            self._handle_failed_worker(i)
-                    else:
-                        slot['status'] = 'finished'
+                if slot['status'] == 'ready' and self._master_task_queue:
+                    task_to_dispatch = self._master_task_queue.popleft()
+                    # The global_task_number and total_tasks are now pre-assigned.
+                    # We no longer need to manage a dispatch counter here.
+                    task_to_dispatch['task_blend_file'] = bpy.data.filepath
+                    try:
+                        slot['process'].stdin.write(json.dumps(task_to_dispatch) + "\n")
+                        slot['process'].stdin.flush()
+                        slot['status'] = 'running'
+                        slot['current_task'] = task_to_dispatch
+                        slot['peak_ram_on_task'] = 0
+                        slot['task_start_time'] = time.monotonic() # Start the task timer
+                    except (IOError, BrokenPipeError):
+                        logging.error(f"Pipe to worker {i} was broken. Requeueing task and handling failed worker.")
+                        self._master_task_queue.appendleft(task_to_dispatch)
+                        # No dispatch counter to decrement anymore.
+                        self._handle_failed_worker(i, requeue_task=False)
 
-            # --- Phase 3: Dynamic Worker Management & Monitoring ---
-            self._resource_check_counter += 1
-            if (self._resource_check_counter * 0.1) >= self.RESOURCE_CHECK_INTERVAL_SEC:
-                self._resource_check_counter = 0
-                if PSUTIL_INSTALLED:
-                    import psutil
-                    cpu_usage = psutil.cpu_percent()
-                    ram_usage = psutil.virtual_memory().percent
+            # --- Phase 3: Main State Machine Logic ---
+            current_time = time.monotonic()
+            cpu_now, ram_now = self._get_system_resources()
+            self._update_peak_utilization(cpu_now, ram_now)
 
-                    if cpu_usage < self.CPU_LOW_THRESHOLD and ram_usage < self.RAM_LOW_THRESHOLD:
-                        for i, slot in enumerate(self._worker_slots):
-                            if slot['status'] in ['idle', 'suspended']:
-                                self._launch_new_worker(i)
-                                slot['flagged_for_termination'] = False # Clear flag on relaunch
-                                break
-                
-                    elif cpu_usage > self.CPU_HIGH_THRESHOLD or ram_usage > self.RAM_HIGH_THRESHOLD:
-                        for i, slot in reversed(list(enumerate(self._worker_slots))):
-                            if slot['status'] == 'running' and not slot.get('flagged_for_termination'):
-                                logging.warning(f"High resource usage detected. Flagging worker {i} for termination after its current task.")
-                                slot['flagged_for_termination'] = True
-                                break
-
-            # Monitor for unexpected crashes
-            for i, slot in enumerate(self._worker_slots):
-                if slot.get('process') and slot['process'].poll() is not None and slot['status'] == 'running':
-                    logging.error(f"Worker in slot {i} (PID: {slot['process'].pid}) has crashed unexpectedly!")
-                    # A real crash, so we DO want to requeue the task.
-                    self._handle_failed_worker(i, requeue_task=True)
-            
-            # --- Phase 4: UI Update & Completion Check ---
-            if self._total_tasks > 0:
-                progress = (self._finished_tasks / self._total_tasks) * 100
-                status_text = f"Baking... {self._finished_tasks}/{self._total_tasks} ({progress:.0f}%)"
-                if self._failed_tasks > 0: status_text += f" - FAILED: {self._failed_tasks}"
-                active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'launching'])
-                status_text += f" | Active: {active_workers} | Queued: {len(self._master_task_queue)}"
-                context.workspace.status_text_set(status_text)
+            if self._operator_state == 'RAMPING_UP':
+                logging.info("--- State: Ramping Up ---")
+                bpy.ops.wm.save_mainfile()
         
-            if self._finished_tasks >= self._total_tasks:
+                num_to_launch = min(len(self._worker_slots), self.INITIAL_WORKER_COUNT, self._total_tasks)
+                logging.info(f"Launching initial set of {num_to_launch} workers...")
+                for i in range(num_to_launch):
+                    self._launch_new_worker(i)
+        
+                self._initial_tasks_finished_count = 0
+                self._operator_state = 'STABILIZING'
+                logging.info(f"Entering stabilization. Waiting for {num_to_launch} initial task(s) to complete.")
+
+            elif self._operator_state == 'STABILIZING':
+                num_required = min(self.INITIAL_WORKER_COUNT, self._total_tasks)
+                if self._initial_tasks_finished_count >= num_required:
+                    logging.info("--- State: Stabilization Finished (event-driven). Switching to Running. ---")
+                    self._operator_state = 'RUNNING'
+                    self._next_resource_check_time = current_time
+
+            elif self._operator_state == 'RUNNING':
+                if current_time >= self._next_resource_check_time:
+                    self._next_resource_check_time = current_time + self.RESOURCE_CHECK_INTERVAL_SEC
+            
+                    is_cpu_high = cpu_now > self.CPU_HIGH_THRESHOLD
+                    is_ram_high = ram_now > self.RAM_HIGH_THRESHOLD
+
+                    if is_cpu_high or is_ram_high:
+                        self._high_usage_counter += 1
+                        if self._high_usage_counter >= self.HIGH_USAGE_SUSTAINED_CHECKS:
+                            logging.warning(f"Sustained high resource usage detected (CPU:{cpu_now}%, RAM:{ram_now}%). Initiating scale-down.")
+                            
+                            running_workers = [(i, s) for i, s in enumerate(self._worker_slots) if s['status'] in ['running', 'ready']]
+                            
+                            if len(running_workers) > self.INITIAL_WORKER_COUNT:
+                                if is_cpu_high and not is_ram_high:
+                                    running_workers.sort(key=lambda item: item[1].get('task_start_time', 0))
+                                    slot_to_terminate_index, _ = running_workers[0]
+                                    logging.warning(f"  > High CPU is the primary issue. Terminating longest-running worker (Slot {slot_to_terminate_index}) as a precaution against stalls.")
+                                    self._handle_failed_worker(slot_to_terminate_index, requeue_task=True)
+                                elif is_ram_high:
+                                    running_workers.sort(key=lambda item: item[1]['tasks_completed'])
+                                    slot_to_terminate_index, _ = running_workers[0]
+                                    logging.warning(f"  > High RAM is the primary issue. Terminating least productive worker (Slot {slot_to_terminate_index}).")
+                                    self._handle_failed_worker(slot_to_terminate_index, requeue_task=True)
+                            
+                            self._high_usage_counter = 0
+                    else:
+                        self._high_usage_counter = 0
+
+            # --- Phase 4: Crash & Stall Detection ---
+            TASK_TIMEOUT_SECONDS = 300 # 5 minutes
+            for i, slot in enumerate(self._worker_slots):
+                if slot.get('process') and slot['process'].poll() is not None and slot['status'] in ['running', 'launching']:
+                    logging.error(f"Worker in slot {i} (PID: {slot.get('process').pid}) has crashed unexpectedly!")
+                    self._handle_failed_worker(i, requeue_task=True)
+                
+                task_start_time = slot.get('task_start_time', 0)
+                if slot['status'] == 'running' and task_start_time > 0 and (current_time - task_start_time) > TASK_TIMEOUT_SECONDS:
+                    logging.error(f"Worker in slot {i} (PID: {slot.get('process').pid}) has been running the same task for over {TASK_TIMEOUT_SECONDS} seconds. Assuming stall and terminating.")
+                    self._handle_failed_worker(i, requeue_task=True)
+    
+            # --- Phase 5: UI Update ---
+            if self._operator_state != 'FINISHING':
+                progress = (self._finished_tasks / self._total_tasks) * 100 if self._total_tasks > 0 else 100
+                active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'launching', 'ready'])
+                status_text = (f"Baking... {self._finished_tasks}/{self._total_tasks} ({progress:.0f}%) | "
+                               f"Active: {active_workers} | Queued: {len(self._master_task_queue)} | State: {self._operator_state}")
                 if self._failed_tasks > 0:
-                    self.report({'ERROR'}, f"{self._failed_tasks} bake task(s) failed. See console.")
-                    return self._cleanup(context, {'CANCELLED'})
-                else:
-                    logging.info("All bake tasks completed successfully.")
-                    self._finalize_export(context)
-                    self.report({'INFO'}, f"Export complete. Baked {self._total_tasks} textures.")
-                    return self._cleanup(context, {'FINISHED'})
+                    status_text += f" | FAILED: {self._failed_tasks}"
+                context.workspace.status_text_set(status_text)
 
             return {'PASS_THROUGH'}
-        
+            
     def _handle_failed_worker(self, slot_index, requeue_task=True):
         """
-        Helper function to terminate a worker. Can optionally requeue the task
-        it was working on.
+        Manages a worker that has stopped, either by crashing or by being
+        gracefully terminated. Can requeue the task it was working on.
         """
         if slot_index >= len(self._worker_slots): return
     
         slot = self._worker_slots[slot_index]
     
-        # Requeue the task it was working on, ONLY if requested.
+        # If requested, put the task it was working on back at the front of the queue.
         if requeue_task and 'current_task' in slot and slot['current_task']:
             task = slot['current_task']
-            self._master_task_queue.appendleft(task) # Put it back at the front of the line
-            logging.warning(f"Requeueing task '{task.get('bake_type')}' for material '{task.get('material_name')}' from failed worker {slot_index}.")
+            self._master_task_queue.appendleft(task)
+            logging.warning(f"Requeueing task for material '{task.get('material_name')}' from failed worker {slot_index}.")
     
         slot['current_task'] = None
-        self._terminate_worker(slot_index) # This sets status to 'suspended'
-       
-          
+        slot['flagged_for_termination'] = False # Reset flag
+        self._terminate_worker(slot_index) # This will terminate the process and set status to 'suspended'
+        
     def _is_geonodes_generator(self, obj):
         """
         [MODIFIED FROM ADDON 2]
@@ -4685,6 +4731,67 @@ class OBJECT_OT_export_and_ingest(Operator):
             self.report({'WARNING'}, "Failed to combine color and opacity maps.")
             return False
 
+    def _get_system_resources(self):
+        """Helper to get current CPU and RAM usage, returns (0,0) if psutil fails."""
+        if PSUTIL_INSTALLED:
+            import psutil
+            return psutil.cpu_percent(), psutil.virtual_memory().percent
+        return 0, 0
+
+    def _update_peak_utilization(self, cpu, ram):
+        """Updates the peak utilization for all currently running workers."""
+        for slot in self._worker_slots:
+            if slot['status'] == 'running':
+                slot['peak_cpu_since_ready'] = max(slot['peak_cpu_since_ready'], cpu)
+                # Update the new per-task peak RAM tracker
+                slot['peak_ram_on_task'] = max(slot['peak_ram_on_task'], ram)
+      
+    def _preflight_validation(self, objects_to_process):
+        """
+        [NEW - Pre-flight Check]
+        Validates that every material being processed is only assigned to objects
+        that are valid for baking (e.g., have UV maps). This prevents a single
+        "bad apple" object from corrupting a shared material's state and causing
+        a misleading failure on a different, valid object.
+        """
+        logging.info("--- Starting Pre-flight Material & Object Validation ---")
+        
+        materials_to_check = {
+            slot.material
+            for obj in objects_to_process
+            if obj.data
+            for slot in obj.material_slots if slot.material
+        }
+
+        if not materials_to_check:
+            logging.info("No materials to validate. Pre-flight check passed.")
+            return True, ""
+
+        # Build a map of every user of each material in the entire blend file
+        all_materials_map = collections.defaultdict(list)
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH':
+                for slot in obj.material_slots:
+                    if slot.material:
+                        all_materials_map[slot.material].append(obj)
+
+        for mat in materials_to_check:
+            if mat in all_materials_map:
+                for user_obj in all_materials_map[mat]:
+                    # The critical check: Is this a mesh and does it lack a UV map?
+                    if user_obj.type == 'MESH' and not user_obj.data.uv_layers:
+                        error_message = (
+                            f"Export Canceled: Pre-flight check failed.\n\n"
+                            f"Material '{mat.name}' is used by object '{user_obj.name}', "
+                            f"which is a MESH but has NO UV MAPS.\n\n"
+                            f"Baking requires a UV map. Please add a UV map to '{user_obj.name}' or remove the material from it."
+                        )
+                        logging.error(error_message)
+                        return False, error_message
+        
+        logging.info("--- Pre-flight Validation Successful ---")
+        return True, ""
+
     def execute(self, context):
         if not PSUTIL_INSTALLED:
             self.report({'ERROR'}, "Dependency 'psutil' is not installed. Please install it from the addon panel.")
@@ -4694,66 +4801,51 @@ class OBJECT_OT_export_and_ingest(Operator):
         if export_lock:
             self.report({'INFO'}, "Another export is already in progress.")
             return {'CANCELLED'}
-        
-        # --- THIS IS THE FIX ---
-        # Get addon preferences early for this initial validation step.
+    
         addon_prefs = context.preferences.addons[__name__].preferences
-
-        # Check if the ingest directory is still the default value before doing anything else.
         if addon_prefs.remix_ingest_directory == "/ProjectFolder/Assets":
             message = "Please change the Ingest Directory from the default value before exporting."
             self.report({'ERROR'}, message)
             logging.error(message)
-            return {'CANCELLED'} # Exit before acquiring the lock or initializing state.
-        # --- END OF FIX ---
+            return {'CANCELLED'}
 
         export_lock = True
 
-        # Initialize operator state
-        self._timer = None
         self._op_lock = Lock()
+        self._operator_state = 'INITIALIZING'
         self._export_data = {
-            "objects_for_export": [], 
-            "bake_info": {}, 
-            "temp_files_to_clean": set(),
-            "original_material_assignments": {}, 
-            "temp_materials_for_cleanup": [],
-            "normals_were_flipped": False,
-            # --- NEW FLAG ---
-            "was_mirrored_on_export": False, 
+            "objects_for_export": [], "bake_info": {}, "temp_files_to_clean": set(),
+            "original_material_assignments": {}, "temp_materials_for_cleanup": [],
+            "normals_were_flipped": False, "was_mirrored_on_export": False, 
             "temp_realized_object_names": []
         }
-        self._task_batches = []
-        self._worker_slots = []
-        self._comm_threads = []
         self._results_queue = Queue()
         self._log_queue = Queue()
-        self._total_tasks = 0
+        self._comm_threads = []
         self._finished_tasks = 0
         self._failed_tasks = 0
-        self._resource_check_counter = 0
+        self._high_usage_counter = 0
+        self._running_average_peak_ram = 5.0
 
         try:
-            # Note: addon_prefs is already defined from the check above.
             if not is_blend_file_saved():
                 raise RuntimeError("Please save the .blend file before exporting.")
 
-            # --- LOGIC REORDERED ---
-            # Step 1: Determine the final, definitive list of mesh objects to be exported.
-            # This includes handling the "Selection Only" option and realizing GeoNodes generators.
             initial_selection = {
                 o for o in (context.selected_objects if addon_prefs.remix_use_selection_only else context.scene.objects)
                 if o.type in {'MESH', 'CURVE'} and o.visible_get() and not o.hide_render
             }
+            if not initial_selection: raise RuntimeError("No suitable visible objects found to export.")
 
-            if not initial_selection:
-                raise RuntimeError("No suitable visible objects found to export.")
+            is_valid, error_msg = self._preflight_validation(initial_selection)
+            if not is_valid:
+                bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_msg, success=False)
+                return self._cleanup(context, {'CANCELLED'})
 
             final_export_list = set(initial_selection)
             generators_found = {obj for obj in initial_selection if self._is_geonodes_generator(obj)}
-            
-            source_objects_to_exclude = set()
             if generators_found:
+                source_objects_to_exclude = set()
                 logging.info(f"Found {len(generators_found)} Geometry Node generator(s) that require realization.")
                 for gen_obj in generators_found:
                     ivy_modifier = next((m for m in gen_obj.modifiers if m.type == 'NODES' and 'Baga_Ivy_Generator' in m.name), None)
@@ -4764,67 +4856,80 @@ class OBJECT_OT_export_and_ingest(Operator):
                             source_objects_to_exclude.update(leaf_coll_input.objects)
                         if flower_coll_input and isinstance(flower_coll_input, bpy.types.Collection):
                             source_objects_to_exclude.update(flower_coll_input.objects)
-
                     realized_objects = self._realize_geonodes_object_non_destructively(context, gen_obj)
                     final_export_list.update(realized_objects)
+                final_export_list -= generators_found
+                final_export_list -= source_objects_to_exclude
 
-            final_export_list -= generators_found
-            final_export_list -= source_objects_to_exclude
-            
             self._export_data["objects_for_export"] = [o for o in final_export_list if o and o.type == 'MESH']
-
-            if not self._export_data["objects_for_export"]:
-                raise RuntimeError("Processing resulted in no valid mesh objects to export.")
-
-            # Step 2: With the final object list now known, call the TARGETED EXR conversion.
-            logging.info("Checking for EXR textures to convert on the final export objects...")
-            success, _ = convert_exr_textures_to_png(context, self._export_data["objects_for_export"])
-            if not success:
-                raise RuntimeError("Failed to convert EXR textures to PNG.")
-            # --- END OF REORDERED LOGIC ---
-
+            if not self._export_data["objects_for_export"]: raise RuntimeError("Processing resulted in no valid mesh objects to export.")
+        
             logging.info(f"Final object list for processing: {[o.name for o in self._export_data['objects_for_export']]}")
-            
-            if not self._prepare_and_validate_textures(context, self._export_data["objects_for_export"]):
-                raise RuntimeError("Texture preparation and validation failed.")
+        
+            texture_map = self._prepare_and_validate_textures(context, self._export_data["objects_for_export"])
+            if texture_map is None:
+                return self._cleanup(context, {'CANCELLED'})
+        
+            success, _ = convert_exr_textures_to_png(context, self._export_data["objects_for_export"])
+            if not success: raise RuntimeError("Failed to convert EXR textures to PNG.")
 
-            all_tasks, _, _, _ = self.collect_bake_tasks(
-                context, self._export_data["objects_for_export"], self._export_data
-            )
+            all_tasks, _, _, _ = self.collect_bake_tasks(context, self._export_data["objects_for_export"], self._export_data)
+
             self._total_tasks = len(all_tasks)
 
-            any_udims_found = any(self._material_uses_udims(s.material) for obj in self._export_data["objects_for_export"] for s in obj.material_slots if s.material)
-            
-            if not all_tasks and not any_udims_found:
-                logging.info("No complex materials or UDIMs found. Finalizing export directly with simple textures.")
+            # --- THIS IS THE FIX ---
+            # Pre-assign task numbers and total tasks to each task dictionary.
+            # This makes the task number persistent, even if requeued.
+            for i, task in enumerate(all_tasks):
+                task['global_task_number'] = i + 1
+                task['total_tasks'] = self._total_tasks
+            # --- END OF FIX ---
+
+            if not all_tasks:
+                logging.info("No bake tasks required. Finalizing export directly.")
                 self._finalize_export(context)
                 return self._cleanup(context, {'FINISHED'})
-
-            if all_tasks:
-                logging.info(f"Found {self._total_tasks} bake tasks. Starting worker pool...")
-                for i, task in enumerate(all_tasks):
-                    task['global_task_number'] = i + 1
-
-                num_batches = min(self._total_tasks, MAX_CONCURRENT_BAKE_WORKERS)
-                self._task_batches = [[] for _ in range(num_batches)]
-                for i, task in enumerate(all_tasks):
-                    self._task_batches[i % num_batches].append(task)
-
-                self._worker_slots = [{'process': None, 'status': 'idle', 'batch_index': i, 'flagged_for_termination': False} for i in range(num_batches)]
-
-                self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
-                context.window_manager.modal_handler_add(self)
-                return {'RUNNING_MODAL'}
-            
-            else:
-                logging.info("No bake tasks, but UDIMs found. Proceeding directly to finalization for stitching.")
-                self._finalize_export(context)
-                return self._cleanup(context, {'FINISHED'})
+        
+            logging.info(f"Found {self._total_tasks} bake tasks. Initializing dynamic worker pool.")
+            self._master_task_queue = collections.deque(all_tasks)
+        
+            num_potential_slots = min(self._total_tasks, self.MAX_POTENTIAL_WORKERS)
+            self._worker_slots = [{
+                'status': 'idle', 'process': None, 'current_task': None, 
+                'launch_time': 0, 'ready_time': 0,
+                'peak_cpu_since_ready': 0, 
+                'peak_ram_on_task': 0,
+                'tasks_completed': 0
+            } for _ in range(num_potential_slots)]
+        
+            self._operator_state = 'RAMPING_UP'
+            self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
 
         except Exception as e:
             logging.error(f"Export failed during setup: {e}", exc_info=True)
             self.report({'ERROR'}, f"Export setup failed: {e}")
             return self._cleanup(context, {'CANCELLED'})
+            
+    def _handle_failed_worker(self, slot_index, requeue_task=True):
+        """
+        Manages a worker that has stopped, either by crashing or by being
+        gracefully terminated. Can requeue the task it was working on.
+        """
+        if slot_index >= len(self._worker_slots): return
+    
+        slot = self._worker_slots[slot_index]
+    
+        # If requested, put the task it was working on back at the front of the queue.
+        if requeue_task and 'current_task' in slot and slot['current_task']:
+            task = slot['current_task']
+            self._master_task_queue.appendleft(task)
+            logging.warning(f"Requeueing task for material '{task.get('material_name')}' from failed worker {slot_index}.")
+    
+        slot['current_task'] = None
+        slot['flagged_for_termination'] = False # Reset flag
+        self._terminate_worker(slot_index) # This will terminate the process and set status to 'suspended'
 
     def _combine_color_and_alpha(self, color_map_path, alpha_mask_path):
         """
@@ -5276,35 +5381,20 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _prepare_materials_for_export(self, context, objects_to_process):
         """
-        [DEFINITIVE V3 - EFFICIENT NAME MAPPING]
-        Centralizes the creation and assignment of temporary materials for export. This version
-        now creates and stores a direct mapping from original material names to their final
-        exported names in self._export_data['material_name_map'] for efficient lookup later.
+        [DEFINITIVE V19 - CORRECT NAME MAPPING FIX]
+        This version corrects the critical bug where the material name map, used by the
+        special texture assignment function, was not being populated with the final, prefixed
+        material name (e.g., 'EXPORT_matname'). It now stores the correct final name, ensuring
+        the subsequent lookup on the server will succeed.
         """
-        logging.info("Preparing temporary materials for export...")
-        addon_prefs = context.preferences.addons[__name__].preferences
+        logging.info("Preparing unique, baked materials for export (with correct name mapping)...")
 
-        # --- THIS IS THE FIX (PART 1) ---
-        # Initialize the mapping dictionary in the main operator state.
         self._export_data["material_name_map"] = {}
-        # --- END OF FIX (PART 1) ---
-
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
 
-        bake_info = self._export_data.get('bake_info', {})
-        bake_dir = bake_info.get('bake_dir')
-        if not bake_dir:
-            bake_dir = os.path.join(tempfile.gettempdir(), "remix_ingestor_temp_finalize")
-            os.makedirs(bake_dir, exist_ok=True)
-            self._export_data['temp_files_to_clean'].add(bake_dir)
-
-        tasks_by_hash = defaultdict(dict)
-        for task in bake_info.get('tasks', []):
-            if task.get('material_hash'):
-                tasks_by_hash[task['material_hash']][task.get('target_socket_name')] = task.get('output_path')
-        cached_textures_by_hash = bake_info.get('cached_materials', {})
+        bake_cache = global_material_hash_cache
 
         for obj in objects_to_process:
             if not obj: continue
@@ -5312,58 +5402,33 @@ class OBJECT_OT_export_and_ingest(Operator):
                 original_mat = slot.material
                 if not original_mat: continue
 
-                context_hash = get_material_hash(original_mat, obj, slot_index, bake_method=addon_prefs.bake_method)
-                texture_paths_to_use = tasks_by_hash.get(context_hash) or cached_textures_by_hash.get(context_hash)
+                sanitized_mat_name = re.sub(r'[\s.-]', '_', original_mat.name)
+                final_mat_for_export = None
 
-                if texture_paths_to_use:
-                    final_mat_name = f"{obj.name.replace('.', '_')}_{original_mat.name.replace('.', '_')}_BAKED"
-                    baked_mat = self._build_material_from_textures(final_mat_name, texture_paths_to_use)
-                    obj.material_slots[slot_index].material = baked_mat
-                    # --- THIS IS THE FIX (PART 2) ---
-                    # Store the direct relationship: original name -> final baked name.
-                    self._export_data["material_name_map"][original_mat.name] = baked_mat.name
-                    # --- END OF FIX (PART 2) ---
-                    continue
+                mat_hash = get_material_hash(original_mat, obj, slot_index, ignore_mesh_context=False)
 
-                # If not baked/cached, it's a simple material.
-                # --- THIS IS THE FIX (PART 3) ---
-                # For simple materials, the name doesn't change. Record this identity mapping.
-                self._export_data["material_name_map"][original_mat.name] = original_mat.name
-                # --- END OF FIX (PART 3) ---
+                if mat_hash in bake_cache:
+                    unique_baked_mat_name = f"BAKED_{sanitized_mat_name}"
+                    logging.info(f"  - CACHE HIT: Found baked textures for '{original_mat.name}' (Hash: {mat_hash[:8]}...). Building new material: '{unique_baked_mat_name}'")
+                    final_mat_for_export = self._build_material_from_textures(unique_baked_mat_name, bake_cache[mat_hash])
+                    # --- THIS IS THE FIX ---
+                    # Store the FULL, final name including the "BAKED_" prefix.
+                    self._export_data["material_name_map"][original_mat.name] = unique_baked_mat_name
+                    # --- END OF FIX ---
+                else:
+                    logging.info(f"  - CACHE MISS: Material '{original_mat.name}' is simple and was not baked. Copying for export.")
+                    unique_copy_name = f"EXPORT_{sanitized_mat_name}"
+                    final_mat_for_export = original_mat.copy()
+                    final_mat_for_export.name = unique_copy_name
+                    self._export_data["temp_materials_for_cleanup"].append(final_mat_for_export)
+                    # --- THIS IS THE FIX ---
+                    # Store the FULL, final name including the "EXPORT_" prefix.
+                    self._export_data["material_name_map"][original_mat.name] = unique_copy_name
+                    # --- END OF FIX ---
 
-                if not original_mat.use_nodes: continue
-                bsdf = next((n for n in original_mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-                if not bsdf: continue
-
-                base_color_socket = bsdf.inputs.get("Base Color")
-                alpha_socket = bsdf.inputs.get("Alpha")
-            
-                if base_color_socket and alpha_socket and base_color_socket.is_linked and alpha_socket.is_linked:
-                    color_map_path = self._get_texture_path_from_socket(base_color_socket)
-                    alpha_map_path = self._get_texture_path_from_socket(alpha_socket)
-
-                    if color_map_path and alpha_map_path:
-                        base_name, ext = os.path.splitext(os.path.basename(color_map_path))
-                        combined_filename = f"{base_name}_with_alpha_{uuid.uuid4().hex[:6]}{ext}"
-                        combined_filepath = os.path.join(bake_dir, combined_filename)
-
-                        if self._combine_albedo_and_opacity(color_map_path, alpha_map_path, combined_filepath):
-                            self._export_data['temp_files_to_clean'].add(combined_filepath)
-                            texture_paths_for_composite_mat = {}
-                            texture_paths_for_composite_mat["Base Color"] = combined_filepath
-                        
-                            for socket in bsdf.inputs:
-                                if socket.is_linked and socket.name not in ["Base Color", "Alpha"]:
-                                    path = self._get_texture_path_from_socket(socket)
-                                    if path:
-                                        texture_paths_for_composite_mat[socket.name] = path
-                        
-                            final_mat_name = f"{original_mat.name}_COMPOSITED"
-                            composited_mat = self._build_material_from_textures(final_mat_name, texture_paths_for_composite_mat)
-                            obj.material_slots[slot_index].material = composited_mat
-                            # Also map the composited material name
-                            self._export_data["material_name_map"][original_mat.name] = composited_mat.name
-                            
+                if final_mat_for_export:
+                    obj.material_slots[slot_index].material = final_mat_for_export
+                
     def _build_material_from_textures(self, name, texture_paths):
         """
         [NEW HELPER] Creates and returns a new Blender material with a simple
@@ -6092,7 +6157,7 @@ class OBJECT_OT_info_operator(Operator):
     bl_idname = "object.info_operator"
     bl_label = "Hover for Information"
     bl_description = (
-        "Warning. If mesh names are the same, exporting will automatically replace the other mesh..."
+        "Please dont overwhelm the addon by exporting 50 procedral materials at once! Your pc will thank me."
     )
 
     def execute(self, context):
@@ -6134,6 +6199,7 @@ class OBJECT_OT_reset_options(Operator):
         addon_prefs.mirror_import = False
         addon_prefs.flip_normals_import = False
         addon_prefs.remix_replace_stock_mesh = False
+        addon_prefs.remix_bake_material_only = True
         
         addon_prefs.obj_export_forward_axis = 'NEGATIVE_Z'
         addon_prefs.obj_export_up_axis = 'Y'
@@ -6242,6 +6308,34 @@ class EXPORT_OT_SubstancePainterExporter(Operator):
         except Exception as e:
             self.report({'ERROR'}, f"Could not open Substance Painter: {str(e)}")
 
+class OBJECT_OT_flip_normals_on_selected(Operator):
+    """Flips the normals for all selected mesh objects."""
+    bl_idname = "object.flip_normals_on_selected"
+    bl_label = "Flip Normals on Selected"
+    bl_description = "Flips the face normals of all currently selected mesh objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # This operator is only active if there is at least one selected mesh object
+        return any(obj.type == 'MESH' for obj in context.selected_objects)
+
+    def execute(self, context):
+        # Gather only the mesh objects from the current selection
+        meshes_to_flip = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        
+        if not meshes_to_flip:
+            self.report({'WARNING'}, "No mesh objects were selected.")
+            return {'CANCELLED'}
+
+        logging.info(f"User triggered 'Flip Normals on Selected' for {len(meshes_to_flip)} object(s).")
+        
+        # Call the existing, robust batch processing function
+        batch_flip_normals_optimized(meshes_to_flip, context)
+        
+        self.report({'INFO'}, f"Flipped normals on {len(meshes_to_flip)} selected object(s).")
+        return {'FINISHED'}
+
 class VIEW3D_PT_remix_ingestor(Panel):
     bl_label = "Remix Asset Ingestion"
     bl_idname = "VIEW3D_PT_remix_ingestor"
@@ -6308,6 +6402,7 @@ class VIEW3D_PT_remix_ingestor(Panel):
         export_box.prop(addon_prefs, "remix_replace_stock_mesh", text="Replace Stock Mesh")
         export_box.prop(addon_prefs, "mirror_on_export", text="Mirror on Export")
         export_box.prop(addon_prefs, "flip_faces_export", text="Flip Normals During Export")
+        export_box.prop(addon_prefs, "remix_bake_material_only")
         export_box.prop(addon_prefs, "apply_modifiers")
     
         row = export_box.row(align=True)
@@ -6333,6 +6428,7 @@ class VIEW3D_PT_remix_ingestor(Panel):
         utilities_box = layout.box()
         utilities_box.label(text="Utilities", icon='TOOL_SETTINGS')
         utilities_box.operator("system.check_gpu_settings", text="Check GPU Settings", icon='SYSTEM')
+        utilities_box.operator("object.flip_normals_on_selected", text="Flip Normals on Selected", icon='NORMALS_FACE')
 
         reset_box = layout.box()
         reset_box.operator("object.reset_remix_ingestor_options", text="Reset All Options", icon='FILE_REFRESH')
@@ -6359,6 +6455,7 @@ classes = [
     # --- The new generalized installer and restart operators ---
     REMIX_OT_install_dependency,
     REMIX_OT_restart_blender,
+    OBJECT_OT_flip_normals_on_selected,
 ]
            
 def register():
