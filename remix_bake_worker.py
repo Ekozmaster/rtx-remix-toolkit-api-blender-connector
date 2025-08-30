@@ -22,10 +22,11 @@ class Counter:
         self.i = 0
         self.total = total
     
-    # ---> START OF FIX 2.A: ADD A METHOD TO SET THE CURRENT NUMBER <---
     def set_current(self, n):
         self.i = n
-    # ---> END OF FIX 2.A <---
+    
+    def set_total(self, n):
+        self.total = n
     
     def get_progress_str(self):
         return f"Task {self.i}/{self.total}"
@@ -113,41 +114,101 @@ def _find_source_socket_recursively(current_node, target_socket_name, visited_no
     # If we loop through all shader inputs and find nothing, this path is a dead end.
     return None
     
+def _apply_texture_translation_map(task):
+    """
+    Reads the texture translation map from a task and forces the repathing
+    of any corresponding image datablocks in the worker's current context.
+    This heals "ghost" datablocks before the bake begins.
+    """
+    from bpy.path import abspath
+
+    translation_map = task.get('texture_translation_map', {})
+    if not translation_map:
+        return
+
+    log(" > Applying texture translation map for this task...")
+    repath_success_count = 0
+    for image_name, correct_path in translation_map.items():
+        image = bpy.data.images.get(image_name)
+        if image:
+            current_path = ""
+            try:
+                current_path = abspath(image.filepath)
+            except Exception:
+                pass 
+
+            if current_path.replace('\\', '/') != correct_path.replace('\\', '/') or not image.has_data:
+                log(f"   - Repathing '{image.name}' to '{os.path.basename(correct_path)}'")
+                if correct_path == "GHOST_DATA_UNRECOVERABLE":
+                    log(f"   - CRITICAL ERROR: Main addon marked '{image.name}' as unrecoverable. Cannot repath.")
+                    continue
+
+                if os.path.exists(correct_path):
+                    try:
+                        image.filepath = correct_path
+                        image.source = 'FILE'
+                        image.reload()
+                        if not image.has_data:
+                             log(f"   - CRITICAL WARNING: Reloaded '{image.name}' but it still has no pixel data!")
+                        repath_success_count += 1
+                    except Exception as e:
+                        log(f"   - CRITICAL ERROR: Failed to reload '{image.name}' from path '{correct_path}': {e}")
+                else:
+                    log(f"   - CRITICAL ERROR: Remap path not found for '{image.name}': '{correct_path}'")
+    
+    log(f" > Texture repathing complete. {repath_success_count} images reloaded.")
+
 def perform_bake_task(task):
-    # ---> THIS IS THE FIX: Read the global number and set the counter <---
+    """
+    [SURGICALLY IMPLEMENTED] This function now handles the entire lifecycle of a
+    single, self-contained bake task, including loading its own blend file,
+    setting up the render engine correctly, and safely cleaning up.
+    """
+    # Set the global task number and total for logging from the persistent task data.
     global_num = task.get("global_task_number", task_counter.i + 1)
+    total_tasks = task.get("total_tasks", task_counter.total)
     task_counter.set_current(global_num)
-    # ---> END OF FIX <---
+    task_counter.set_total(total_tasks)
+
+    blend_file_for_task = task.get('task_blend_file')
+    if not blend_file_for_task or not os.path.exists(blend_file_for_task):
+        log(f"!!! BAKE TASK FAILED. Task blend file not found: {blend_file_for_task}")
+        return False
+
+    # --- Load the self-contained blend file for this specific task ---
+    try:
+        bpy.ops.wm.open_mainfile(filepath=blend_file_for_task)
+        log(f"Loaded task-specific file: {os.path.basename(blend_file_for_task)}")
+        
+        # The render engine MUST be set up AFTER loading the file, as loading
+        # the file overwrites the current scene's settings and render context.
+        setup_render_engine()
+
+    except Exception as e:
+        log(f"!!! BAKE TASK FAILED. Could not load .blend file {blend_file_for_task}: {e}")
+        return False
 
     bake_target_obj_name = task['object_name']
     bake_target_obj = bpy.data.objects.get(bake_target_obj_name)
 
     if not bake_target_obj:
-        log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}'. Object not found.")
+        log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}'. Object not found after loading .blend file.")
         return False
 
-    original_active_uv_map_name = None
-    if bake_target_obj.data and bake_target_obj.data.uv_layers.active:
-        original_active_uv_map_name = bake_target_obj.data.uv_layers.active.name
-
     try:
-        # --- Start of new UV map handling ---
+        # Set the correct UV map for the bake operation.
         if bake_target_obj.data and bake_target_obj.data.uv_layers:
             uv_map_for_bake = task.get('uv_layer')
             if uv_map_for_bake and uv_map_for_bake in bake_target_obj.data.uv_layers:
-                # Set the correct UV map for the bake operation.
                 log(f" > Setting active UV map for '{bake_target_obj_name}' to '{uv_map_for_bake}' for baking.")
                 bake_target_obj.data.uv_layers.active = bake_target_obj.data.uv_layers[uv_map_for_bake]
-            elif uv_map_for_bake:
-                # If a map was specified but not found, warn the user.
-                log(f" > WARNING: Specified bake UV map '{uv_map_for_bake}' not found on '{bake_target_obj_name}'. Using the current active map.")
         else:
             log(f" > WARNING: No UV maps on '{bake_target_obj_name}'.")
-        # --- End of new UV map handling ---
 
+        # Find the material by its unique ID
         original_mat = next((m for m in bpy.data.materials if m.get("uuid") == task['material_uuid']), None)
         if not original_mat:
-            raise RuntimeError(f"Material UUID '{task['material_uuid']}' not found.")
+            raise RuntimeError(f"Material UUID '{task['material_uuid']}' not found in loaded data.")
 
         log(f"Starting Bake: Obj='{bake_target_obj.name}', Mat='{original_mat.name}', Type='{task['bake_type']}'")
         perform_single_bake_operation(bake_target_obj, original_mat, task)
@@ -158,18 +219,12 @@ def perform_bake_task(task):
         log(traceback.format_exc())
         return False
     finally:
-        # Restore the originally active UV map to avoid side effects on the .blend file.
-        if original_active_uv_map_name and bake_target_obj and bake_target_obj.data:
-             if original_active_uv_map_name in bake_target_obj.data.uv_layers:
-                current_active_map = bake_target_obj.data.uv_layers.active
-                # Only restore if the active map was changed.
-                if not current_active_map or current_active_map.name != original_active_uv_map_name:
-                    try:
-                        log(f" > Restoring original active UV map for '{bake_target_obj_name}' to '{original_active_uv_map_name}'.")
-                        bake_target_obj.data.uv_layers.active = bake_target_obj.data.uv_layers[original_active_uv_map_name]
-                    except Exception as e:
-                        log(f" > WARNING: Could not restore original active UV map on '{bake_target_obj_name}': {e}")
-                        
+        # --- CRITICAL CLEANUP STEP FOR PERSISTENT WORKER ---
+        # This wipes the slate clean by resetting to a blank factory state,
+        # preventing data from this task from affecting the next one.
+        log(" > Cleaning up worker scene after task...")
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        
 def _recover_packed_image_for_bake(image_datablock):
     """
     [DEFINITIVE V2 - ROBUST RECOVERY]
@@ -790,28 +845,27 @@ def _composite_decal_bakes(img, decal_albedo_img, decal_alpha_img):
 
 def _perform_simple_bake(setup_data, task, active_output_node):
     """
-    [CORRECTED - V2] Performs a simple, single-pass bake and now correctly
-    calls the ITERATIVE version of _get_socket_to_bake, preventing stack overflows
-    on complex but "simple" materials.
+    [CORRECTED - V4] Performs a simple, single-pass bake. This version adds a
+    type check to correctly handle the assignment of default values from vector/color
+    sockets (like Displacement) to float sockets (like Emission Strength), preventing
+    the bpy_prop_array TypeError.
     """
     nt = setup_data['nt']
     img = setup_data['img']
     obj = bpy.data.objects.get(task['object_name'])
     bake_type = task['bake_type']
 
-    if bake_type == 'EMIT':
+    bpy.context.scene.render.engine = 'CYCLES'
+
+    if bake_type == 'EMIT' or bake_type == 'DISPLACEMENT':
         log(f" > Performing EMIT bake for socket '{task['target_socket_name']}'...")
         
-        # --- THIS IS THE CRITICAL FIX ---
-        # This now calls the robust, iterative version of the function.
         socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
-        # --- END OF CRITICAL FIX ---
 
         if not socket_to_bake:
             log(f" > SIMPLE BAKE WARNING: Could not find socket '{task['target_socket_name']}'. Skipping.")
             return
 
-        # Store the sockets themselves, NOT the link object, to avoid ReferenceErrors.
         original_from_socket = None
         original_to_socket = None
         if active_output_node and active_output_node.inputs['Surface'].is_linked:
@@ -822,13 +876,27 @@ def _perform_simple_bake(setup_data, task, active_output_node):
         emission_node = nt.nodes.new('ShaderNodeEmission')
         try:
             if socket_to_bake.is_linked:
-                # Determine if the bake is for a value (grayscale) or color (RGB)
                 input_socket_name = 'Strength' if task.get('is_value_bake') else 'Color'
                 nt.links.new(socket_to_bake.links[0].from_socket, emission_node.inputs[input_socket_name])
             else:
-                # Also handle the default value correctly
+                # Handle the default value correctly
                 input_socket = emission_node.inputs['Strength' if task.get('is_value_bake') else 'Color']
-                input_socket.default_value = socket_to_bake.default_value
+                
+                # --- START OF FIX ---
+                # This handles the case where the source default_value is an array (e.g., from a
+                # Vector or Color socket) but the destination expects a single float.
+                is_source_array = hasattr(socket_to_bake.default_value, '__len__')
+                is_dest_array = hasattr(input_socket.default_value, '__len__')
+
+                if is_source_array and not is_dest_array:
+                    # Convert array (vector/color) to a single value by averaging its components.
+                    # This correctly handles converting a Displacement vector to Emission Strength.
+                    avg_val = sum(socket_to_bake.default_value[:3]) / 3.0
+                    input_socket.default_value = avg_val
+                else:
+                    # If types are compatible (float->float, vector->color), assign directly.
+                    input_socket.default_value = socket_to_bake.default_value
+                # --- END OF FIX ---
 
             if active_output_node:
                 nt.links.new(emission_node.outputs['Emission'], active_output_node.inputs['Surface'])
@@ -856,10 +924,13 @@ def _perform_simple_bake(setup_data, task, active_output_node):
         bpy.ops.object.bake(type=bake_type, use_clear=True, margin=16)
         img.save()
 
+    
 def perform_single_bake_operation(obj, original_mat, task):
     """
     Orchestrates the entire bake operation for a single task,
     choosing between a 3-pass decal bake or a simple bake.
+    [SURGICALLY IMPLEMENTED]: The 'finally' block for cleanup has been removed,
+    as cleanup is now handled globally by the calling function.
     """
     setup_data = None
     decal_albedo_img = None
@@ -917,77 +988,46 @@ def perform_single_bake_operation(obj, original_mat, task):
         log(f"!!! BAKE TASK FAILED for '{obj.name}' during operation !!!")
         log(traceback.format_exc())
         raise e
-    finally:
-        # --- Cleanup ---
-        if setup_data:
-            render_settings = setup_data['scene'].render
-            image_settings = setup_data['scene'].render.image_settings
-            original_settings = setup_data['original_settings']
-            
-            image_settings.file_format = original_settings['format']
-            image_settings.color_depth = original_settings['color_depth']
-            image_settings.compression = original_settings['compression']
-            render_settings.film_transparent = original_settings['film_transparent']
-
-            if obj and original_settings['original_mat_slot_index'] != -1:
-                try:
-                    obj.material_slots[original_settings['original_mat_slot_index']].material = original_settings['original_mat']
-                except Exception:
-                    pass
-            
-            if 'nt' in setup_data and 'tex_node' in setup_data and setup_data['nt'].nodes.get(setup_data['tex_node'].name):
-                setup_data['nt'].nodes.remove(setup_data['nt'].nodes.get(setup_data['tex_node'].name))
-            
-            mat_to_clean = bpy.data.materials.get(setup_data['mat_for_bake'].name)
-            if mat_to_clean:
-                bpy.data.materials.remove(mat_to_clean, do_unlink=True)
-
-            if setup_data.get('img') and setup_data['img'].name in bpy.data.images:
-                bpy.data.images.remove(setup_data['img'])
-
-        if decal_albedo_img and decal_albedo_img.name in bpy.data.images:
-            bpy.data.images.remove(decal_albedo_img)
-        if decal_alpha_img and decal_alpha_img.name in bpy.data.images:
-            bpy.data.images.remove(decal_alpha_img)
+    # --- The 'finally' block that was here has been REMOVED. ---
 
 def persistent_worker_loop():
-    """Main loop for the worker. Includes PID in all stdout messages."""
-    log("Persistent worker started. Awaiting commands...")
+    """
+    [SURGICALLY IMPLEMENTED] Main loop for the worker. It now immediately reports
+    'ready' and then enters a loop to process self-contained tasks, each with its own file.
+    """
     
-    # A dedicated function to send JSON to stdout, ensuring the PID is always included.
     def send_json_message(payload):
-        payload['pid'] = worker_pid # <-- THE FIX: Always add the PID
+        payload['pid'] = worker_pid
         print(json.dumps(payload), flush=True)
 
     try:
-        initial_command_str = sys.stdin.readline()
-        command = json.loads(initial_command_str)
-        if command.get("action") == "load_blend":
-            blend_file = command.get("blend_file")
-            task_counter.total = command.get("total_tasks", 0)
-            if blend_file and os.path.exists(blend_file):
-                bpy.ops.wm.open_mainfile(filepath=blend_file)
-                log(f"Successfully loaded blend file: {blend_file}")
-                setup_render_engine()
-                send_json_message({"status": "ready"}) # <-- Use the helper function
-            else:
-                raise RuntimeError(f"Blend file not found: {blend_file}")
+        # The initial, one-time render setup and file load is removed.
+        # It is now handled inside perform_bake_task to ensure a correct
+        # state for every bake.
+        log("Persistent worker started. Initializing...")
+        send_json_message({"status": "ready"})
+        log("Worker is READY. Awaiting bake tasks...")
+
     except Exception as e:
-        log(f"!!! FATAL: Could not process initial 'load_blend' command: {e}")
-        send_json_message({"status": "error", "details": str(e)})
+        log(f"!!! FATAL: Could not initialize worker environment: {e}")
+        send_json_message({"status": "error", "details": f"Initialization failed: {e}"})
         return
 
+    # --- Main task processing loop ---
     while True:
         line = sys.stdin.readline()
         if not line:
             log("Input stream closed. Exiting.")
             break
+            
         result_payload = {}
         try:
             task = json.loads(line)
             if task.get("action") == "quit":
-                log("Quit command received. Exiting.")
-                break
+                log("Quit command received. Shutting down gracefully.")
+                break 
+
+            # Each task is now processed by the function that handles file loading.
             success = perform_bake_task(task)
             result_payload = {
                 "status": "success" if success else "failure",
@@ -999,24 +1039,44 @@ def persistent_worker_loop():
             log(f"!!! UNHANDLED WORKER ERROR during task loop: {e}")
             result_payload = {"status": "error", "details": str(e)}
 
-        send_json_message(result_payload) # <-- Use the helper function
+        send_json_message(result_payload)
 
-    log("Worker task processing complete.")
+    log("Worker task processing complete. Exiting.")
 
 if __name__ == "__main__":
     final_exit_code = 0
     try:
+        # --- This new startup logic runs before anything else ---
+        # 1. Create a parser to find our custom arguments.
         parser = argparse.ArgumentParser()
         parser.add_argument("--persistent", action="store_true")
+        parser.add_argument("--lib-path", type=str, default=None)
+        
+        # 2. Parse only the known arguments that come after '--'.
         args, _ = parser.parse_known_args(sys.argv[sys.argv.index("--") + 1:])
+
+        # 3. If a library path was passed, add it to the system path immediately.
+        if args.lib_path and os.path.isdir(args.lib_path):
+            if args.lib_path not in sys.path:
+                sys.path.insert(0, args.lib_path)
+        # --- End of new startup logic ---
+
         if args.persistent:
             persistent_worker_loop()
         else:
+            # This logic would be for the old single-shot worker, which is now deprecated.
+            # We can log an error or simply do nothing.
+            log("ERROR: Worker was started without the --persistent flag. This mode is deprecated.")
             final_exit_code = 1
+            
     except Exception:
-        log("!!! UNHANDLED WORKER ERROR !!!"); log(traceback.format_exc())
+        # Use the worker's own logger to report any catastrophic startup failure.
+        log("!!! UNHANDLED WORKER STARTUP ERROR !!!")
+        log(traceback.format_exc())
         final_exit_code = 1
+        
     finally:
         log(f"Worker finished. Exiting with code: {final_exit_code}")
-        sys.stdout.flush(); sys.stderr.flush()
+        sys.stdout.flush()
+        sys.stderr.flush()
         sys.exit(final_exit_code)
