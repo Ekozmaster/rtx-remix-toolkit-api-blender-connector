@@ -2591,55 +2591,6 @@ def _ensure_image_uuids(context):
             image['remix_bake_uuid'] = str(uuid.uuid4())
     logging.info("UUID tagging complete.")
     
-def _find_bsdf_and_output_nodes(node_tree):
-    """Finds the active Principled BSDF and Material Output nodes."""
-    bsdf_node = next((n for n in node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-    output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-    if not output_node:
-        output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-    return bsdf_node, output_node
-
-def _find_universal_decal_mixer(current_node, end_node, visited_nodes):
-    """Recursively searches backwards from a starting node to find a Mix Shader."""
-    if current_node in visited_nodes or current_node == end_node:
-        return None
-    visited_nodes.add(current_node)
-
-    if current_node.type == 'MIX_SHADER':
-        return (current_node, None)
-
-    if current_node.type == 'GROUP' and current_node.node_tree:
-        group_tree = current_node.node_tree
-        internal_output = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT' and n.is_active_output), None)
-        if internal_output:
-            shader_input = next((s for s in internal_output.inputs if s.type == 'SHADER' and s.is_linked), None)
-            if shader_input:
-                found_result = _find_universal_decal_mixer(shader_input.links[0].from_node, end_node, visited_nodes)
-                if found_result:
-                    found_node, _ = found_result
-                    return (found_node, current_node)
-
-    next_input = next((inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked), None)
-    if next_input:
-        return _find_universal_decal_mixer(next_input.links[0].from_node, end_node, visited_nodes)
-    
-    return None
-
-def _material_has_decal_setup(mat):
-    """Checks if a material has a decal setup (a Mix Shader between BSDF and output)."""
-    if not mat or not mat.use_nodes or not mat.node_tree:
-        return False
-    
-    nt = mat.node_tree
-    bsdf_node, active_output_node = _find_bsdf_and_output_nodes(nt)
-
-    if bsdf_node and active_output_node and active_output_node.inputs['Surface'].is_linked:
-        start_node = active_output_node.inputs['Surface'].links[0].from_node
-        found_decal_info = _find_universal_decal_mixer(start_node, bsdf_node, set())
-        return found_decal_info is not None
-        
-    return False
-
 def get_material_hash(mat, obj=None, material_slot_index=None, force=True, image_hash_cache=None, bake_method='EMIT_HIJACK', ignore_mesh_context=False):
     """
     [PRODUCTION VERSION - HYBRID HASHING] Calculates a highly detailed hash.
@@ -3925,50 +3876,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                 return False # This is a critical failure
         
         return True
-                                                                              
-    def _is_simple_pbr_setup(self, mat):
-        """
-        [DEFINITIVE V4 - RECURSIVE] Determines if a material is simple.
-        This version uses a dedicated recursive helper function (_is_branch_procedural)
-        to correctly traverse the entire node tree, including arbitrarily nested node
-        groups, from every relevant input socket. It is guaranteed to find any
-        procedural node in the chain.
-        """
-        if not mat or not mat.use_nodes or not mat.node_tree:
-            return False
-
-        # Find the essential nodes for a complete material analysis
-        bsdf_node = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-        output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-        if not output_node:
-            output_node = next((n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-
-        # A material isn't a simple PBR setup if it's missing these key components
-        if not output_node or not bsdf_node:
-            return False
-
-        # Gather all top-level sockets that feed the final material output
-        sockets_to_check = []
-        sockets_to_check.extend(bsdf_node.inputs)
-        sockets_to_check.extend([output_node.inputs['Displacement'], output_node.inputs['Volume']])
-
-        # For each connected input, start a deep recursive search.
-        for socket in sockets_to_check:
-            if socket.is_linked:
-                start_node = socket.links[0].from_node
-                # Call the recursive helper. If it finds anything procedural, the material is complex.
-                if self._is_branch_procedural(start_node, set()):
-                    logging.info(
-                        f"Material '{mat.name}' is complex. Reason: A procedural node was found in the "
-                        f"chain leading to the '{socket.name}' input."
-                    )
-                    return False # Bake is required
-
-        # If all connected branches are clean, the material is simple.
-        logging.info(f"Material '{mat.name}' has a simple PBR setup. Baking will be skipped.")
-        return True
-
-        
+                                                                                                      
     def _is_branch_procedural(self, current_node, visited_nodes):
         """
         [RECURSIVE HELPER] Traverses backwards from a starting node. Returns True if
@@ -4127,12 +4035,27 @@ class OBJECT_OT_export_and_ingest(Operator):
                 self._transform_uvs_for_atlas(list(object_set), tiles_for_transform)
 
     def _create_bake_task(self, obj, mat, channel_details, bake_settings, bake_info, special_texture_map):
-        """Creates a dictionary for a single bake task."""
+        """
+        [UUID-BASED & CORRECTED FILENAME]
+        Creates a dictionary for a single bake task. Now uses a sanitized final
+        socket name for file naming to simplify post-processing.
+        """
         channel_name, bake_type, is_val, is_color = channel_details
         safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
-        safe_socket_name = channel_name.replace(' ', '')
-        hash_for_filename = bake_settings['material_hash'][:8] if bake_settings['material_hash'] else f"NOHSH_{uuid.uuid4().hex[:6]}"
-        output_filename = f"{safe_mat_name}_{hash_for_filename}_{safe_socket_name}.png"
+        
+        # --- THIS IS THE FIX ---
+        # Use a clean, final name for the output file, regardless of the temporary task name.
+        if channel_name == "Decal Color":
+            final_socket_name = "BaseColor"
+        elif channel_name == "Decal Alpha":
+            final_socket_name = "Alpha"
+        else:
+            final_socket_name = channel_name.replace(' ', '')
+        # --- END OF FIX ---
+
+        mat_uuid = bake_settings.get('material_uuid', str(uuid.uuid4()))
+    
+        output_filename = f"{safe_mat_name}_{mat_uuid}_{final_socket_name}.png"
         output_path = os.path.join(bake_info['bake_dir'], output_filename)
 
         if channel_name in special_texture_map:
@@ -4140,159 +4063,305 @@ class OBJECT_OT_export_and_ingest(Operator):
                 'path': output_path, 'type': special_texture_map[channel_name]
             })
 
-        final_bake_type = 'EMIT' if bake_settings['uses_udims'] and bake_type == 'DIFFUSE' else bake_type
+        uses_udims = bake_settings.get('uses_udims', False)
+        final_bake_type = 'EMIT' if uses_udims and bake_type == 'DIFFUSE' else bake_type
 
         return {
-            "material_name": mat.name, "material_uuid": bake_settings['material_uuid'], "object_name": obj.name,
-            "bake_type": final_bake_type, "output_path": output_path, "target_socket_name": channel_name,
-            "is_value_bake": is_val, "is_color_data": is_color,
-            "resolution_x": bake_settings['resolution_x'], "resolution_y": bake_settings['resolution_y'],
-            "uv_layer": bake_settings['uv_layer'], "material_hash": bake_settings['material_hash'],
+            "material_name": mat.name,
+            "material_uuid": mat_uuid,
+            "object_name": obj.name,
+            "bake_type": final_bake_type,
+            "output_path": output_path,
+            "target_socket_name": channel_name, # The worker still needs the conceptual name
+            "is_value_bake": is_val,
+            "is_color_data": is_color,
+            "resolution_x": bake_settings['resolution_x'],
+            "resolution_y": bake_settings['resolution_y'],
+            "uv_layer": bake_settings['uv_layer'],
             "bake_method": bake_settings['bake_method']
         }
-
+        
     def _generate_tasks_for_material(self, obj, slot_index, mat, bake_info, bake_method, channels, special_texture_map):
         """
-        Analyzes a single material on a specific object and generates all necessary
-        bake tasks for it, returning an empty list if no baking is needed.
+        Orchestrates task generation for a single material by checking the cache,
+        analyzing the material's node setup, and creating the necessary bake tasks.
         """
-        material_tasks = []
-        
-        uses_udims = self._material_uses_udims(mat)
-        if uses_udims and mat.name not in bake_info['udim_materials']:
-            bake_info['udim_materials'].add(mat.name)
-
-        material_hash = get_material_hash(mat, obj, slot_index, image_hash_cache=global_image_hash_cache, bake_method=bake_method)
+        # --- Cache Check ---
+        material_hash = get_material_hash(mat, obj, slot_index, image_hash_cache=global_image_hash_cache, bake_method=bake_method, ignore_mesh_context=True)
         hash_for_log = f"Hash: {material_hash[:8]}..." if material_hash else "Hash: [FAILED]"
 
         if material_hash and material_hash in global_material_hash_cache:
             logging.info(f"  CACHE HIT: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) is cached. Reusing.")
             cached_data = global_material_hash_cache[material_hash]
             bake_info['cached_materials'][material_hash] = cached_data
-            for socket_name, path in cached_data.items():
-                if socket_name in special_texture_map:
-                     bake_info['special_texture_info'][(obj.name, mat.name)].append({'path': path, 'type': special_texture_map[socket_name]})
             return []
 
         logging.info(f"  CACHE MISS: Context for '{mat.name}' on '{obj.name}' ({hash_for_log}) will be processed.")
-        is_complex = not self._is_simple_pbr_setup(mat)
-        has_decal = _material_has_decal_setup(mat)
 
-        if is_complex or uses_udims:
-            log_reason_parts = []
-            if is_complex: log_reason_parts.append("complex setup")
-            if uses_udims: log_reason_parts.append("UDIM textures")
-            logging.info(f"  - Queuing FULL BAKE for material '{mat.name}' on '{obj.name}' (Reason: {', '.join(log_reason_parts)}).")
+        # --- Analysis Phase ---
+        bsdf, output_node = _find_bsdf_and_output_nodes(mat.node_tree)
+        if not output_node:
+            logging.error(f"  - Material '{mat.name}' has no Material Output node. Skipping.")
+            return []
 
-            DEFAULT_BAKE_RESOLUTION = 2048
-            res_x, res_y = DEFAULT_BAKE_RESOLUTION, DEFAULT_BAKE_RESOLUTION
-            uv_layer = obj.data.uv_layers.active.name if obj.data.uv_layers.active else obj.data.uv_layers[0].name
+        # Delegate the complex node analysis to a new helper function
+        task_templates, simple_textures = self._analyze_material_for_baking(
+            mat, bsdf, output_node, channels, bake_info
+        )
 
-            if uses_udims:
-                udim_node = next((n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image and n.image.source == 'TILED'), None)
-                if udim_node and udim_node.image:
-                    tiles = sorted([t for t in udim_node.image.tiles if t.label], key=lambda t: t.number)
-                    if tiles:
-                        tile_width, tile_height = udim_node.image.size
-                        if tile_width > 0 and tile_height > 0:
-                            res_x, res_y = tile_width * len(tiles), tile_height
-                            logging.info(f"   - UDIMs detected. Setting bake resolution to {res_x}x{res_y} for atlas.")
-                uv_layer = "remix_atlas_uv"
-            else:
-                max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
-                if max_w > 0: res_x = max_w
-                if max_h > 0: res_y = max_h
-                if max_w > 0 or max_h > 0: logging.info(f"   - Dynamically set bake resolution to {res_x}x{res_y}.")
-
-            mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-            task_templates = list(channels['core'])
-            bsdf, output_node = _find_bsdf_and_output_nodes(mat.node_tree)
-
-            for channel_details in channels['optional']:
-                channel_name = channel_details[0]
-                socket = (output_node.inputs.get(channel_name) if channel_name == "Displacement" and output_node else (bsdf.inputs.get(channel_name) if bsdf else None))
-                if (socket and socket.is_linked) or (channel_name == "Alpha" and socket and not math.isclose(socket.default_value, 1.0)):
-                    task_templates.append(channel_details)
-            
-            bake_settings = {'material_hash': material_hash, 'resolution_x': res_x, 'resolution_y': res_y, 'uv_layer': uv_layer, 'bake_method': bake_method, 'material_uuid': mat_uuid, 'uses_udims': uses_udims}
-            for channel_details in task_templates:
-                material_tasks.append(self._create_bake_task(obj, mat, channel_details, bake_settings, bake_info, special_texture_map))
+        # --- Task Creation Phase ---
+        material_tasks = []
+        if task_templates:
+            # Delegate the creation of final task dictionaries to another helper
+            material_tasks = self._create_bake_tasks_from_templates(
+                obj, mat, task_templates, bake_info, special_texture_map, bake_method, material_hash
+            )
         
-        elif has_decal:
-            logging.info(f"  - Queuing DECAL COMPOSITE task for simple material '{mat.name}' on '{obj.name}'.")
-            bsdf_node, _ = _find_bsdf_and_output_nodes(mat.node_tree)
-            if bsdf_node:
-                original_base_color_path = self._get_texture_path_from_socket(bsdf_node.inputs['Base Color'])
-                if not original_base_color_path:
-                    logging.warning(f"    - Could not find a valid source texture for 'Base Color' on simple material '{mat.name}'. It will be treated as black.")
-                
-                DEFAULT_BAKE_RESOLUTION = 2048
-                max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
-                res_x = max_w if max_w > 0 else DEFAULT_BAKE_RESOLUTION
-                res_y = max_h if max_h > 0 else DEFAULT_BAKE_RESOLUTION
-                mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-                
-                output_path = os.path.join(bake_info['bake_dir'], f"{''.join(c for c in mat.name if c.isalnum())}_{material_hash[:8]}_BaseColor.png")
-                
-                material_tasks.append({
-                    "material_name": mat.name, "material_uuid": mat_uuid, "object_name": obj.name,
-                    "bake_type": "EMIT", "target_socket_name": "Base Color", "output_path": output_path,
-                    "resolution_x": res_x, "resolution_y": res_y, "uv_layer": obj.data.uv_layers.active.name,
-                    "material_hash": material_hash, "bake_method": bake_method, "is_simple_decal_composite": True,
-                    "original_base_color_path": original_base_color_path
-                })
-                if material_hash:
-                    if material_hash not in global_material_hash_cache: global_material_hash_cache[material_hash] = {}
-                    global_material_hash_cache[material_hash]['Base Color'] = output_path
-                    for socket_name in ["Metallic", "Roughness", "Normal"]:
-                         path = self._get_texture_path_from_socket(bsdf_node.inputs[socket_name])
-                         if path: global_material_hash_cache[material_hash][socket_name] = path
-        else:
-            logging.info(f"  - Material '{mat.name}' is simple. Checking for existing special textures to use directly.")
-            bsdf, output_node = _find_bsdf_and_output_nodes(mat.node_tree)
-            sockets_to_scan = {}
-            if bsdf:
-                sockets_to_scan.update({"Emission Color": bsdf.inputs.get("Emission Color"), "Alpha": bsdf.inputs.get("Alpha")})
-            if output_node:
-                sockets_to_scan["Displacement"] = output_node.inputs.get("Displacement")
-
-            for socket_name, socket in sockets_to_scan.items():
-                if socket and socket.is_linked:
-                    texture_path = self._get_texture_path_from_socket(socket)
-                    if texture_path and os.path.exists(texture_path):
-                        server_texture_type = special_texture_map.get(socket_name)
-                        if server_texture_type:
-                            logging.info(f"    > Found direct-use special map for '{socket_name}' at: {os.path.basename(texture_path)}")
-                            bake_info['special_texture_info'][(obj.name, mat.name)].append({'path': texture_path, 'type': server_texture_type})
-
+        # --- Caching Phase ---
+        if simple_textures:
+            if material_hash not in global_material_hash_cache:
+                global_material_hash_cache[material_hash] = {}
+            global_material_hash_cache[material_hash].update(simple_textures)
+            logging.info(f"  - Caching {len(simple_textures)} direct-use simple texture(s).")
+        
         return material_tasks
+
+    def _analyze_material_for_baking(self, mat, bsdf, output_node, channels, bake_info):
+        """
+        [CORRECTED SURGICAL BAKE LOGIC] Analyzes each material channel independently.
+        Bakes only the channels confirmed to be procedural and copies any simple textures,
+        correctly handling both non-PBR materials (like Baga Ivy) and PBR materials with decals.
+        """
+        task_templates = []
+        simple_textures = {}
+
+        logging.info(f"  - Performing surgical analysis for '{mat.name}'...")
+
+        # A truly simple PBR material can be fast-tracked.
+        if self._is_simple_pbr_setup(mat) and not self._material_has_decal_setup(mat):
+            logging.info(f"    - Material is simple PBR. Caching all texture paths directly.")
+            # Gather all texture paths and return immediately.
+            all_pbr_channels = channels['core'] + channels['optional']
+            for channel_details in all_pbr_channels:
+                socket = (bsdf.inputs.get(channel_details[0]) if bsdf else None) or \
+                         (output_node.inputs.get(channel_details[0]) if output_node else None)
+                if socket:
+                    path = self._get_texture_path_from_socket(socket)
+                    if path:
+                        simple_textures[channel_details[0]] = path
+            return [], simple_textures
+
+        # --- If not a simple PBR, analyze each channel individually. ---
+        all_channels_to_check = channels['core'] + channels['optional']
+
+        for channel_details in all_channels_to_check:
+            channel_name = channel_details[0]
+            socket = None
+
+            # For PBR materials, check the BSDF. For non-PBR (Baga Ivy), check the final output.
+            if bsdf:
+                socket = bsdf.inputs.get(channel_name)
+            
+            # Always check the final output node as well, especially for Surface and Displacement.
+            if output_node and channel_name in ["Base Color", "Displacement"]:
+                if channel_name == "Base Color":
+                     socket = output_node.inputs.get('Surface')
+                else:
+                     socket = output_node.inputs.get(channel_name)
+
+            # If the channel isn't connected anywhere, we have nothing to do.
+            if not socket or not socket.is_linked:
+                continue
+
+            # Check if the node chain for this specific channel is procedural.
+            start_node = socket.links[0].from_node
+            is_procedural = self._is_branch_procedural(start_node, set())
+
+            if is_procedural:
+                # This specific channel is complex. Queue a bake task ONLY for it.
+                logging.info(f"    - Channel '{channel_name}' is PROCEDURAL. Queuing for bake.")
+                task_templates.append(channel_details)
+            else:
+                # This channel is just a simple texture. Cache its path to be copied.
+                path = self._get_texture_path_from_socket(socket)
+                if path:
+                    logging.info(f"    - Channel '{channel_name}' is a SIMPLE TEXTURE. Caching for copy.")
+                    simple_textures[channel_name] = path
+                    # Handle special textures (like simple displacement maps) that are copied, not baked.
+                    if channel_name == "Displacement":
+                         bake_info['special_texture_info'][(mat.name, mat.name)].append({'path': path, 'type': 'HEIGHT'})
+
+        return list(dict.fromkeys(task_templates)), simple_textures
+
+    def _find_bsdf_and_output_nodes(self, node_tree):
+        """Finds the active Principled BSDF and Material Output nodes."""
+        bsdf_node = next((n for n in node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+        if not output_node:
+            output_node = next((n for n in node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        return bsdf_node, output_node
+
+    def _find_universal_decal_mixer(self, current_node, end_node, visited_nodes):
+        """Recursively searches backwards from a starting node to find a Mix Shader."""
+        if current_node in visited_nodes or current_node == end_node:
+            return None
+        visited_nodes.add(current_node)
+
+        if current_node.type == 'MIX_SHADER':
+            return (current_node, None)
+
+        if current_node.type == 'GROUP' and current_node.node_tree:
+            group_tree = current_node.node_tree
+            internal_output = next((n for n in group_tree.nodes if n.type == 'GROUP_OUTPUT' and n.is_active_output), None)
+            if internal_output:
+                shader_input = next((s for s in internal_output.inputs if s.type == 'SHADER' and s.is_linked), None)
+                if shader_input:
+                    found_result = self._find_universal_decal_mixer(shader_input.links[0].from_node, end_node, visited_nodes)
+                    if found_result:
+                        found_node, _ = found_result
+                        return (found_node, current_node)
+
+        next_input = next((inp for inp in current_node.inputs if inp.type == 'SHADER' and inp.is_linked), None)
+        if next_input:
+            return self._find_universal_decal_mixer(next_input.links[0].from_node, end_node, visited_nodes)
+        
+        return None
+    
+    def _material_has_decal_setup(self, mat):
+        """
+        Checks if a material has a decal setup by looking for a Mix Shader
+        node anywhere in the path between the main BSDF and the Material Output.
+        """
+        if not mat or not mat.use_nodes or not mat.node_tree:
+            return False
+        
+        nt = mat.node_tree
+        bsdf_node, active_output_node = self._find_bsdf_and_output_nodes(nt)
+
+        if bsdf_node and active_output_node and active_output_node.inputs['Surface'].is_linked:
+            start_node = active_output_node.inputs['Surface'].links[0].from_node
+            found_decal_info = self._find_universal_decal_mixer(start_node, bsdf_node, set())
+            return found_decal_info is not None
+            
+        return False
+
+    def _create_bake_tasks_from_templates(self, obj, mat, task_templates, bake_info, special_texture_map, bake_method, material_hash):
+        """
+        Creates a list of final bake task dictionaries based on a list of channel templates.
+        This includes determining resolution, UV layers, and handling decal-specific tasks.
+        """
+        material_tasks = []
+        bsdf, output_node = self._find_bsdf_and_output_nodes(mat.node_tree)
+        
+        res_x, res_y = 2048, 2048
+        uv_layer = obj.data.uv_layers.active.name if obj.data.uv_layers.active else None
+        max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
+        if max_w > 0: res_x = max_w
+        if max_h > 0: res_y = max_h
+        
+        uses_udims = self._material_uses_udims(mat)
+        if uses_udims: 
+            uv_layer = "remix_atlas_uv"
+
+        mat_uuid = mat.get("uuid", str(uuid.uuid4()))
+        mat["uuid"] = mat_uuid
+        
+        bake_settings = {
+            'material_hash': material_hash, 
+            'resolution_x': res_x, 
+            'resolution_y': res_y, 
+            'uv_layer': uv_layer, 
+            'bake_method': bake_method, 
+            'material_uuid': mat_uuid, 
+            'uses_udims': uses_udims
+        }
+
+        for channel_details in task_templates:
+            is_decal_task = bsdf and self._material_has_decal_setup(mat)
+            
+            if channel_details[0] == 'Base Color' and is_decal_task:
+                task = self._create_bake_task(obj, mat, channel_details, bake_settings, bake_info, special_texture_map)
+                task['is_decal_composite'] = True
+                
+                mixer_info = self._find_universal_decal_mixer(output_node.inputs['Surface'].links[0].from_node, bsdf, set())
+                base_shader_socket = mixer_info[0].inputs[1] if mixer_info else None
+                
+                # --- THIS IS THE FIX ---
+                # Correctly check if the base shader connection is procedural.
+                task['decal_base_is_procedural'] = self._is_branch_procedural(base_shader_socket.links[0].from_node, set()) if base_shader_socket and base_shader_socket.is_linked else False
+                # --- END OF FIX ---
+                
+                if not task['decal_base_is_procedural']:
+                    task['decal_base_albedo_path'] = self._get_texture_path_from_socket(bsdf.inputs['Base Color'])
+                material_tasks.append(task)
+            else:
+                material_tasks.append(self._create_bake_task(obj, mat, channel_details, bake_settings, bake_info, special_texture_map))
+                
+        return material_tasks
+                
+    def _is_material_simple(self, mat):
+        """
+        [DEFINITIVE V5 - STRICT ANALYSIS] Determines if a material is simple.
+        A material is ONLY considered simple if every connected input socket on its
+        BSDF and Output nodes traces back exclusively to an Image Texture node,
+        passing through only safe passthrough nodes. The presence of ANY other
+        node type (Brick, Noise, Math, etc.) will correctly flag it as complex.
+        """
+        if not mat or not mat.use_nodes or not mat.node_tree:
+            return False
+
+        # If it has a decal, the underlying material might be simple, but the
+        # final result is complex and needs baking.
+        if self._material_has_decal_setup(mat):
+            return False
+
+        bsdf_node, output_node = self._find_bsdf_and_output_nodes(mat.node_tree)
+
+        # A material with no final output is not valid for this check.
+        if not output_node:
+            return False
+        
+        # A material with no BSDF (like Baga Ivy) is definitively not a simple PBR setup.
+        if not bsdf_node:
+            return False
+
+        # Check every socket that could possibly be connected on a PBR material.
+        sockets_to_check = list(bsdf_node.inputs) + [output_node.inputs['Displacement']]
+
+        for socket in sockets_to_check:
+            if socket.is_linked:
+                # If any branch is found to be procedural, the entire material is complex.
+                if self._is_branch_procedural(socket.links[0].from_node, set()):
+                    return False
+        
+        # If all connected branches traced back to simple textures, the material is simple.
+        return True
 
     def collect_bake_tasks(self, context, objects_to_process, export_data):
         """
-        Main entry point to generate all bake tasks. It orchestrates the process by
-        calling its own specialized helper methods.
+        [DEFINITIVE LOGIC V5 - REGRESSION FIX]
+        This version fixes the two critical regressions introduced previously:
+        1. DUPLICATE TASKS: Now uses a run-specific set ('processed_materials_this_run') to
+           ensure each unique material is only processed once per export, cutting the task count.
+        2. MISSING NORMALS: Restores the logic to find and bake 'Normal' maps for complex
+           non-PBR materials (like Baga Ivy) that do not use a Principled BSDF node.
         """
-        bake_info = self._initialize_bake_session(export_data)
+        tasks = []
+        bake_dir = CUSTOM_COLLECT_PATH
+        os.makedirs(bake_dir, exist_ok=True)
+        bake_info = { 'tasks': [], 'bake_dir': bake_dir, 'special_texture_info': defaultdict(list), 'cached_materials': {} }
+        export_data['bake_info'] = bake_info
         
         addon_prefs = context.preferences.addons[__name__].preferences
         bake_method = addon_prefs.bake_method
-        logging.info(f"  > Using selected Bake Method for all tasks: {bake_method}.")
-
-        SPECIAL_TEXTURE_MAP = {
-            "Displacement": "HEIGHT", "Emission Color": "EMISSIVE", "Alpha": "OPACITY",
-            "Anisotropy": "ANISOTROPY", "Transmission": "TRANSMITTANCE",
-            "Subsurface Radius": "MEASUREMENT_DISTANCE", "Subsurface Scale": "SINGLE_SCATTERING"
-        }
-        
-        channels = {
-            'core': [("Base Color", 'DIFFUSE', False, True), ("Metallic", 'EMIT', True, False), ("Roughness", 'ROUGHNESS', True, False), ("Normal", 'NORMAL', False, False)] if bake_method == 'NATIVE' else [("Base Color", 'EMIT', False, True), ("Metallic", 'EMIT', True, False), ("Roughness", 'EMIT', True, False), ("Normal", 'NORMAL', False, False)],
-            'optional': [("Alpha", 'EMIT', True, False), ("Displacement", 'DISPLACEMENT', True, False), ("Emission Color", 'EMIT', False, True), ("Anisotropy", 'EMIT', True, False), ("Transmission", 'EMIT', True, False), ("Subsurface Radius", 'EMIT', False, True), ("Subsurface Scale", 'EMIT', True, False)]
-        }
-
-        logging.info("Analyzing materials with mesh-aware caching...")
+        logging.info("Analyzing materials with corrected surgical and decal logic...")
         self._identify_and_prepare_udim_atlases(objects_to_process)
-        
-        all_tasks = []
+
+        # --- FIX #1: PREVENT DUPLICATE TASKS ---
+        # This set will track materials that have already had tasks generated for them in this specific export run.
+        processed_materials_this_run = set()
+        # --- END OF FIX #1 ---
+
         for obj in objects_to_process:
             if obj.type != 'MESH' or not obj.data or not obj.data.uv_layers:
                 continue
@@ -4301,17 +4370,88 @@ class OBJECT_OT_export_and_ingest(Operator):
                 mat = slot.material
                 if not mat or not mat.use_nodes:
                     continue
-                
-                material_tasks = self._generate_tasks_for_material(obj, slot_index, mat, bake_info, bake_method, channels, SPECIAL_TEXTURE_MAP)
-                all_tasks.extend(material_tasks)
 
-        bake_info['tasks'] = all_tasks
-        if bake_info['tasks']:
-            logging.info(f"Generated {len(bake_info['tasks'])} new bake tasks.")
-        if bake_info['cached_materials']:
-            logging.info(f"Will reuse cached textures for {len(bake_info['cached_materials'])} material contexts.")
-            
-        return all_tasks, {}, bake_info['bake_dir'], bake_info.get('special_texture_info', {})
+                # --- FIX #1 (CONTINUED): Check if we've already handled this material. ---
+                if mat in processed_materials_this_run:
+                    continue
+                # --- END OF FIX #1 ---
+
+                # Caching logic remains the same
+                material_hash = get_material_hash(mat, obj, slot_index, image_hash_cache=global_image_hash_cache, bake_method=bake_method, ignore_mesh_context=True)
+                if material_hash and material_hash in global_material_hash_cache:
+                    logging.info(f"  CACHE HIT: Reusing cached textures for '{mat.name}'.")
+                    processed_materials_this_run.add(mat) # Mark as processed even if cached
+                    continue
+
+                bsdf, output_node = self._find_bsdf_and_output_nodes(mat.node_tree)
+                mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
+                
+                res_x, res_y = 2048, 2048; max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
+                if max_w > 0: res_x = max_w
+                if max_h > 0: res_y = max_h
+                uses_udims = self._material_uses_udims(mat)
+                uv_layer = obj.data.uv_layers.active.name if obj.data.uv_layers.active else None
+                if uses_udims: uv_layer = "remix_atlas_uv"
+                base_bake_settings = {
+                    'resolution_x': res_x, 'resolution_y': res_y, 'uv_layer': uv_layer,
+                    'bake_method': bake_method, 'material_uuid': mat_uuid, 'uses_udims': uses_udims
+                }
+
+                if self._material_has_decal_setup(mat):
+                    logging.info(f"  - Decal setup found on '{mat.name}'. Flagging 'Base Color' task for composite bake.")
+                    base_color_task = self._create_bake_task(obj, mat, ("Base Color", 'EMIT', False, True), base_bake_settings, bake_info, {})
+                    base_color_task['is_decal_composite'] = True
+                    base_color_is_simple, base_albedo_path = False, None
+                    if bsdf and bsdf.inputs['Base Color'].is_linked and not self._is_branch_procedural(bsdf.inputs['Base Color'].links[0].from_node, set()):
+                        base_color_is_simple = True
+                        base_albedo_path = self._get_texture_path_from_socket(bsdf.inputs['Base Color'])
+                    base_color_task['decal_base_is_procedural'] = not base_color_is_simple
+                    if base_color_is_simple: base_color_task['decal_base_albedo_path'] = base_albedo_path
+                    tasks.append(base_color_task)
+
+                    if bsdf:
+                        pbr_channels_to_check = [("Normal", 'NORMAL', False, False), ("Metallic", 'EMIT', True, False), ("Roughness", 'EMIT', True, False), ("Displacement", 'EMIT', True, False)]
+                        for channel_name, *details in pbr_channels_to_check:
+                            socket = bsdf.inputs.get(channel_name) or output_node.inputs.get(channel_name)
+                            if socket and socket.is_linked:
+                                if self._is_branch_procedural(socket.links[0].from_node, set()):
+                                    tasks.append(self._create_bake_task(obj, mat, (channel_name, *details), base_bake_settings, bake_info, {}))
+                                else:
+                                    logging.info(f"    - Underlying '{channel_name}' is a simple texture. It will be copied.")
+                
+                elif not self._is_material_simple(mat):
+                    logging.info(f"  - Complex material detected: '{mat.name}'. Generating surgical bake tasks.")
+                    tasks_for_this_mat = []
+                    sockets_to_check = []
+                    if output_node: sockets_to_check.extend([(output_node.inputs.get('Surface'), ("Base Color", 'EMIT', False, True)), (output_node.inputs.get('Displacement'), ("Displacement", 'EMIT', True, False))])
+                    if bsdf:
+                        pbr_channels = [("Normal", 'NORMAL', False, False), ("Metallic", 'EMIT', True, False), ("Roughness", 'EMIT', True, False), ("Alpha", 'EMIT', True, False)]
+                        for name, *details in pbr_channels: sockets_to_check.append((bsdf.inputs.get(name), (name, *details)))
+                    
+                    # --- FIX #2: BAKE NORMALS ON NON-PBR MATERIALS ---
+                    # If no BSDF is found (like in Baga Ivy), search for a Normal input on a top-level group node.
+                    elif not bsdf:
+                        for node in mat.node_tree.nodes:
+                            if node.type == 'GROUP':
+                                for input_socket in node.inputs:
+                                    # Heuristic: If the socket is named 'Normal' and is linked, we bake it.
+                                    if 'Normal' in input_socket.name and input_socket.is_linked:
+                                        sockets_to_check.append((input_socket, ("Normal", 'NORMAL', False, False)))
+                    # --- END OF FIX #2 ---
+
+                    for socket, channel_details in sockets_to_check:
+                        if socket and socket.is_linked: tasks_for_this_mat.append(channel_details)
+                    
+                    for channel_details in set(tasks_for_this_mat):
+                        tasks.append(self._create_bake_task(obj, mat, channel_details, base_bake_settings, bake_info, {}))
+
+                # --- FIX #1 (CONTINUED): Mark this material as processed for this run. ---
+                processed_materials_this_run.add(mat)
+                # --- END OF FIX #1 ---
+
+        bake_info['tasks'] = tasks
+        if tasks: logging.info(f"Generated {len(tasks)} targeted bake tasks.")
+        return tasks, {}, bake_dir, bake_info.get('special_texture_info', {})
         
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
@@ -5017,64 +5157,64 @@ class OBJECT_OT_export_and_ingest(Operator):
           
     def _finalize_export(self, context):
         """
-        [DEFINITIVE V15 - CORRECT ALPHA COMPOSITING]
-        Handles the final steps of the export. This version fixes the critical bug where baked
-        alpha maps were not being found and combined with their corresponding base color maps.
-        The logic now uses the bake task list for a direct, reliable lookup instead of guessing filenames.
+        [DEFINITIVE V9 - WITH DECAL COMPOSITE]
+        This version now includes the new logic to find baked decal layers and
+        trigger the programmatic compositing step for optimized decal handling.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
         self._export_data['original_active_uvs'] = {}
 
         try:
-            logging.info("--- Finalizing Export (Composite & Atlas Aware) ---")
+            logging.info("--- Finalizing Export (UUID-Based Composite & Atlas Aware) ---")
             bake_info = self._export_data.get('bake_info', {})
-
-            # --- PHASE 1: TEXTURE COMPOSITING & CACHING ---
-            if bake_info and bake_info.get('tasks'):
-                logging.info("Checking for baked alpha maps to combine...")
-                tasks = bake_info.get('tasks', [])
-                
-                # --- THIS IS THE FIX ---
-                # Create a reliable lookup map from the tasks list: {material_hash: {socket_name: path}}
-                tasks_by_hash = defaultdict(dict)
-                for task in tasks:
-                    mat_hash = task.get('material_hash')
-                    socket_name = task.get('target_socket_name')
-                    if mat_hash and socket_name:
-                        tasks_by_hash[mat_hash][socket_name] = task.get('output_path')
-
-                # Now, iterate through the hashes to find pairs of Base Color and Alpha maps.
-                for mat_hash, baked_maps in tasks_by_hash.items():
-                    if "Base Color" in baked_maps and "Alpha" in baked_maps:
-                        color_map_path = baked_maps["Base Color"]
-                        alpha_mask_path = baked_maps["Alpha"]
-                        
-                        # Verify both files exist before attempting to combine them.
-                        if os.path.exists(color_map_path) and os.path.exists(alpha_mask_path):
-                            log_msg = (
-                                f"Found corresponding Base Color and Alpha bakes for hash {mat_hash[:8]}... "
-                                f"Combining '{os.path.basename(alpha_mask_path)}' into '{os.path.basename(color_map_path)}'."
-                            )
-                            logging.info(log_msg)
-                            self._combine_color_and_alpha(color_map_path, alpha_mask_path)
-                # --- END OF FIX ---
+            final_texture_cache = defaultdict(dict)
         
-                logging.info("Updating global material cache with newly baked textures...")
+            for mat_hash, textures in global_material_hash_cache.items():
+                final_texture_cache[mat_hash].update(textures)
+            
+            if bake_info and bake_info.get('tasks'):
+                logging.info("Processing baked textures and checking for alpha maps to combine...")
+                tasks_by_uuid = defaultdict(dict)
+                
+                # --- NEW: Identify decal compositing jobs ---
+                decal_composite_jobs = defaultdict(dict)
+
                 for task in bake_info.get('tasks', []):
-                    mat_hash = task.get('material_hash')
+                    mat_uuid = task.get('material_uuid')
                     socket_name = task.get('target_socket_name')
                     output_path = task.get('output_path')
+                
+                    if not (mat_uuid and socket_name and os.path.exists(output_path)):
+                        continue
+                    
+                    if task.get('is_decal_layer_bake'):
+                        if socket_name == 'Decal Color':
+                            decal_composite_jobs[mat_uuid]['color'] = output_path
+                            decal_composite_jobs[mat_uuid]['base_albedo'] = task.get('decal_base_albedo_path')
+                        elif socket_name == 'Decal Alpha':
+                            decal_composite_jobs[mat_uuid]['alpha'] = output_path
+                    else:
+                        final_texture_cache[mat_uuid][socket_name] = output_path
+                        tasks_by_uuid[mat_uuid][socket_name] = output_path
 
-                    if mat_hash and socket_name and os.path.exists(output_path):
-                        if mat_hash not in global_material_hash_cache:
-                            global_material_hash_cache[mat_hash] = {}
-                        global_material_hash_cache[mat_hash][socket_name] = output_path
-                logging.info(f"Global cache now contains {len(global_material_hash_cache)} unique materials.")
+                # --- Execute decal compositing ---
+                for mat_uuid, job_paths in decal_composite_jobs.items():
+                    if all(k in job_paths for k in ['color', 'alpha', 'base_albedo']):
+                        # The final output path will be named as if it were a normal BaseColor bake
+                        final_composite_path = job_paths['color'].replace("Decal_Color", "BaseColor")
+                        if self._composite_decal_over_albedo(job_paths['base_albedo'], job_paths['color'], job_paths['alpha'], final_composite_path):
+                             final_texture_cache[mat_uuid]['Base Color'] = final_composite_path
 
-            # --- PHASE 2: MATERIAL PREPARATION ---
-            self._prepare_materials_for_export(context, objects_to_process=self._export_data["objects_for_export"])
+                # Execute standard alpha channel combination for fully baked materials
+                for mat_uuid, baked_maps in tasks_by_uuid.items():
+                    if "Base Color" in baked_maps and "Alpha" in baked_maps:
+                        self._combine_color_and_alpha(baked_maps["Base Color"], baked_maps["Alpha"])
 
-            # --- PHASE 3: GEOMETRY PREPARATION ---
+            logging.info(f"Final texture cache built. Contains data for {len(final_texture_cache)} unique materials.")
+
+            self._prepare_materials_for_export(context, objects_to_process=self._export_data["objects_for_export"], texture_cache=final_texture_cache)
+
+            # ... (The rest of the function for geometry prep, export, and upload remains unchanged)
             final_meshes_for_obj = self._export_data.get("objects_for_export", [])
             if not final_meshes_for_obj:
                 raise RuntimeError("Final object list for export is empty after processing.")
@@ -5089,7 +5229,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 batch_flip_normals_optimized(final_meshes_for_obj, context)
                 self._export_data["normals_were_flipped"] = True
 
-            # --- PHASE 4: FILE EXPORT ---
             base_name, asset_number = get_asset_number(context)
             obj_filename = f"{base_name}_{asset_number}.obj"
 
@@ -5125,7 +5264,6 @@ class OBJECT_OT_export_and_ingest(Operator):
                 if uses_stitched_material and obj.data and "remix_atlas_uv" in obj.data.uv_layers:
                     if obj.data.uv_layers.active:
                         self._export_data['original_active_uvs'][obj.name] = obj.data.uv_layers.active.name
-                
                     obj.data.uv_layers.active = obj.data.uv_layers["remix_atlas_uv"]
                     logging.info(f"  > Set active UV map to 'remix_atlas_uv' for '{obj.name}' for export.")
 
@@ -5139,7 +5277,6 @@ class OBJECT_OT_export_and_ingest(Operator):
 
             logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
 
-            # --- PHASE 5: API UPLOAD AND SERVER COMMUNICATION ---
             ingested_usd = upload_to_api(exported_obj_path, addon_prefs.remix_ingest_directory, context)
             if not ingested_usd:
                 raise RuntimeError("API upload failed.")
@@ -5379,22 +5516,18 @@ class OBJECT_OT_export_and_ingest(Operator):
                     # If a UV coord points to a tile that doesn't exist, collapse it to zero.
                     atlas_uv_layer.data[loop_index].uv = (0.0, 0.0)
 
-    def _prepare_materials_for_export(self, context, objects_to_process):
+    def _prepare_materials_for_export(self, context, objects_to_process, texture_cache):
         """
-        [DEFINITIVE V19 - CORRECT NAME MAPPING FIX]
-        This version corrects the critical bug where the material name map, used by the
-        special texture assignment function, was not being populated with the final, prefixed
-        material name (e.g., 'EXPORT_matname'). It now stores the correct final name, ensuring
-        the subsequent lookup on the server will succeed.
+        [DEFINITIVE V8 - SYNTAX FIX] Prepares materials for export.
+        This version fixes a SyntaxError caused by using a regular expression
+        with a backslash inside an f-string. The name sanitization is now
+        performed outside the f-string to resolve the issue.
         """
-        logging.info("Preparing unique, baked materials for export (with correct name mapping)...")
-
+        logging.info("Preparing unique materials for export (with corrected decal logic)...")
         self._export_data["material_name_map"] = {}
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
-
-        bake_cache = global_material_hash_cache
 
         for obj in objects_to_process:
             if not obj: continue
@@ -5402,33 +5535,50 @@ class OBJECT_OT_export_and_ingest(Operator):
                 original_mat = slot.material
                 if not original_mat: continue
 
-                sanitized_mat_name = re.sub(r'[\s.-]', '_', original_mat.name)
+                mat_uuid = original_mat.get("uuid", str(uuid.uuid4()))
+                original_mat["uuid"] = mat_uuid
+                
                 final_mat_for_export = None
+                
+                texture_paths = texture_cache.get(mat_uuid, {}).copy()
 
-                mat_hash = get_material_hash(original_mat, obj, slot_index, ignore_mesh_context=False)
+                if self._material_has_decal_setup(original_mat):
+                    bsdf, _ = self._find_bsdf_and_output_nodes(original_mat.node_tree)
+                    if bsdf:
+                        logging.info(f"  - Decal material '{original_mat.name}' found. Merging simple PBR maps.")
+                        for pbr_input in bsdf.inputs:
+                            if pbr_input.name not in texture_paths and pbr_input.is_linked:
+                                if not self._is_branch_procedural(pbr_input.links[0].from_node, set()):
+                                    path = self._get_texture_path_from_socket(pbr_input)
+                                    if path:
+                                        logging.info(f"    - Copying simple texture for '{pbr_input.name}' from original material.")
+                                        texture_paths[pbr_input.name] = path
 
-                if mat_hash in bake_cache:
-                    unique_baked_mat_name = f"BAKED_{sanitized_mat_name}"
-                    logging.info(f"  - CACHE HIT: Found baked textures for '{original_mat.name}' (Hash: {mat_hash[:8]}...). Building new material: '{unique_baked_mat_name}'")
-                    final_mat_for_export = self._build_material_from_textures(unique_baked_mat_name, bake_cache[mat_hash])
+                if texture_paths:
                     # --- THIS IS THE FIX ---
-                    # Store the FULL, final name including the "BAKED_" prefix.
-                    self._export_data["material_name_map"][original_mat.name] = unique_baked_mat_name
+                    # Sanitize the name first, then use the clean variable in the f-string.
+                    sanitized_mat_name = re.sub(r'[\s.-]', '_', original_mat.name)
+                    unique_baked_mat_name = f"BAKED_{sanitized_mat_name}_{mat_uuid[:8]}"
                     # --- END OF FIX ---
+                    
+                    logging.info(f"  - Building new material '{unique_baked_mat_name}' from {len(texture_paths)} final textures for '{original_mat.name}'.")
+                    final_mat_for_export = self._build_material_from_textures(unique_baked_mat_name, texture_paths)
                 else:
-                    logging.info(f"  - CACHE MISS: Material '{original_mat.name}' is simple and was not baked. Copying for export.")
+                    logging.info(f"  - Material '{original_mat.name}' is simple. Copying for export.")
+                    
+                    # --- THIS IS THE FIX (Applied here as well for consistency) ---
+                    sanitized_mat_name = re.sub(r'[\s.-]', '_', original_mat.name)
                     unique_copy_name = f"EXPORT_{sanitized_mat_name}"
+                    # --- END OF FIX ---
+
                     final_mat_for_export = original_mat.copy()
                     final_mat_for_export.name = unique_copy_name
                     self._export_data["temp_materials_for_cleanup"].append(final_mat_for_export)
-                    # --- THIS IS THE FIX ---
-                    # Store the FULL, final name including the "EXPORT_" prefix.
-                    self._export_data["material_name_map"][original_mat.name] = unique_copy_name
-                    # --- END OF FIX ---
 
                 if final_mat_for_export:
+                    self._export_data["material_name_map"][original_mat.name] = final_mat_for_export.name
                     obj.material_slots[slot_index].material = final_mat_for_export
-                
+                    
     def _build_material_from_textures(self, name, texture_paths):
         """
         [NEW HELPER] Creates and returns a new Blender material with a simple
