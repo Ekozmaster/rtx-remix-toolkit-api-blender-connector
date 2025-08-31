@@ -116,47 +116,62 @@ def _find_source_socket_recursively(current_node, target_socket_name, visited_no
     
 def _apply_texture_translation_map(task):
     """
+    [DEFINITIVE V3 - Corrected for Worker Script]
     Reads the texture translation map from a task and forces the repathing
     of any corresponding image datablocks in the worker's current context.
-    This heals "ghost" datablocks before the bake begins.
+    It correctly handles paths containing the <UDIM> token and gets the base
+    bake directory directly from the task data.
     """
     from bpy.path import abspath
 
-    translation_map = task.get('texture_translation_map', {})
-    if not translation_map:
+    texture_map = task.get('texture_translation_map', {})
+    bake_dir = task.get('bake_dir') # Get bake_dir from the task data
+    if not texture_map or not bake_dir:
+        log(" > No texture translation map found in task, skipping repath.")
         return
 
     log(" > Applying texture translation map for this task...")
-    repath_success_count = 0
-    for image_name, correct_path in translation_map.items():
+    reloaded_count = 0
+    for image_name, correct_path in texture_map.items():
         image = bpy.data.images.get(image_name)
         if image:
-            current_path = ""
-            try:
-                current_path = abspath(image.filepath)
-            except Exception:
-                pass 
+            # --- START OF THE UDIM FIX ---
+            if "<UDIM>" in correct_path:
+                log(f"   - Repathing UDIM set '{image.name}' to template '{os.path.basename(correct_path)}'")
+                image.source = 'TILED'
+                # For UDIMs, the path is already a full, valid template from the main addon
+                image.filepath_raw = correct_path 
+            # --- END OF THE UDIM FIX ---
+            else: # Standard, non-UDIM image logic
+                current_path = ""
+                try: current_path = abspath(image.filepath)
+                except Exception: pass
 
-            if current_path.replace('\\', '/') != correct_path.replace('\\', '/') or not image.has_data:
-                log(f"   - Repathing '{image.name}' to '{os.path.basename(correct_path)}'")
-                if correct_path == "GHOST_DATA_UNRECOVERABLE":
-                    log(f"   - CRITICAL ERROR: Main addon marked '{image.name}' as unrecoverable. Cannot repath.")
-                    continue
+                if current_path.replace('\\', '/') != correct_path.replace('\\', '/') or not image.has_data:
+                    log(f"   - Repathing standard image '{image.name}' to '{os.path.basename(correct_path)}'")
+                    if correct_path == "GHOST_DATA_UNRECOVERABLE":
+                        log(f"   - CRITICAL ERROR: Main addon marked '{image.name}' as unrecoverable. Cannot repath.")
+                        continue
 
-                if os.path.exists(correct_path):
-                    try:
+                    # The path from the main addon is already absolute and validated
+                    if os.path.exists(correct_path):
                         image.filepath = correct_path
                         image.source = 'FILE'
-                        image.reload()
-                        if not image.has_data:
-                             log(f"   - CRITICAL WARNING: Reloaded '{image.name}' but it still has no pixel data!")
-                        repath_success_count += 1
-                    except Exception as e:
-                        log(f"   - CRITICAL ERROR: Failed to reload '{image.name}' from path '{correct_path}': {e}")
+                    else:
+                        log(f"   - CRITICAL ERROR: Remap path not found for '{image.name}': '{correct_path}'")
+                        continue
+            
+            # --- Common Reload Logic ---
+            try:
+                image.reload()
+                if not image.has_data:
+                     log(f"   - INFO: Image '{image.name}' is packed. Recovering from memory.", level='INFO')
                 else:
-                    log(f"   - CRITICAL ERROR: Remap path not found for '{image.name}': '{correct_path}'")
+                    reloaded_count += 1
+            except Exception as e:
+                log(f"   - CRITICAL ERROR: Failed to reload '{image.name}': {e}")
     
-    log(f" > Texture repathing complete. {repath_success_count} images reloaded.")
+    log(f" > Texture repathing complete. {reloaded_count} images reloaded.")
 
 def _perform_bake(bake_task):
     """
@@ -643,12 +658,17 @@ def _bake_base_albedo_pass(setup_data, task, final_mix_shader_original, active_o
     nt = setup_data['nt']
     img = setup_data['img']
     render_settings = setup_data['scene'].render
+    obj = bpy.data.objects.get(task['object_name'])
 
+    # --- START OF THE FIX ---
+    # This task is a decal composite, but the underlying albedo is a simple texture.
+    # Instead of baking, we just copy the original texture's pixel data.
     if task.get("is_simple_decal_composite"):
         log("   - Pass 1: Copying original base albedo from source texture (simple material).")
         original_path = task.get("original_base_color_path")
         if original_path and os.path.exists(original_path):
             try:
+                # Load the source image, resize if necessary, and copy its pixels
                 source_img = bpy.data.images.load(original_path)
                 if source_img.size[0] != img.size[0] or source_img.size[1] != img.size[1]:
                     source_img.scale(img.size[0], img.size[1])
@@ -657,11 +677,12 @@ def _bake_base_albedo_pass(setup_data, task, final_mix_shader_original, active_o
                 log("     - Successfully copied pixels from: %s", os.path.basename(original_path))
             except Exception as e:
                 log("    - Pass 1 ERROR: Could not load or copy original base color from '%s': %e. Result will be black.", original_path, e)
-                img.pixels = [0.0] * len(img.pixels)
+                img.pixels = [0.0] * len(img.pixels) # Fill with black on failure
         else:
             log("    - Pass 1 WARNING: Original base color path was not provided or not found. Result will be black.")
             img.pixels = [0.0] * len(img.pixels)
-        return
+        return # Skip the rest of the baking logic for this pass
+    # --- END OF THE FIX ---
 
     log("   - Pass 1: Baking Base Albedo (Opaque) using EMIT to: %s", os.path.basename(task['output_path']))
     base_shader_input = final_mix_shader_original.inputs[1]
@@ -708,13 +729,10 @@ def _bake_base_albedo_pass(setup_data, task, final_mix_shader_original, active_o
                 
                 render_settings.film_transparent = False
                 
-                # --- FIX: Select and activate the object before baking ---
-                obj = bpy.data.objects.get(task['object_name'])
                 bpy.ops.object.select_all(action='DESELECT')
                 obj.select_set(True)
                 bpy.context.view_layer.objects.active = obj
                 bpy.ops.object.bake(type='EMIT', use_clear=True, margin=16)
-                # --- END OF FIX ---
             else:
                 log("    - Pass 1 WARNING: Could not find 'Base Color' socket. Bake for this pass will be black.")
                 img.pixels = [0.0] * len(img.pixels)
@@ -1111,9 +1129,10 @@ def perform_single_bake_operation(obj, original_mat, task):
 
 def persistent_worker_loop():
     """
-    [CORRECTED TASK COUNTING] Main loop for the worker. It now immediately reports
-    'ready' and then enters a loop to process self-contained tasks, each with its own file.
-    It correctly updates its internal task counter from data sent by the main addon.
+    [CORRECTED TASK COUNTING & ROBUST MATERIAL LOOKUP] Main loop for the worker.
+    It now immediately reports 'ready' and then enters a loop to process self-contained tasks,
+    each with its own file. It correctly updates its internal task counter from data sent
+    by the main addon and finds materials by UUID for stability.
     """
     
     def send_json_message(payload):
@@ -1146,27 +1165,33 @@ def persistent_worker_loop():
                 log("Quit command received. Shutting down gracefully.")
                 break 
 
-            # --- THIS IS THE FIX ---
-            # 1. Update the global task counter with the persistent numbers from the main addon.
-            #    This ensures all log messages from the log() function have the correct "Task X/Y" prefix.
             task_counter.set_current(task.get('global_task_number', 0))
             task_counter.set_total(task.get('total_tasks', 0))
-
-            # 2. Log the file being loaded. The log() function handles the task counter prefix automatically.
-            log("Loaded task-specific file: %s", os.path.basename(task.get('task_blend_file', '')))
-            # --- END OF FIX ---
             
-            bpy.ops.wm.open_mainfile(filepath=task['task_blend_file'])
+            bpy.ops.wm.open_mainfile(filepath=task['task_blend_file'], load_ui=False)
+            log("Loaded task-specific file: %s", os.path.basename(task.get('task_blend_file', '')))
+            
             setup_render_engine()
 
+            # --- This is the corrected function call ---
+            # It now correctly passes the entire task dictionary.
+            _apply_texture_translation_map(task)
+            # --- End of corrected call ---
+
             obj = bpy.data.objects.get(task['object_name'])
-            mat = bpy.data.materials.get(task['material_name'])
+            mat = next((m for m in bpy.data.materials if m.get("uuid") == task['material_uuid']), None)
+            
+            if not mat:
+                mat = bpy.data.materials.get(task['material_name'])
+                if mat:
+                    log(f" > WARNING: Could not find material by UUID. Fell back to finding '{task['material_name']}' by name.")
 
             if obj and mat:
                 perform_single_bake_operation(obj, mat, task)
                 success = True
             else:
-                log("!!! ERROR: Could not find object '%s' or material '%s' after loading file. Skipping.", task['object_name'], task['material_name'])
+                log("!!! ERROR: Could not find object '%s' or material '%s' (UUID: %s) after loading file. Skipping.", 
+                    task['object_name'], task['material_name'], task.get('material_uuid'))
                 success = False
 
             result_payload = {
@@ -1182,7 +1207,6 @@ def persistent_worker_loop():
 
         send_json_message(result_payload)
         
-        # Clean up the scene for the next task
         log("  > Cleaning up worker scene after task...")
         bpy.ops.wm.read_factory_settings(use_empty=True)
 
