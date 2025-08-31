@@ -158,73 +158,164 @@ def _apply_texture_translation_map(task):
     
     log(f" > Texture repathing complete. {repath_success_count} images reloaded.")
 
-def perform_bake_task(task):
+def _perform_bake(bake_task):
     """
-    [SURGICALLY IMPLEMENTED] This function now handles the entire lifecycle of a
-    single, self-contained bake task, including loading its own blend file,
-    setting up the render engine correctly, and safely cleaning up.
+    [DEFINITIVE DECAL FIX] Performs a single bake operation. This version
+    now contains special logic to handle the conceptual 'Decal Color' and
+    'Decal Alpha' tasks by temporarily rewiring the material's node tree.
     """
-    # Set the global task number and total for logging from the persistent task data.
-    global_num = task.get("global_task_number", task_counter.i + 1)
-    total_tasks = task.get("total_tasks", task_counter.total)
-    task_counter.set_current(global_num)
-    task_counter.set_total(total_tasks)
-
-    blend_file_for_task = task.get('task_blend_file')
-    if not blend_file_for_task or not os.path.exists(blend_file_for_task):
-        log(f"!!! BAKE TASK FAILED. Task blend file not found: {blend_file_for_task}")
+    obj = bpy.data.objects.get(bake_task['object_name'])
+    mat = bpy.data.materials.get(bake_task['material_name'])
+    if not obj or not mat:
+        log(f"  > BAKE ERROR: Could not find object '{bake_task['object_name']}' or material '{bake_task['material_name']}'. Skipping.")
         return False
 
-    # --- Load the self-contained blend file for this specific task ---
-    try:
-        bpy.ops.wm.open_mainfile(filepath=blend_file_for_task)
-        log(f"Loaded task-specific file: {os.path.basename(blend_file_for_task)}")
+    # --- Setup common to all bakes ---
+    scene = bpy.context.scene
+    scene.render.engine = 'CYCLES'
+    scene.cycles.samples = 16 # Low sample count is fine for this kind of baking
+    
+    # Set the target image for baking
+    image_settings = scene.render.image_settings
+    image_settings.file_format = 'PNG'
+    image_settings.color_mode = 'RGBA' if bake_task['is_color_data'] else 'BW'
+    image_settings.color_depth = '8'
+    
+    bake_image = bpy.data.images.new(
+        name=f"BakeTarget_{mat.name}_{bake_task['target_socket_name']}",
+        width=bake_task['resolution_x'],
+        height=bake_task['resolution_y'],
+        alpha=True
+    )
+    bake_image.filepath_raw = bake_task['output_path']
+    bake_image.file_format = 'PNG'
+
+    # Prepare the material's node tree
+    nt = mat.node_tree
+    tex_node = nt.nodes.new('ShaderNodeTexImage')
+    tex_node.image = bake_image
+    nt.nodes.active = tex_node
+    
+    # Ensure the correct UV map is active for the object
+    if bake_task['uv_layer'] and bake_task['uv_layer'] in obj.data.uv_layers:
+        obj.data.uv_layers.active = obj.data.uv_layers[bake_task['uv_layer']]
+        log(f"  > Setting active UV map for '{obj.name}' to '{bake_task['uv_layer']}' for baking.")
+    
+    original_links = {}
+    output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+    if not output_node:
+        log(f"  > BAKE ERROR: No active Material Output node in '{mat.name}'.")
+        return False
         
-        # The render engine MUST be set up AFTER loading the file, as loading
-        # the file overwrites the current scene's settings and render context.
-        setup_render_engine()
+    # Store original surface link to restore it later
+    surface_input = output_node.inputs['Surface']
+    if surface_input.is_linked:
+        original_links['Surface'] = surface_input.links[0]
 
-    except Exception as e:
-        log(f"!!! BAKE TASK FAILED. Could not load .blend file {blend_file_for_task}: {e}")
-        return False
+    # --- [START] NEW DECAL-AWARE LOGIC ---
+    target_socket_name = bake_task['target_socket_name']
+    
+    if target_socket_name in ['Decal Color', 'Decal Alpha']:
+        log(f"  > Performing special DECAL bake for socket '{target_socket_name}'...")
+        bsdf_node = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if not bsdf_node:
+            log(f"  > DECAL BAKE ERROR: Could not find a Principled BSDF in '{mat.name}'.")
+            return False
 
-    bake_target_obj_name = task['object_name']
-    bake_target_obj = bpy.data.objects.get(bake_target_obj_name)
+        # Find the Mix Shader that acts as the decal layer
+        mixer_start_node = surface_input.links[0].from_node
+        decal_mixer = _find_node_in_chain(mixer_start_node, 'MIX_SHADER', bsdf_node)
+        if not decal_mixer:
+            log(f"  > DECAL BAKE ERROR: Could not find the decal's Mix Shader in '{mat.name}'.")
+            return False
+        
+        emission = nt.nodes.new('ShaderNodeEmission')
+        
+        if target_socket_name == 'Decal Color':
+            # Isolate the decal's color information (Shader 2 input of the mix)
+            decal_shader_socket = decal_mixer.inputs[2]
+            if decal_shader_socket.is_linked:
+                # Connect the decal's shader output directly to the new Emission node
+                nt.links.new(decal_shader_socket.links[0].from_socket, emission.inputs['Color'])
+            else:
+                log("  > DECAL BAKE WARNING: Decal's color input is not linked. Bake might be black.")
 
-    if not bake_target_obj:
-        log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}'. Object not found after loading .blend file.")
-        return False
+        elif target_socket_name == 'Decal Alpha':
+            # Isolate the decal's alpha mask (the Factor input of the mix)
+            decal_fac_socket = decal_mixer.inputs['Fac']
+            if decal_fac_socket.is_linked:
+                # Connect the decal's factor directly to the new Emission node
+                nt.links.new(decal_fac_socket.links[0].from_socket, emission.inputs['Color'])
+            else:
+                log("  > DECAL BAKE WARNING: Decal's factor input is not linked. Bake might be black.")
 
+        # Hijack the material output to bake our isolated emission signal
+        _clear_socket_links(surface_input)
+        nt.links.new(emission.outputs['Emission'], surface_input)
+        
+        # We always use EMIT for these special bakes
+        scene.cycles.bake_type = 'EMIT'
+    
+    # --- [END] NEW DECAL-AWARE LOGIC ---
+    
+    else: # Standard bake logic for non-decal tasks
+        log(f"  > Performing {bake_task['bake_method']} bake for socket '{target_socket_name}'...")
+        if bake_task['bake_method'] == 'EMIT_HIJACK':
+            source_socket = _find_source_socket_iterative(nt, output_node, target_socket_name)
+            if not source_socket:
+                log(f"  > SIMPLE BAKE WARNING: Could not find socket '{target_socket_name}'. Skipping.")
+                # Return True because it's not a critical failure, just nothing to bake.
+                return True
+            
+            emission = nt.nodes.new('ShaderNodeEmission')
+            nt.links.new(source_socket, emission.inputs['Color'])
+            
+            _clear_socket_links(surface_input)
+            nt.links.new(emission.outputs['Emission'], surface_input)
+            scene.cycles.bake_type = 'EMIT'
+        else: # Native bake
+             scene.cycles.bake_type = bake_task['bake_type']
+
+    # --- Execute the Bake ---
     try:
-        # Set the correct UV map for the bake operation.
-        if bake_target_obj.data and bake_target_obj.data.uv_layers:
-            uv_map_for_bake = task.get('uv_layer')
-            if uv_map_for_bake and uv_map_for_bake in bake_target_obj.data.uv_layers:
-                log(f" > Setting active UV map for '{bake_target_obj_name}' to '{uv_map_for_bake}' for baking.")
-                bake_target_obj.data.uv_layers.active = bake_target_obj.data.uv_layers[uv_map_for_bake]
-        else:
-            log(f" > WARNING: No UV maps on '{bake_target_obj_name}'.")
-
-        # Find the material by its unique ID
-        original_mat = next((m for m in bpy.data.materials if m.get("uuid") == task['material_uuid']), None)
-        if not original_mat:
-            raise RuntimeError(f"Material UUID '{task['material_uuid']}' not found in loaded data.")
-
-        log(f"Starting Bake: Obj='{bake_target_obj.name}', Mat='{original_mat.name}', Type='{task['bake_type']}'")
-        perform_single_bake_operation(bake_target_obj, original_mat, task)
+        bpy.ops.object.bake(type=scene.cycles.bake_type, use_clear=True)
+        bake_image.save()
+        log("  > Bake successful.")
         return True
-
-    except Exception:
-        log(f"!!! BAKE TASK FAILED for '{bake_target_obj_name}' !!!")
-        log(traceback.format_exc())
+    except Exception as e:
+        log(f"  > BAKE CRITICAL FAILURE: {e}", level='ERROR')
         return False
     finally:
-        # --- CRITICAL CLEANUP STEP FOR PERSISTENT WORKER ---
-        # This wipes the slate clean by resetting to a blank factory state,
-        # preventing data from this task from affecting the next one.
-        log(" > Cleaning up worker scene after task...")
-        bpy.ops.wm.read_factory_settings(use_empty=True)
-        
+        # --- Cleanup ---
+        # Restore original node links
+        if 'Surface' in original_links:
+            _clear_socket_links(surface_input)
+            nt.links.new(original_links['Surface'].from_socket, surface_input)
+        # Remove temporary nodes
+        for node in nt.nodes:
+            if node.type in ('EMISSION', 'TEX_IMAGE') and "BakeTarget" in node.name:
+                nt.nodes.remove(node)
+        if bake_image:
+            bpy.data.images.remove(bake_image)
+
+# Helper function to find a specific node type by traversing backwards
+def _find_node_in_chain(start_node, target_type, end_node):
+    q = collections.deque([start_node])
+    visited = {start_node}
+    while q:
+        current = q.popleft()
+        if current.type == target_type:
+            return current
+        if current == end_node:
+            continue
+        for input_socket in current.inputs:
+            if input_socket.is_linked:
+                prev_node = input_socket.links[0].from_node
+                if prev_node not in visited:
+                    visited.add(prev_node)
+                    q.append(prev_node)
+    return None
+    
 def _recover_packed_image_for_bake(image_datablock):
     """
     [DEFINITIVE V2 - ROBUST RECOVERY]
@@ -923,14 +1014,11 @@ def _perform_simple_bake(setup_data, task, active_output_node):
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.bake(type=bake_type, use_clear=True, margin=16)
         img.save()
-
-    
+        
 def perform_single_bake_operation(obj, original_mat, task):
     """
     Orchestrates the entire bake operation for a single task,
     choosing between a 3-pass decal bake or a simple bake.
-    [SURGICALLY IMPLEMENTED]: The 'finally' block for cleanup has been removed,
-    as cleanup is now handled globally by the calling function.
     """
     setup_data = None
     decal_albedo_img = None
@@ -988,12 +1076,44 @@ def perform_single_bake_operation(obj, original_mat, task):
         log(f"!!! BAKE TASK FAILED for '{obj.name}' during operation !!!")
         log(traceback.format_exc())
         raise e
-    # --- The 'finally' block that was here has been REMOVED. ---
+    finally:
+        # --- Cleanup ---
+        if setup_data:
+            render_settings = setup_data['scene'].render
+            image_settings = setup_data['scene'].render.image_settings
+            original_settings = setup_data['original_settings']
+            
+            image_settings.file_format = original_settings['format']
+            image_settings.color_depth = original_settings['color_depth']
+            image_settings.compression = original_settings['compression']
+            render_settings.film_transparent = original_settings['film_transparent']
+
+            if obj and original_settings['original_mat_slot_index'] != -1:
+                try:
+                    obj.material_slots[original_settings['original_mat_slot_index']].material = original_settings['original_mat']
+                except Exception:
+                    pass
+            
+            if 'nt' in setup_data and 'tex_node' in setup_data and setup_data['nt'].nodes.get(setup_data['tex_node'].name):
+                setup_data['nt'].nodes.remove(setup_data['nt'].nodes.get(setup_data['tex_node'].name))
+            
+            mat_to_clean = bpy.data.materials.get(setup_data['mat_for_bake'].name)
+            if mat_to_clean:
+                bpy.data.materials.remove(mat_to_clean, do_unlink=True)
+
+            if setup_data.get('img') and setup_data['img'].name in bpy.data.images:
+                bpy.data.images.remove(setup_data['img'])
+
+        if decal_albedo_img and decal_albedo_img.name in bpy.data.images:
+            bpy.data.images.remove(decal_albedo_img)
+        if decal_alpha_img and decal_alpha_img.name in bpy.data.images:
+            bpy.data.images.remove(decal_alpha_img)
 
 def persistent_worker_loop():
     """
-    [SURGICALLY IMPLEMENTED] Main loop for the worker. It now immediately reports
+    [CORRECTED TASK COUNTING] Main loop for the worker. It now immediately reports
     'ready' and then enters a loop to process self-contained tasks, each with its own file.
+    It correctly updates its internal task counter from data sent by the main addon.
     """
     
     def send_json_message(payload):
@@ -1001,9 +1121,6 @@ def persistent_worker_loop():
         print(json.dumps(payload), flush=True)
 
     try:
-        # The initial, one-time render setup and file load is removed.
-        # It is now handled inside perform_bake_task to ensure a correct
-        # state for every bake.
         log("Persistent worker started. Initializing...")
         send_json_message({"status": "ready"})
         log("Worker is READY. Awaiting bake tasks...")
@@ -1021,14 +1138,37 @@ def persistent_worker_loop():
             break
             
         result_payload = {}
+        success = False
+        task = {}
         try:
             task = json.loads(line)
             if task.get("action") == "quit":
                 log("Quit command received. Shutting down gracefully.")
                 break 
 
-            # Each task is now processed by the function that handles file loading.
-            success = perform_bake_task(task)
+            # --- THIS IS THE FIX ---
+            # 1. Update the global task counter with the persistent numbers from the main addon.
+            #    This ensures all log messages from the log() function have the correct "Task X/Y" prefix.
+            task_counter.set_current(task.get('global_task_number', 0))
+            task_counter.set_total(task.get('total_tasks', 0))
+
+            # 2. Log the file being loaded. The log() function handles the task counter prefix automatically.
+            log("Loaded task-specific file: %s", os.path.basename(task.get('task_blend_file', '')))
+            # --- END OF FIX ---
+            
+            bpy.ops.wm.open_mainfile(filepath=task['task_blend_file'])
+            setup_render_engine()
+
+            obj = bpy.data.objects.get(task['object_name'])
+            mat = bpy.data.materials.get(task['material_name'])
+
+            if obj and mat:
+                perform_single_bake_operation(obj, mat, task)
+                success = True
+            else:
+                log("!!! ERROR: Could not find object '%s' or material '%s' after loading file. Skipping.", task['object_name'], task['material_name'])
+                success = False
+
             result_payload = {
                 "status": "success" if success else "failure",
                 "details": f"Task for material {task.get('material_name')} on {task.get('object_name')}"
@@ -1037,9 +1177,14 @@ def persistent_worker_loop():
             result_payload = {"status": "error", "details": f"invalid_json: {line}"}
         except Exception as e:
             log(f"!!! UNHANDLED WORKER ERROR during task loop: {e}")
+            log(traceback.format_exc())
             result_payload = {"status": "error", "details": str(e)}
 
         send_json_message(result_payload)
+        
+        # Clean up the scene for the next task
+        log("  > Cleaning up worker scene after task...")
+        bpy.ops.wm.read_factory_settings(use_empty=True)
 
     log("Worker task processing complete. Exiting.")
 
