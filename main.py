@@ -420,8 +420,8 @@ class RemixIngestorPreferences(AddonPreferences):
         default=False
     )
     remix_bake_material_only: BoolProperty(
-        name="Enable simplistic hashing to bake less.",
-        description="Do not enable if you are using the same procedral material across different objects.",
+        name="Material-Centric Bake Hashing",
+        description="Decides whether to bake based only on the material's properties, ignoring object-specific data. This results in fewer bakes if the same material is used on multiple objects. Disable if the same procedural material needs to look different on each different object.",
         default=True
     )
     remix_export_scale: FloatProperty(
