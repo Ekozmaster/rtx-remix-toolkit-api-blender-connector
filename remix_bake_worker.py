@@ -165,7 +165,8 @@ def _apply_texture_translation_map(task):
             try:
                 image.reload()
                 if not image.has_data:
-                     log(f"   - INFO: Image '{image.name}' is packed. Recovering from memory.", level='INFO')
+                     # --- THIS IS THE FIX: Removed the invalid 'level' argument ---
+                     log(f"   - INFO: Image '{image.name}' is packed. Recovering from memory.")
                 else:
                     reloaded_count += 1
             except Exception as e:
@@ -298,7 +299,8 @@ def _perform_bake(bake_task):
         log("  > Bake successful.")
         return True
     except Exception as e:
-        log(f"  > BAKE CRITICAL FAILURE: {e}", level='ERROR')
+        # --- THIS IS THE FIX: Removed the invalid 'level' argument ---
+        log(f"  > BAKE CRITICAL FAILURE: {e}")
         return False
     finally:
         # --- Cleanup ---
@@ -585,8 +587,8 @@ def _get_socket_to_bake(node_tree, target_socket_name):
 
 def _setup_bake_environment(task, obj, original_mat):
     """
-    Sets up the bake environment, including scene settings, temporary materials, and images.
-    Returns a dictionary containing the setup data and original settings for cleanup.
+    [V2] Sets up the bake environment. The 'original_mat' is now guaranteed to be the
+    exact datablock from the object's material slot.
     """
     scene = bpy.context.scene
     render_settings = scene.render
@@ -609,14 +611,20 @@ def _setup_bake_environment(task, obj, original_mat):
     if not nt:
         raise RuntimeError("Material copy failed.")
 
+    # --- START OF THE FIX ---
+    # The 'original_mat' passed to this function is now the exact datablock from the
+    # object's slot. We can use a direct reference comparison to find its index.
     original_mat_slot_index = -1
     for i, slot in enumerate(obj.material_slots):
         if slot.material == original_mat:
             slot.material = mat_for_bake
             original_mat_slot_index = i
             break
+    # --- END OF THE FIX ---
+
     if original_mat_slot_index == -1:
-        raise RuntimeError("Could not find original material on object.")
+        # This error should now be virtually impossible to hit, but is kept as a safeguard.
+        raise RuntimeError("Could not find original material on object (logic error).")
     original_settings['original_mat_slot_index'] = original_mat_slot_index
 
     img = bpy.data.images.new(
@@ -629,13 +637,10 @@ def _setup_bake_environment(task, obj, original_mat):
     image_settings.color_depth = '16' if is_high_precision else '8'
     image_settings.compression = 0 if is_high_precision else 15
 
-    # --- FIX #1: Correctly set Non-Color for data maps with a safe default ---
-    # The default for .get() is now False, which is safer.
     if not task.get('is_color_data', False):
         img.colorspace_settings.name = 'Non-Color'
     else:
         img.colorspace_settings.name = 'sRGB'
-    # --- END OF FIX ---
 
     tex_node = nt.nodes.new('ShaderNodeTexImage')
     tex_node.image = img
@@ -954,19 +959,24 @@ def _composite_decal_bakes(img, decal_albedo_img, decal_alpha_img):
 
 def _perform_simple_bake(setup_data, task, active_output_node):
     """
-    [CORRECTED - V4] Performs a simple, single-pass bake. This version adds a
-    type check to correctly handle the assignment of default values from vector/color
-    sockets (like Displacement) to float sockets (like Emission Strength), preventing
-    the bpy_prop_array TypeError.
+    [CORRECTED - V5 NORMAL MAP FIX] Performs a simple, single-pass bake. This version
+    now forces the bake type to 'NORMAL' when the target socket is 'Normal', ensuring
+    correct vector data is generated. It also retains the previous fix for handling
+    vector-to-float default value assignments.
     """
     nt = setup_data['nt']
     img = setup_data['img']
     obj = bpy.data.objects.get(task['object_name'])
-    bake_type = task['bake_type']
+    
+    # --- START OF THE FIX ---
+    # Determine the correct bake type. If the task is for a Normal map,
+    # we MUST override any other setting and use the native 'NORMAL' bake type.
+    bake_type = 'NORMAL' if task['target_socket_name'] == 'Normal' else task['bake_type']
+    # --- END OF THE FIX ---
 
     bpy.context.scene.render.engine = 'CYCLES'
 
-    if bake_type == 'EMIT' or bake_type == 'DISPLACEMENT':
+    if bake_type in ['EMIT', 'DISPLACEMENT']:
         log(f" > Performing EMIT bake for socket '{task['target_socket_name']}'...")
         
         socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
@@ -988,24 +998,16 @@ def _perform_simple_bake(setup_data, task, active_output_node):
                 input_socket_name = 'Strength' if task.get('is_value_bake') else 'Color'
                 nt.links.new(socket_to_bake.links[0].from_socket, emission_node.inputs[input_socket_name])
             else:
-                # Handle the default value correctly
                 input_socket = emission_node.inputs['Strength' if task.get('is_value_bake') else 'Color']
                 
-                # --- START OF FIX ---
-                # This handles the case where the source default_value is an array (e.g., from a
-                # Vector or Color socket) but the destination expects a single float.
                 is_source_array = hasattr(socket_to_bake.default_value, '__len__')
                 is_dest_array = hasattr(input_socket.default_value, '__len__')
 
                 if is_source_array and not is_dest_array:
-                    # Convert array (vector/color) to a single value by averaging its components.
-                    # This correctly handles converting a Displacement vector to Emission Strength.
                     avg_val = sum(socket_to_bake.default_value[:3]) / 3.0
                     input_socket.default_value = avg_val
                 else:
-                    # If types are compatible (float->float, vector->color), assign directly.
                     input_socket.default_value = socket_to_bake.default_value
-                # --- END OF FIX ---
 
             if active_output_node:
                 nt.links.new(emission_node.outputs['Emission'], active_output_node.inputs['Surface'])
@@ -1018,14 +1020,13 @@ def _perform_simple_bake(setup_data, task, active_output_node):
             img.save()
 
         finally:
-            # Cleanup the node hijacking
             if emission_node.name in nt.nodes:
                 nt.nodes.remove(emission_node)
-            # Restore the original connection using the safely stored sockets.
             if original_from_socket and original_to_socket:
                 if original_from_socket.node.name in nt.nodes and original_to_socket.node.name in nt.nodes:
                     nt.links.new(original_from_socket, original_to_socket)
     else:
+        # This 'else' block now correctly handles the 'NORMAL' bake type, as well as any other native types.
         log(f" > Performing NATIVE bake for type '{bake_type}'...")
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
@@ -1129,10 +1130,9 @@ def perform_single_bake_operation(obj, original_mat, task):
 
 def persistent_worker_loop():
     """
-    [CORRECTED TASK COUNTING & ROBUST MATERIAL LOOKUP] Main loop for the worker.
-    It now immediately reports 'ready' and then enters a loop to process self-contained tasks,
-    each with its own file. It correctly updates its internal task counter from data sent
-    by the main addon and finds materials by UUID for stability.
+    [CORRECTED TASK COUNTING & ROBUST MATERIAL LOOKUP V2] Main loop for the worker.
+    It now finds the material to bake by checking the object's actual material slots
+    against the UUID/name from the task, ensuring the correct datablock is used.
     """
     
     def send_json_message(payload):
@@ -1172,25 +1172,34 @@ def persistent_worker_loop():
             log("Loaded task-specific file: %s", os.path.basename(task.get('task_blend_file', '')))
             
             setup_render_engine()
-
-            # --- This is the corrected function call ---
-            # It now correctly passes the entire task dictionary.
             _apply_texture_translation_map(task)
-            # --- End of corrected call ---
 
             obj = bpy.data.objects.get(task['object_name'])
-            mat = next((m for m in bpy.data.materials if m.get("uuid") == task['material_uuid']), None)
+            # --- START OF THE FIX ---
+            # Find the specific material datablock that is assigned to the object,
+            # matching the identifiers from the task. This is more robust than a global search.
+            mat_to_bake = None
+            if obj:
+                # First, try to find the material on the object by its unique ID.
+                for slot in obj.material_slots:
+                    if slot.material and slot.material.get("uuid") == task['material_uuid']:
+                        mat_to_bake = slot.material
+                        break
+                
+                # If not found by UUID (e.g., older data), fall back to matching by name.
+                if not mat_to_bake:
+                    for slot in obj.material_slots:
+                        if slot.material and slot.material.name == task['material_name']:
+                            mat_to_bake = slot.material
+                            log(f" > WARNING: Could not find material by UUID on object. Fell back to name '{task['material_name']}'.")
+                            break
+            # --- END OF THE FIX ---
             
-            if not mat:
-                mat = bpy.data.materials.get(task['material_name'])
-                if mat:
-                    log(f" > WARNING: Could not find material by UUID. Fell back to finding '{task['material_name']}' by name.")
-
-            if obj and mat:
-                perform_single_bake_operation(obj, mat, task)
+            if obj and mat_to_bake:
+                perform_single_bake_operation(obj, mat_to_bake, task)
                 success = True
             else:
-                log("!!! ERROR: Could not find object '%s' or material '%s' (UUID: %s) after loading file. Skipping.", 
+                log("!!! ERROR: Could not find object '%s' or assigned material '%s' (UUID: %s) after loading file. Skipping.", 
                     task['object_name'], task['material_name'], task.get('material_uuid'))
                 success = False
 
