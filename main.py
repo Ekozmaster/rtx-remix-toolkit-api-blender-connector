@@ -74,9 +74,11 @@ BAKE_BATCH_SIZE_PER_WORKER = 5
 
 SOCKET_TO_SPECIAL_TYPE_MAP = {
     "Displacement": "HEIGHT",
-    "Emission Color": "EMISSIVE", # CORRECTED: Changed "Emission" to "Emission Color"
+    "Emission Color": "EMISSIVE",
     "Anisotropy": "ANISOTROPY",
-    "Transmission": "TRANSMITTANCE"
+    "Transmission": "TRANSMITTANCE",
+    "Subsurface Color": "SINGLE_SCATTERING",
+    "Subsurface Radius": "MEASUREMENT_DISTANCE"
 }
 
 def get_sentinel_path():
@@ -1927,12 +1929,16 @@ def handle_special_texture_assignments(self, context, reference_prim, export_dat
         ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
         server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
 
+        # --- SURGICAL CHANGE START ---
         SPECIAL_TEXTURE_MAP = {
             "HEIGHT": "height_texture",
             "EMISSIVE": "emissive_mask_texture",
             "ANISOTROPY": "anisotropy_texture",
             "TRANSMITTANCE": "transmittance_texture",
+            "SINGLE_SCATTERING": "subsurface_color_texture",
+            "MEASUREMENT_DISTANCE": "subsurface_radius_texture"
         }
+        # --- SURGICAL CHANGE END ---
 
         # This loop now correctly builds the list of files to upload
         for mat_name, texture_list in assignments_by_original_mat_name.items():
@@ -1952,10 +1958,12 @@ def handle_special_texture_assignments(self, context, reference_prim, export_dat
             logging.warning("No valid special textures found to upload.")
             return {'FINISHED'}
 
-        # (The ingestion payload and request can remain the same)
+        # --- SURGICAL CHANGE START: Replacing the payload ---
         logging.info(f"Ingesting {len(textures_for_ingest)} total special textures...")
         base_api_url = addon_prefs.remix_export_url.rstrip('/')
-        ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [{ "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False }], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [0, "Initializing", True] } }, "check_plugins": [ {"name": "MaterialShaders", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllMaterials"}], "data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "shader_subidentifiers": {"AperturePBR_Opacity": ".*"}}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, {"name": "ConvertToDDS", "selector_plugins": [{"data": {"channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "select_from_root_layer_only": False}, "name": "AllShaders"}], "resultor_plugins": [{"data": {"channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}, "name": "FileCleanup"}], "data": {"channel": "Default", "conversion_args": {"inputs:diffuse_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:emissive_mask_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:height_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max"]}}, "cook_mass_template": False, "data_flows": [{"channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True}, {"channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True}, {"channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True}], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True], "save_on_fix_failure": True, "suffix": ".rtex.dds"}, "stop_if_fix_failed": True, "context_plugin": {"data": {"channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [0, "Initializing", True], "save_on_exit": False}, "name": "CurrentStage"}}, ], "resultor_plugins": [{"name": "FileMetadataWritter", "data": {"channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [0, "Initializing", True]}}] }
+        ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [ { "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False } ], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [ 0, "Initializing", True ] } }, "check_plugins": [ { "name": "MaterialShaders", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllMaterials" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True, "shader_subidentifiers": { "AperturePBR_Opacity": ".*" } }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToOctahedral", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:normalmap_texture": { "encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal" } }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToDDS", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:diffuse_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:emissive_mask_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:height_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max" ] }, "inputs:metallic_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:normalmap_texture": { "args": [ "--format", "bc5", "--no-mip-gamma-correct" ] }, "inputs:reflectionroughness_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:transmittance_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:subsurface_color_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:subsurface_radius_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]} }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True }, { "channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True }, { "channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds" }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "MassTexturePreview", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "Nothing" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } } ], "resultor_plugins": [ { "name": "FileMetadataWritter", "data": { "channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] } } ] }
+        # --- SURGICAL CHANGE END ---
+
         ingest_payload["context_plugin"]["data"]["input_files"] = textures_for_ingest
         ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
         ingest_response = make_request_with_retries('POST', f"{base_api_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl)
@@ -4445,7 +4453,7 @@ class OBJECT_OT_export_and_ingest(Operator):
         addon_prefs = context.preferences.addons[__name__].preferences
         bake_method = addon_prefs.bake_method
         use_simplistic_hashing = addon_prefs.remix_bake_material_only
-    
+
         logging.info("Analyzing materials with corrected decal+simple texture logic...")
         self._identify_and_prepare_udim_atlases(objects_to_process)
 
@@ -4459,7 +4467,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                 mat = slot.material
                 if not mat or not mat.use_nodes:
                     continue
-            
+        
                 material_hash = get_material_hash(mat, obj, slot_index, image_hash_cache=global_image_hash_cache, bake_method=bake_method, ignore_mesh_context=use_simplistic_hashing)
 
                 if material_hash in processed_material_hashes_this_session:
@@ -4479,7 +4487,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
                 bsdf, output_node = self._find_bsdf_and_output_nodes(mat.node_tree)
                 mat_uuid = mat.get("uuid", str(uuid.uuid4())); mat["uuid"] = mat_uuid
-            
+        
                 if self._material_uses_udims(mat):
                     # This correct UDIM logic remains unchanged
                     logging.info(f"  - UDIM material detected: '{mat.name}'. Forcing full atlas bake for all connected channels.")
@@ -4496,6 +4504,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                         'bake_method': bake_method, 'material_uuid': mat_uuid, 'uses_udims': True,
                         'material_hash': material_hash
                     }
+                    # --- SURGICAL CHANGE START ---
                     pbr_channels_to_bake = [
                         (output_node.inputs.get('Surface'), ("Base Color", 'EMIT', False, True)), 
                         (output_node.inputs.get('Displacement'), ("Displacement", 'EMIT', True, False)),
@@ -4504,11 +4513,14 @@ class OBJECT_OT_export_and_ingest(Operator):
                         (bsdf.inputs.get("Roughness") if bsdf else None, ("Roughness", 'EMIT', True, False)),
                         (bsdf.inputs.get("Alpha") if bsdf else None, ("Alpha", 'EMIT', True, False)),
                         (bsdf.inputs.get("Emission Color") if bsdf else None, ("Emission Color", 'EMIT', False, True)),
+                        (bsdf.inputs.get("Subsurface Color") if bsdf else None, ("Subsurface Color", 'EMIT', False, True)),
+                        (bsdf.inputs.get("Subsurface Radius") if bsdf else None, ("Subsurface Radius", 'EMIT', True, False)),
                     ]
+                    # --- SURGICAL CHANGE END ---
                     for socket, channel_details in pbr_channels_to_bake:
                         if socket and socket.is_linked:
                             tasks.append(self._create_bake_task(obj, mat, channel_details, base_bake_settings, bake_info, SOCKET_TO_SPECIAL_TYPE_MAP))
-            
+        
                 elif self._material_has_decal_setup(mat):
                     logging.info(f"  - Decal setup found on NON-UDIM material '{mat.name}'. Flagging 'Base Color' for composite bake.")
                     res_x, res_y = 2048, 2048; max_w, max_h = self._find_largest_texture_resolution_recursive(mat.node_tree)
@@ -4532,7 +4544,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                         base_color_task['original_base_color_path'] = base_albedo_path
                     tasks.append(base_color_task)
 
-                    # --- SURGICAL FIX FOR SIMPLE TEXTURES ON DECAL MATERIALS START ---
+                    # --- SURGICAL CHANGE START ---
                     pbr_channels_to_check = [
                         ("Normal", 'NORMAL', False, False), 
                         ("Metallic", 'EMIT', True, False), 
@@ -4540,8 +4552,11 @@ class OBJECT_OT_export_and_ingest(Operator):
                         ("Displacement", 'EMIT', True, False),
                         ("Emission Color", 'EMIT', False, True),
                         ("Anisotropy", 'EMIT', True, False),
-                        ("Transmission", 'EMIT', True, False)
+                        ("Transmission", 'EMIT', True, False),
+                        ("Subsurface Color", 'EMIT', False, True),
+                        ("Subsurface Radius", 'EMIT', True, False)
                     ]
+                    # --- SURGICAL CHANGE END ---
                     for channel_name, *details in pbr_channels_to_check:
                         socket = (bsdf.inputs.get(channel_name) if bsdf else None) or (output_node and output_node.inputs.get(channel_name))
                         if socket and socket.is_linked:
@@ -4556,7 +4571,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                                     if material_hash not in bake_info['cached_materials']:
                                         bake_info['cached_materials'][material_hash] = {}
                                     bake_info['cached_materials'][material_hash][channel_name] = texture_path
-                                
+                            
                                     # If this simple texture is a special type, also add it to the special info list.
                                     if channel_name in SOCKET_TO_SPECIAL_TYPE_MAP:
                                         bake_info['special_texture_info'][(obj.name, mat.name)].append({
@@ -4564,8 +4579,7 @@ class OBJECT_OT_export_and_ingest(Operator):
                                             'type': SOCKET_TO_SPECIAL_TYPE_MAP[channel_name]
                                         })
                                         logging.info(f"    - Decal Material: Flagged simple texture '{channel_name}' for special server handling.")
-                    # --- SURGICAL FIX FOR SIMPLE TEXTURES ON DECAL MATERIALS END ---
-        
+    
                 elif not self._is_material_simple(mat):
                     # This logic for other complex materials remains correct and unchanged.
                     logging.info(f"  - Complex NON-UDIM material detected: '{mat.name}'. Generating tasks for all connected channels.")
@@ -4585,7 +4599,19 @@ class OBJECT_OT_export_and_ingest(Operator):
                             (output_node.inputs.get('Displacement'), ("Displacement", 'EMIT', True, False))
                         ])
                     if bsdf:
-                        pbr_channels = [("Normal", 'NORMAL', False, False), ("Metallic", 'EMIT', True, False), ("Roughness", 'EMIT', True, False), ("Alpha", 'EMIT', True, False), ("Emission Color", 'EMIT', False, True), ("Anisotropy", 'EMIT', True, False), ("Transmission", 'EMIT', True, False)]
+                        # --- SURGICAL CHANGE START ---
+                        pbr_channels = [
+                            ("Normal", 'NORMAL', False, False), 
+                            ("Metallic", 'EMIT', True, False), 
+                            ("Roughness", 'EMIT', True, False), 
+                            ("Alpha", 'EMIT', True, False), 
+                            ("Emission Color", 'EMIT', False, True), 
+                            ("Anisotropy", 'EMIT', True, False), 
+                            ("Transmission", 'EMIT', True, False),
+                            ("Subsurface Color", 'EMIT', False, True),
+                            ("Subsurface Radius", 'EMIT', True, False)
+                        ]
+                        # --- SURGICAL CHANGE END ---
                         for name, *details in pbr_channels: 
                             sockets_to_check.append((bsdf.inputs.get(name), (name, *details)))
                     elif not bsdf:
@@ -4599,16 +4625,24 @@ class OBJECT_OT_export_and_ingest(Operator):
                             tasks_for_this_mat.append(channel_details)
                     for channel_details in set(tasks_for_this_mat):
                         tasks.append(self._create_bake_task(obj, mat, channel_details, base_bake_settings, bake_info, SOCKET_TO_SPECIAL_TYPE_MAP))
-            
+        
                 else: 
                     # This logic for simple materials remains correct and unchanged.
                     logging.info(f"  - Simple NON-UDIM material detected: '{mat.name}'. Caching texture paths.")
+                    # --- SURGICAL CHANGE START ---
                     all_pbr_channels_to_check = [
-                        ("Base Color", 'EMIT', False, True), ("Normal", 'NORMAL', False, False), 
-                        ("Metallic", 'EMIT', True, False), ("Roughness", 'EMIT', True, False), 
-                        ("Displacement", 'EMIT', True, False), ("Emission Color", 'EMIT', False, True),
-                        ("Anisotropy", 'EMIT', True, False), ("Transmission", 'EMIT', True, False)
+                        ("Base Color", 'EMIT', False, True), 
+                        ("Normal", 'NORMAL', False, False), 
+                        ("Metallic", 'EMIT', True, False), 
+                        ("Roughness", 'EMIT', True, False), 
+                        ("Displacement", 'EMIT', True, False), 
+                        ("Emission Color", 'EMIT', False, True),
+                        ("Anisotropy", 'EMIT', True, False), 
+                        ("Transmission", 'EMIT', True, False),
+                        ("Subsurface Color", 'EMIT', False, True),
+                        ("Subsurface Radius", 'EMIT', True, False)
                     ]
+                    # --- SURGICAL CHANGE END ---
                     for channel_name, *details in all_pbr_channels_to_check:
                         socket = (bsdf.inputs.get(channel_name) if bsdf else None) or (output_node.inputs.get(channel_name) if output_node else None)
                         if socket and socket.is_linked:
@@ -4627,7 +4661,6 @@ class OBJECT_OT_export_and_ingest(Operator):
         bake_info['tasks'] = tasks
         if tasks: logging.info(f"Generated {len(tasks)} targeted bake tasks.")
         return tasks, bake_info['cached_materials'], bake_dir, bake_info.get('special_texture_info', {})
-
     
     def _launch_persistent_worker(self):
         """Launches a single persistent worker and starts the communication threads."""
