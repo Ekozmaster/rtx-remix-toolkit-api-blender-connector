@@ -4046,9 +4046,10 @@ class OBJECT_OT_export_and_ingest(Operator):
 
     def _create_bake_task(self, obj, mat, channel_details, bake_settings, bake_info, special_texture_map):
         """
-        [UUID-BASED & CORRECTED FILENAME & HASH TRACKING]
-        Creates a dictionary for a single bake task. Now uses a sanitized final
-        socket name for file naming and includes the material_hash for caching.
+        [DEFINITIVE FILENAME FIX]
+        Creates a dictionary for a single bake task. The output filename now
+        incorporates the unique material_hash to prevent overwrites when the same
+        material is baked multiple times with different mesh contexts.
         """
         channel_name, bake_type, is_val, is_color = channel_details
         safe_mat_name = "".join(c for c in mat.name if c.isalnum() or c in ('_', '-')).strip()
@@ -4060,9 +4061,20 @@ class OBJECT_OT_export_and_ingest(Operator):
         else:
             final_socket_name = channel_name.replace(' ', '')
 
-        mat_uuid = bake_settings.get('material_uuid', str(uuid.uuid4()))
+        # --- START OF THE FIX ---
+        # The material_hash is guaranteed to be unique for each bake context
+        # when "simplistic hashing" is disabled. We use it to create a unique filename.
+        material_hash = bake_settings.get('material_hash')
+        if not material_hash:
+            # This is a fallback in case the hash is missing, which should not happen in a normal run.
+            # Using a random UUID here prevents a crash but indicates a logic error elsewhere.
+            logging.critical("CRITICAL WARNING: Material hash missing during task creation. Filename may conflict.")
+            material_hash = uuid.uuid4().hex
 
-        output_filename = f"{safe_mat_name}_{mat_uuid}_{final_socket_name}.png"
+        # Construct the new, unique filename using the first 16 characters of the hash.
+        output_filename = f"{safe_mat_name}_{material_hash[:16]}_{final_socket_name}.png"
+        # --- END OF THE FIX ---
+
         output_path = os.path.join(bake_info['bake_dir'], output_filename)
 
         if channel_name in special_texture_map:
@@ -4075,7 +4087,7 @@ class OBJECT_OT_export_and_ingest(Operator):
 
         return {
             "material_name": mat.name,
-            "material_uuid": mat_uuid,
+            "material_uuid": bake_settings.get('material_uuid', str(uuid.uuid4())),
             "object_name": obj.name,
             "bake_type": final_bake_type,
             "output_path": output_path,
@@ -4087,9 +4099,9 @@ class OBJECT_OT_export_and_ingest(Operator):
             "uv_layer": bake_settings['uv_layer'],
             "bake_dir": bake_info['bake_dir'],
             "bake_method": bake_settings['bake_method'],
-            "material_hash": bake_settings.get('material_hash') # <-- THIS LINE IS ADDED
+            "material_hash": material_hash
         }
-    
+        
     def _identify_and_prepare_udim_atlases(self, objects_to_process):
         """
         Performs a pre-pass to find objects with UDIM materials and creates the
@@ -5546,7 +5558,9 @@ class OBJECT_OT_export_and_ingest(Operator):
                 obj.select_set(True)
             context.view_layer.objects.active = selectable_meshes[0]
 
+            # --- SURGICAL CHANGE START: Ensure correct UV map is active for ALL material types ---
             for obj in final_meshes_for_obj:
+                # First, handle the special case for UDIMs which MUST use the atlas map.
                 uses_stitched_material = any(
                     slot.material and slot.material.name.endswith("__UDIM_STITCHED") 
                     for slot in obj.material_slots
@@ -5556,6 +5570,21 @@ class OBJECT_OT_export_and_ingest(Operator):
                         self._export_data['original_active_uvs'][obj.name] = obj.data.uv_layers.active.name
                     obj.data.uv_layers.active = obj.data.uv_layers["remix_atlas_uv"]
                     logging.info(f"  > Set active UV map to 'remix_atlas_uv' for '{obj.name}' for export.")
+                
+                # THEN, handle all other standard materials that were baked.
+                else:
+                    # Look up the UV map that was recorded when bake tasks were created for this object.
+                    bake_tasks_for_obj = [t for t in bake_info.get('tasks', []) if t['object_name'] == obj.name]
+                    if bake_tasks_for_obj:
+                        # All tasks for one object should use the same UV map.
+                        target_uv_name = bake_tasks_for_obj[0].get('uv_layer')
+                        if target_uv_name and target_uv_name in obj.data.uv_layers:
+                             if obj.data.uv_layers.active and obj.data.uv_layers.active.name != target_uv_name:
+                                # Store the original active map if we are about to change it.
+                                self._export_data['original_active_uvs'][obj.name] = obj.data.uv_layers.active.name
+                                obj.data.uv_layers.active = obj.data.uv_layers[target_uv_name]
+                                logging.info(f"  > Set active UV map to '{target_uv_name}' for '{obj.name}' to match bake settings.")
+            # --- SURGICAL CHANGE END ---
 
             logging.info(f" > Exporting {len(context.selected_objects)} objects to OBJ...")
             bpy.ops.wm.obj_export(
@@ -5582,7 +5611,7 @@ class OBJECT_OT_export_and_ingest(Operator):
             logging.error(f"Export finalization failed: {e}", exc_info=True)
             self.report({'ERROR'}, f"Finalization failed: {e}")
             raise RuntimeError(f"Finalization process failed.") from e
-        
+            
     def _find_ultimate_source_node(self, start_socket):
         """
         [IMPROVED & RENAMED] Traces back from a socket to find the ultimate source node.
@@ -5823,22 +5852,27 @@ class OBJECT_OT_export_and_ingest(Operator):
                     # If a UV coord points to a tile that doesn't exist, collapse it to zero.
                     atlas_uv_layer.data[loop_index].uv = (0.0, 0.0)
 
+        
     def _prepare_materials_for_export(self, context, objects_to_process, texture_cache, baked_material_uuids):
         """
-        [DEFINITIVE V6 - UDIM CACHING FIX]
-        This version corrects a critical bug where a cached UDIM material would be
-        unnecessarily re-stitched on a subsequent export. The logic is now reordered to
-        prioritize checking for cached textures before performing any material analysis.
+        [DEFINITIVE V8 - MATERIAL-CENTRIC RE-ASSEMBLY]
+        This version implements a more efficient material-centric approach, fixing the bug
+        where disabling "simplistic hashing" resulted in no textures. It creates the minimum
+        number of new materials required by grouping objects based on their calculated bake
+        hash. All objects that share an identical baking context will now share a single,
+        correctly-textured baked material.
         """
-        logging.info("Preparing unique materials for export (with UDIM Cache Fix)...")
+        logging.info("Preparing materials for export (Material-Centric Re-assembly)...")
         addon_prefs = context.preferences.addons[__name__].preferences
         bake_method = addon_prefs.bake_method
 
+        # Store the original state before we modify anything.
         self._export_data["material_name_map"] = {}
         self._export_data["original_material_assignments"] = {
             obj.name: [s.material for s in obj.material_slots] for obj in objects_to_process if obj
         }
 
+        # First, find all unique materials and the objects that use them.
         materials_to_process = defaultdict(list)
         for obj in objects_to_process:
             if obj:
@@ -5846,46 +5880,65 @@ class OBJECT_OT_export_and_ingest(Operator):
                     if slot.material:
                         materials_to_process[slot.material].append(obj)
 
+        # --- START OF THE NEW, MATERIAL-CENTRIC LOGIC ---
         for original_mat, objects_using_mat in materials_to_process.items():
-            mat_uuid = original_mat.get("uuid", str(uuid.uuid4()))
-            original_mat["uuid"] = mat_uuid
-    
-            final_mat_for_export = None
+            
+            # Handle the special case for UDIMs first, as they are stitched once per material.
+            if self._material_uses_udims(original_mat):
+                logging.info(f"  - Handling UDIM material: '{original_mat.name}'")
+                stitched_mat_name = f"{original_mat.name}__UDIM_STITCHED"
+                stitched_mat = bpy.data.materials.get(stitched_mat_name)
+                if not stitched_mat:
+                    stitched_mat = self._bake_udim_material_to_atlas(
+                        context, original_mat, objects_using_mat, self._export_data['bake_info'].get('bake_dir')
+                    )
+                
+                if stitched_mat:
+                    self._export_data["material_name_map"][original_mat.name] = stitched_mat.name
+                    for obj in objects_using_mat:
+                        for slot in obj.material_slots:
+                            if slot.material == original_mat:
+                                slot.material = stitched_mat
+                continue # Move to the next material
 
-            material_hash = get_material_hash(original_mat, image_hash_cache=global_image_hash_cache, bake_method=bake_method, ignore_mesh_context=True)
-            texture_paths = texture_cache.get(material_hash, {}).copy()
+            # This dictionary will group objects by their specific bake context hash.
+            # Key: material_hash, Value: list of (object, slot_index) tuples
+            hashes_to_assignments_map = defaultdict(list)
 
-            # --- SURGICAL FIX START ---
-            # THE LOGIC IS NOW REORDERED. We check for cached textures FIRST.
-        
-            if texture_paths:
-                # If we have cached paths, it means the material (UDIM or not) has already been processed.
-                # We immediately build the final material from these cached textures.
-                logging.info(f"  - Using cached textures to build final material for '{original_mat.name}'.")
-                sanitized_name = re.sub(r'[\s.-]', '_', original_mat.name)
-                unique_baked_name = f"BAKED_{sanitized_name}_{material_hash[:8]}"
-                final_mat_for_export = self._build_material_from_textures(unique_baked_name, texture_paths)
-        
-            # Only if there are NO cached textures do we proceed with analysis.
-            elif self._material_uses_udims(original_mat) and mat_uuid not in baked_material_uuids:
-                # This is now only triggered on a CACHE MISS for a UDIM material.
-                logging.info(f"  - CACHE MISS: UDIM material '{original_mat.name}' requires stitching.")
-                final_mat_for_export = self._bake_udim_material_to_atlas(
-                    context, original_mat, objects_using_mat, self._export_data['bake_info'].get('bake_dir')
-                )
-        
-            else:
-                # If it's not a UDIM material and has no cached textures (e.g., a simple non-baking material),
-                # use the original material.
-                final_mat_for_export = original_mat
-            # --- SURGICAL FIX END ---
+            # Pre-calculate the hash for each object using this material.
+            for obj in objects_using_mat:
+                for slot_index, slot in enumerate(obj.material_slots):
+                    if slot.material == original_mat:
+                        context_hash = get_material_hash(
+                            original_mat, obj, slot_index,
+                            image_hash_cache=global_image_hash_cache,
+                            bake_method=bake_method,
+                            ignore_mesh_context=addon_prefs.remix_bake_material_only
+                        )
+                        hashes_to_assignments_map[context_hash].append((obj, slot_index))
 
-            if final_mat_for_export:
-                self._export_data["material_name_map"][original_mat.name] = final_mat_for_export.name
-                for obj in objects_using_mat:
-                    for slot in obj.material_slots:
-                        if slot.material == original_mat:
-                            slot.material = final_mat_for_export
+            # Now, create one new material for each unique hash.
+            for material_hash, assignments in hashes_to_assignments_map.items():
+                texture_paths_for_this_context = texture_cache.get(material_hash)
+
+                if texture_paths_for_this_context:
+                    # This context was baked. Create one new material for it.
+                    logging.info(f"  - Building baked material for '{original_mat.name}' (Context Hash: {material_hash[:8]}...)")
+                    sanitized_name = re.sub(r'[\s.-]', '_', original_mat.name)
+                    unique_baked_name = f"BAKED_{sanitized_name}_{material_hash[:8]}"
+                    
+                    final_mat_for_export = self._build_material_from_textures(unique_baked_name, texture_paths_for_this_context)
+                    
+                    # Assign this single new material to all objects that share this context.
+                    for obj, slot_index in assignments:
+                        obj.material_slots[slot_index].material = final_mat_for_export
+
+                    self._export_data["material_name_map"][original_mat.name] = final_mat_for_export.name
+                else:
+                    # This context was not baked (e.g., simple material with no textures).
+                    # We just map the name and leave the original material assigned.
+                    self._export_data["material_name_map"][original_mat.name] = original_mat.name
+        # --- END OF THE NEW LOGIC ---
                         
     def _build_material_from_textures(self, name, texture_paths):
         """
