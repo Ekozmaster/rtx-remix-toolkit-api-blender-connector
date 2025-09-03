@@ -528,18 +528,6 @@ class AssetNumberItem(PropertyGroup):
     blend_name: StringProperty(name="Blend File Name")
     asset_number: IntProperty(name="Asset Number", default=1)
 
-class CustomSettingsBackup(PropertyGroup):
-    obj_export_forward_axis: StringProperty()
-    obj_export_up_axis: StringProperty()
-    flip_faces_export: BoolProperty()
-    mirror_import: BoolProperty()
-    remix_export_scale: FloatProperty()
-    remix_use_selection_only: BoolProperty()
-    remix_ingest_directory: StringProperty()
-    remix_verify_ssl: BoolProperty()
-    remix_import_original_textures: BoolProperty()
-
-
 def setup_logger():
     global log_file_path
     for handler in logging.root.handlers[:]:
@@ -5075,95 +5063,6 @@ class OBJECT_OT_reset_options(Operator):
         logging.info("Remix Ingestor options have been reset to their default values.")
         return {'FINISHED'}
 
-class EXPORT_OT_SubstancePainterExporter(Operator):
-    """Export selected mesh objects to Substance Painter"""
-    bl_idname = "export.substance_painter"
-    bl_label = "Export to Substance Painter"
-
-    def execute(self, context):
-        preferences = context.preferences
-        export_folder = preferences.addons[__name__].preferences.export_folder
-        substance_painter_path = preferences.addons[__name__].preferences.spp_exe
-        objects = context.selected_objects
-
-        # Validate export folder
-        if not os.path.exists(export_folder):
-            from pathlib import Path
-            export_folder = Path(bpy.path.abspath('//'))
-
-        # Validate selection
-        if not objects:
-            self.report({"INFO"}, "No object selected")
-            return {'CANCELLED'}
-
-        export_paths = []
-        try:
-            for obj in objects:
-                path = self.export_object(export_folder, obj)
-                if path:
-                    export_paths.append(path)
-
-            if export_paths:
-                self.open_substance_painter(export_paths, substance_painter_path)
-            return {'FINISHED'}
-        except Exception as e:
-            self.report({"ERROR"}, f"Failed to export objects: {str(e)}")
-            return {'CANCELLED'}
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def check_material(self, obj):
-        """Ensure each mesh has at least one material with nodes"""
-        if len(obj.data.materials) == 0:
-            new_mat = bpy.data.materials.new(name=f"{obj.name}_material")
-            new_mat.use_nodes = True
-            obj.data.materials.append(new_mat)
-            self.report({"INFO"}, f"{obj.name}: material '{new_mat.name}' added")
-
-    def export_object(self, export_folder, obj):
-        """Export a single mesh object as FBX and return its path"""
-        if obj.type != 'MESH':
-            self.report({"WARNING"}, f"{obj.name} is not a mesh, skipped")
-            return None
-
-        self.check_material(obj)
-
-        object_folder = os.path.join(export_folder, obj.name)
-        os.makedirs(object_folder, exist_ok=True)
-        texture_folder = os.path.join(object_folder, f"{obj.name}_textures")
-        os.makedirs(texture_folder, exist_ok=True)
-
-        export_path = os.path.join(object_folder, f"{obj.name}.fbx")
-        bpy.ops.export_scene.fbx(
-            filepath=export_path,
-            global_scale=1.0,
-            apply_unit_scale=True,
-            use_selection=True
-        )
-        self.report({"INFO"}, f"Exported {obj.name} to {export_path}")
-        return export_path
-
-    def open_substance_painter(self, export_paths, spp_exe):
-        try:
-            # ---- project-creation options --------------------------------------
-            args = [
-                spp_exe,
-                '--size', '2048',                                # document resolution
-                '--template', 'pbr-metal-rough-alpha-blend',     # project template
-                '--normal_format', 'OpenGL',                     # normal map space
-                '--uvtile'                                       # enable UV-tile workflow
-            ]
-            # --------------------------------------------------------------------
-
-            # keep the original --mesh pairs
-            args += [mesh for path in export_paths for mesh in ["--mesh", path]]
-
-            subprocess.Popen(args, stdout=subprocess.PIPE, text=True)
-            self.report({"INFO"}, "Opening Substance Painter with: " + " ".join(args))
-        except Exception as e:
-            self.report({'ERROR'}, f"Could not open Substance Painter: {str(e)}")
-
 class OBJECT_OT_flip_normals_on_selected(Operator):
     """Flips the normals for all selected mesh objects."""
     bl_idname = "object.flip_normals_on_selected"
@@ -5303,7 +5202,6 @@ classes = [
     VIEW3D_PT_remix_ingestor,
     OBJECT_OT_info_operator,
     AssetNumberItem,
-    CustomSettingsBackup,
     EXPORT_OT_SubstancePainterExporter,
     SYSTEM_OT_check_gpu_settings,
     SYSTEM_OT_show_gpu_report,
