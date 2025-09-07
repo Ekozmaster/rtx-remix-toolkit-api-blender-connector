@@ -857,7 +857,54 @@ if IS_BLENDER_CONTEXT:
         
             return {'FINISHED'}
 
-    
+    def batch_apply_transforms_optimized(objects_to_apply, apply_location=True, apply_rotation=True, apply_scale=True):
+        """
+        Applies transforms for a list of objects by directly manipulating mesh data,
+        which is significantly faster than bpy.ops.transform.apply().
+        """
+        if not objects_to_apply:
+            return
+
+        logging.info(f"Batch applying transforms (Direct API) to {len(objects_to_apply)} objects.")
+
+        for obj in objects_to_apply:
+            if not obj or obj.type != 'MESH' or not obj.data:
+                continue
+
+            if obj.matrix_world.is_identity:
+                continue
+
+            try:
+                # Decompose the matrix to selectively apply components
+                loc, rot, scale = obj.matrix_world.decompose()
+
+                # Build the transformation matrix based on user flags
+                transform_matrix = Matrix.Identity(4)
+                if apply_scale:
+                    transform_matrix @= Matrix.Diagonal(scale).to_4x4()
+                if apply_rotation:
+                    transform_matrix @= rot.to_matrix().to_4x4()
+                if apply_location:
+                    transform_matrix @= Matrix.Translation(loc)
+
+                # Build the new object matrix with the components that were NOT applied
+                new_obj_matrix = Matrix.Identity(4)
+                if not apply_location:
+                     new_obj_matrix @= Matrix.Translation(loc)
+                if not apply_rotation:
+                     new_obj_matrix @= rot.to_matrix().to_4x4()
+                if not apply_scale:
+                     new_obj_matrix @= Matrix.Diagonal(scale).to_4x4()
+
+                # The core operation: transform the mesh data and update the object's matrix
+                obj.data.transform(transform_matrix)
+                obj.matrix_world = new_obj_matrix
+
+            except Exception as e:
+                logging.error(f"Failed to apply transform for '{obj.name}' via direct API. Error: {e}")
+
+        logging.info("Batch transform apply finished.")
+
     def batch_flip_normals_optimized(meshes_to_flip, context):
         """
         [DEFINITIVE PERFORMANCE & STABILITY FIX] Flips normals for a list of mesh
@@ -1251,12 +1298,22 @@ if IS_BLENDER_CONTEXT:
             logging.error(f"Error fetching selected mesh prim paths: {e}", exc_info=True)
             return []
         
-    def attach_original_textures(imported_objects, context, base_dir):
+    def attach_original_textures(imported_objects, context, base_dir, material_map=None):
+        """
+        [DEFINITIVE V3 - MAP AS SINGLE SOURCE OF TRUTH]
+        This version fixes the dependency graph race condition by relying exclusively on the
+        provided 'material_map' as the source of truth for materials to process. It no longer
+        inspects the object's material slots, which may not be updated in time.
+        """
         addon_prefs = context.preferences.addons[__name__].preferences
         try:
             if not imported_objects:
                 logging.warning("No imported objects to attach textures.")
-                print("No imported objects to attach textures.")
+                return
+
+            if not material_map:
+                # If the definitive map isn't provided, we cannot proceed.
+                logging.warning("No material map provided to attach_original_textures. Cannot process textures.")
                 return
 
             import_original_textures = addon_prefs.remix_import_original_textures
@@ -1264,178 +1321,94 @@ if IS_BLENDER_CONTEXT:
             blend_file_path = bpy.data.filepath
             if not blend_file_path:
                 logging.error("Blend file has not been saved. Cannot determine textures directory.")
-                print("Blend file has not been saved. Cannot determine textures directory.")
                 return
 
             blend_dir = os.path.dirname(blend_file_path).replace('\\', '/')
             textures_subdir = os.path.join(blend_dir, "textures").replace('\\', '/')
-            logging.debug(f"Textures subdirectory path: {textures_subdir}")
-            # print(f"Textures subdirectory path: {textures_subdir}") # Redundant with logging
+            os.makedirs(textures_subdir, exist_ok=True)
 
-            if not os.path.exists(textures_subdir):
-                try:
-                    os.makedirs(textures_subdir, exist_ok=True)
-                    logging.info(f"Created 'textures' subdirectory: {textures_subdir}")
-                    # print(f"Created 'textures' subdirectory: {textures_subdir}")
-                except Exception as e:
-                    logging.error(f"Failed to create textures subdirectory '{textures_subdir}': {e}")
-                    # print(f"Failed to create textures subdirectory '{textures_subdir}': {e}")
-                    return
-            # else: # Not strictly necessary to log if it exists, can be verbose
-                # logging.debug(f"'textures' subdirectory already exists: {textures_subdir}")
-                # print(f"'textures' subdirectory already exists: {textures_subdir}")
+            # --- START OF THE DEFINITIVE FIX ---
+            # The material_map is now the ONLY source of information. This bypasses the dependency graph lag.
+            # The map is {usd_path: blender_material_object}.
+            materials_to_process = material_map.items()
 
-            # --- OPTIMIZATION: Collect unique materials first ---
-            unique_materials = set()
-            for obj in imported_objects:
-                if obj.type == 'MESH': # Ensure we only consider mesh objects for materials
-                    for mat_slot in obj.material_slots:
-                        if mat_slot.material:
-                            unique_materials.add(mat_slot.material)
-        
-            if not unique_materials:
-                logging.warning("No materials found on imported objects to process.")
+            if not materials_to_process:
+                # This check is now based on the reliable map, not the unreliable object inspection.
+                logging.warning("The provided material map is empty. No materials to process.")
                 return
+            # --- END OF THE DEFINITIVE FIX ---
 
-            logging.info(f"Found {len(unique_materials)} unique materials to process for texture attachment.")
+            logging.info(f"Processing {len(materials_to_process)} materials from the provided map for texture attachment.")
 
-            # --- Process each unique material only once ---
-            for mat in unique_materials:
-                logging.info(f"Processing unique material: {mat.name}")
-                # print(f"Processing unique material: {mat.name}") # Redundant
-
+            # The loop now correctly receives both the original source path and the Blender material.
+            for original_source_path, mat in materials_to_process:
+                if not mat: continue
+            
+                # --- THIS IS THE SURGICAL CHANGE: The following debug line has been removed ---
+                # logging.info(f"Processing material: '{mat.name}' (from source path: '{original_source_path}')")
+                
                 if not mat.use_nodes:
                     mat.use_nodes = True
-                    logging.info(f"Enabled node usage for material '{mat.name}'.")
-                    # print(f"Enabled node usage for material '{mat.name}'.")
-
+        
                 principled_bsdf = None
-                image_texture_node = None # Use a more descriptive name
-
-                # Find existing Principled BSDF and Image Texture nodes
+                image_texture_node = None
                 for node in mat.node_tree.nodes:
-                    if node.type == 'BSDF_PRINCIPLED' and not principled_bsdf: # Take the first one
-                        principled_bsdf = node
-                    elif node.type == 'TEX_IMAGE' and not image_texture_node: # Take the first one
-                        image_texture_node = node
-                    if principled_bsdf and image_texture_node: # Found both, no need to continue loop
-                        break
-            
+                    if node.type == 'BSDF_PRINCIPLED': principled_bsdf = node
+                    elif node.type == 'TEX_IMAGE': image_texture_node = node
+                    if principled_bsdf and image_texture_node: break
+    
                 if not principled_bsdf:
                     principled_bsdf = mat.node_tree.nodes.new(type='ShaderNodeBsdfPrincipled')
-                    principled_bsdf.location = (200, 0) # Adjusted location for clarity
-                    logging.info(f"Created Principled BSDF node for material '{mat.name}'.")
-                    # print(f"Created Principled BSDF node for material '{mat.name}'.")
-
+                    principled_bsdf.location = (200, 0)
                 if not image_texture_node:
                     image_texture_node = mat.node_tree.nodes.new(type='ShaderNodeTexImage')
                     image_texture_node.location = (0, 0)
-                    logging.info(f"Created Image Texture node for material '{mat.name}'.")
-                    # print(f"Created Image Texture node for material '{mat.name}'.")
 
-                # Extract hash from material name (assuming mat.name is consistently formatted)
-                match = re.match(r'^mat_([A-Fa-f0-9]{16})', mat.name) # Simplified regex if suffix doesn't matter for hash
+                # Search for the hash in the original USD path, which is reliable.
+                match = re.search(r'([A-Fa-f0-9]{16})', original_source_path)
                 if not match:
-                     # Fallback if the primary pattern with a dot isn't matched, or if it's just the hash
-                    match = re.match(r'([A-Fa-f0-9]{16})', mat.name) # Try to find a 16-char hex hash anywhere
-            
-                if match:
-                    # If the regex had a group for the hash specifically, use it.
-                    # If it's the full match (e.g. r'([A-Fa-f0-9]{16})'), group(0) or group(1) might be it.
-                    # Safest to check groups.
-                    mat_hash = match.group(1) if match.groups() else match.group(0)
-                    logging.debug(f"Extracted hash '{mat_hash}' from material '{mat.name}'.")
-                else:
-                    logging.warning(f"Material name '{mat.name}' does not match expected hash pattern. Cannot determine texture.")
-                    # print(f"Material name '{mat.name}' does not match expected hash pattern.")
-                    continue # Skip this material if no hash
-
+                    logging.warning(f"Source path '{original_source_path}' does not contain an expected hash pattern. Cannot determine texture.")
+                    continue
+        
+                mat_hash = match.group(1)
                 texture_file_dds = f"{mat_hash}.dds"
                 texture_path_dds = os.path.join(base_dir, "textures", texture_file_dds).replace('\\', '/')
-                # logging.info(f"Looking for DDS texture file: {texture_path_dds}") # Can be verbose
-                # print(f"Looking for texture file: {texture_file_dds}")
 
                 if os.path.exists(texture_path_dds):
-                    target_image_path_for_node = texture_path_dds
-                    target_image_name_for_node = os.path.basename(texture_path_dds)
-                    is_png_converted = False
-
-                    if import_original_textures: # DDS to PNG conversion path
+                    target_image_path = texture_path_dds
+                    if import_original_textures:
                         png_filename = f"{mat_hash}.png"
                         png_path_full = os.path.join(textures_subdir, png_filename).replace('\\', '/')
-                        logging.info(f"Attempting to use/convert to PNG: {png_path_full} from DDS: {texture_path_dds}")
-                        # print(f"Preparing to convert DDS to PNG: {texture_path_dds} -> {png_path_full}")
-
                         if not os.path.exists(png_path_full) or os.path.getmtime(texture_path_dds) > os.path.getmtime(png_path_full):
                             try:
-                                dds_image_data = bpy.data.images.load(texture_path_dds, check_existing=True) # check_existing is important
-                                # Create a new image for PNG conversion to avoid modifying dds_image_data's filepath directly before saving
-                                png_image_data_new = bpy.data.images.new(
-                                    name=png_filename, # Use clean filename
-                                    width=dds_image_data.size[0],
-                                    height=dds_image_data.size[1],
-                                    alpha=(dds_image_data.channels == 4)
-                                )
-                                png_image_data_new.pixels = list(dds_image_data.pixels) # Copy pixels
+                                dds_image_data = bpy.data.images.load(texture_path_dds, check_existing=True)
+                                png_image_data_new = bpy.data.images.new(name=png_filename, width=dds_image_data.size[0], height=dds_image_data.size[1], alpha=(dds_image_data.channels == 4))
+                                png_image_data_new.pixels = list(dds_image_data.pixels)
                                 png_image_data_new.file_format = 'PNG'
-                                png_image_data_new.filepath_raw = png_path_full # Set path for saving
+                                png_image_data_new.filepath_raw = png_path_full
                                 png_image_data_new.save()
-                                logging.info(f"Converted and saved PNG image: {png_path_full}")
-                                # print(f"Saved PNG image: {png_path_full}")
-                            
-                                # Clean up the loaded DDS image datablock if it's no longer needed by other parts of Blender
-                                # (or if we exclusively want to use the PNG from now on)
                                 bpy.data.images.remove(dds_image_data)
-                                is_png_converted = True
-                                target_image_path_for_node = png_path_full
-                                target_image_name_for_node = png_filename
-
+                                target_image_path = png_path_full
                             except Exception as e_conv:
                                 logging.error(f"Failed to convert DDS to PNG for texture '{texture_file_dds}': {e_conv}")
-                                # print(f"Failed to convert DDS to PNG for texture '{texture_file_dds}': {e_conv}")
-                                # Fallback to DDS if conversion fails
-                                target_image_path_for_node = texture_path_dds
-                                target_image_name_for_node = texture_file_dds
                         else:
-                            logging.info(f"PNG texture already exists and is up-to-date: {png_path_full}")
-                            # print(f"PNG texture already exists: {png_path_full}")
-                            target_image_path_for_node = png_path_full
-                            target_image_name_for_node = png_filename
-                            is_png_converted = True # It exists, so it's "converted" for our purposes
-                
-                    # Load the target image (either original DDS or converted PNG)
-                    loaded_image_for_node = bpy.data.images.load(target_image_path_for_node, check_existing=True)
-                    image_texture_node.image = loaded_image_for_node
-                    logging.info(f"Assigned image '{target_image_name_for_node}' to texture node in material '{mat.name}'.")
-
-                    # Link texture to Principled BSDF's Base Color
+                            target_image_path = png_path_full
+        
+                    loaded_image = bpy.data.images.load(target_image_path, check_existing=True)
+                    image_texture_node.image = loaded_image
+            
                     links = mat.node_tree.links
                     base_color_input = principled_bsdf.inputs.get('Base Color')
                     if base_color_input:
-                        # Remove existing links to Base Color if any
-                        for link in list(base_color_input.links): # Iterate over a copy
+                        for link in list(base_color_input.links):
                             links.remove(link)
-                            logging.debug(f"Removed existing link to Base Color for material '{mat.name}'.")
-                    
                         links.new(image_texture_node.outputs['Color'], base_color_input)
-                        logging.info(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                        # print(f"Connected Image Texture to Base Color for material '{mat.name}'.")
-                    else:
-                        logging.warning(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-                        # print(f"No 'Base Color' input found in Principled BSDF for material '{mat.name}'.")
-
-                else: # DDS file does not exist
+                else:
                     logging.warning(f"Texture file does not exist for material '{mat.name}': {texture_path_dds}")
-                    # print(f"Texture file does not exist for material '{mat.name}': {texture_path_dds}")
-                    # Optionally clear the image on the node if the file is missing
                     if image_texture_node.image:
-                        image_texture_node.image = None 
-                        logging.info(f"Cleared missing image from texture node in material '{mat.name}'.")
-
-
+                        image_texture_node.image = None
         except Exception as e:
             logging.error(f"Error attaching original textures: {e}", exc_info=True)
-            # print(f"Error attaching original textures: {e}")
 
     def select_mesh_prim_in_remix(reference_prim, context):
         addon_prefs = context.preferences.addons[__name__].preferences
@@ -1807,7 +1780,6 @@ if IS_BLENDER_CONTEXT:
 
             file_paths = [os.path.join(self.directory, f.name) for f in self.files]
 
-            # --- PREPARATION ---
             main_scene = context.scene
             original_undo_state = context.preferences.edit.use_global_undo
             context.preferences.edit.use_global_undo = False
@@ -1819,10 +1791,11 @@ if IS_BLENDER_CONTEXT:
                 space.overlay.show_wireframes = False
 
             all_mesh_data = []
+            detected_up_axis = None
 
             try:
                 # --- STAGE 1: PARALLEL SCAN AND EXTRACTION ---
-                logging.info("--- [Importer] Stage 1: Scanning and extracting data in parallel... ---")
+                logging.info("--- [Importer] Stage 1: Scanning for geometry and metadata in parallel... ---")
                 stage1_start_time = time.perf_counter()
 
                 try:
@@ -1834,7 +1807,15 @@ if IS_BLENDER_CONTEXT:
                     ctx = multiprocessing.get_context('spawn')
                     with ctx.Pool(processes=max(1, os.cpu_count() -1)) as pool:
                         results_iterator = pool.imap_unordered(scan_and_extract_data_for_file, file_paths)
-                        for data_list in results_iterator:
+                        for result in results_iterator:
+                            if result is None: continue
+                            
+                            up_axis, data_list = result
+                            
+                            if detected_up_axis is None and up_axis in ('Y', 'Z'):
+                                detected_up_axis = up_axis
+                                logging.info(f" > Auto-detected Up Axis: '{detected_up_axis}' from file.")
+                            
                             if data_list:
                                 all_mesh_data.extend(data_list)
             
@@ -1849,18 +1830,46 @@ if IS_BLENDER_CONTEXT:
                 logging.info(f"--- [Importer] Stage 2: Building and finalizing {len(all_mesh_data)} Blender objects... ---")
                 stage2_start_time = time.perf_counter()
                 
-                # Part A: Material Pre-Pass (Fast)
+                # OPTIMIZATION: Create all materials in a single pre-pass to avoid redundant lookups.
                 material_map = {}
                 unique_material_paths = {data['material_path'] for data in all_mesh_data if data.get('material_path')}
+
                 for usd_mat_path in unique_material_paths:
-                    mat_name = usd_mat_path.split('/')[-1]
-                    safe_mat_name = "".join(c for c in mat_name if c.isalnum() or c in ('_', '-', '.'))
-                    mat = bpy.data.materials.get(safe_mat_name) or bpy.data.materials.new(name=safe_mat_name)
+                    if not usd_mat_path: continue
+                    match = re.search(r'([A-Fa-f0-9]{16})', usd_mat_path)
+                    if match:
+                        mat_name = match.group(1)
+                    else:
+                        fallback_mat_name = usd_mat_path.split('/')[-1]
+                        mat_name = "".join(c for c in fallback_mat_name if c.isalnum() or c in ('_', '-', '.')) or "UnnamedMaterial"
+                    
+                    mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
                     material_map[usd_mat_path] = mat
                 
-                objects_to_process = []
+                # OPTIMIZATION: Pre-calculate axis and scale matrices once outside the loop.
+                source_up_axis = detected_up_axis or addon_prefs.usd_import_up_axis
+                source_forward_axis = addon_prefs.usd_import_forward_axis
+                up_axis_base = source_up_axis.replace('NEGATIVE_', '')
+                forward_axis_base = source_forward_axis.replace('NEGATIVE_', '')
 
-                # Part B: Create all Meshes and Objects (NO material assignment, NO linking)
+                if up_axis_base == forward_axis_base:
+                    logging.warning(f"Conflict detected: Up Axis ('{source_up_axis}') is the same as Forward Axis ('{source_forward_axis}'). Overriding Forward Axis.")
+                    if up_axis_base == 'Y': source_forward_axis = 'Z'
+                    else: source_forward_axis = 'Y'
+                    logging.warning(f" > New Forward Axis has been set to: '{source_forward_axis}'")
+
+                logging.info(f"Using '{source_forward_axis}' as Forward and '{source_up_axis}' as Up Axis for conversion.")
+                correction_matrix = bpy_extras.io_utils.axis_conversion(
+                    from_forward=source_forward_axis, from_up=source_up_axis,
+                    to_forward='-Y', to_up='Z',
+                ).to_4x4()
+
+                import_scale = addon_prefs.remix_import_scale
+                scale_matrix = Matrix.Scale(import_scale, 4)
+                if import_scale != 1.0:
+                    logging.info(f"Applying uniform import scale factor of {import_scale} during matrix composition.")
+                
+                final_object_list = []
                 for data in all_mesh_data:
                     counts = data['counts']
                     if counts['verts'] == 0 or counts['faces'] == 0: continue
@@ -1868,38 +1877,60 @@ if IS_BLENDER_CONTEXT:
                     mesh_name = data['name'].replace(':', '_')
                     new_mesh = bpy.data.meshes.new(name=f"{mesh_name}_mesh")
                     
+                    # OPTIMIZATION: Pre-allocate all geometry arrays in single operations.
                     new_mesh.vertices.add(counts['verts'])
                     new_mesh.loops.add(counts['loops'])
                     new_mesh.polygons.add(counts['faces'])
                 
+                    # OPTIMIZATION: Use foreach_set for direct, high-speed memory transfer of geometry data.
                     new_mesh.vertices.foreach_set("co", data['verts_co'].ravel())
                     new_mesh.loops.foreach_set("vertex_index", data['loop_verts'])
                     new_mesh.polygons.foreach_set("loop_start", data['loop_starts'])
                     new_mesh.polygons.foreach_set("loop_total", data['loop_totals'])
 
-                    new_mesh.validate()
+                    # --- OPTIMIZED UV HANDLING ---
+                    uv_data = data.get('uvs')
+                    uv_interpolation = data.get('uv_interpolation')
+                    
+                    if uv_data is not None and uv_interpolation is not None:
+                        uv_layer = new_mesh.uv_layers.new(name="UVMap")
+                    
+                        # Case A: UVs are per-face-corner (faceVarying). This is a direct copy.
+                        if uv_interpolation == 'faceVarying':
+                            if len(uv_data) == counts['loops']:
+                                # OPTIMIZATION: Direct memory copy for perfectly formatted UVs.
+                                uv_layer.data.foreach_set("uv", uv_data.ravel())
+                        
+                        # Case B: UVs are per-vertex. They must be "expanded" to the per-loop format.
+                        elif uv_interpolation == 'vertex':
+                            if len(uv_data) == counts['verts']:
+                                # OPTIMIZATION: Use ultra-fast NumPy indexing to expand vertex UVs to loop UVs in memory.
+                                loop_verts_np = data['loop_verts']
+                                loop_uvs_np = uv_data[loop_verts_np]
+                                # OPTIMIZATION: Direct memory copy of the newly constructed loop UV array.
+                                uv_layer.data.foreach_set("uv", loop_uvs_np.ravel())
+                    
+                    new_mesh.validate(verbose=False)
                     new_mesh.update()
 
                     new_obj = bpy.data.objects.new(mesh_name, new_mesh)
-                    new_obj.matrix_world = Matrix(data["matrix_world"])
+                    source_transform = Matrix(data["matrix_world"])
                     
-                    # Store the object and its intended material path for later
-                    objects_to_process.append((new_obj, data.get('material_path')))
+                    # OPTIMIZATION: Combine all transformations into a single matrix multiplication.
+                    new_obj.matrix_world = correction_matrix @ source_transform @ scale_matrix
+                    
+                    mat_path = data.get('material_path')
+                    if mat_path and mat_path in material_map:
+                        new_obj.data.materials.append(material_map[mat_path])
+                    
+                    main_scene.collection.objects.link(new_obj)
+                    final_object_list.append(new_obj)
 
-                # Part C: Batch Linking and Batch Material Assignment
-                logging.info(f"Batch-linking {len(objects_to_process)} objects to the scene...")
-                final_object_list = []
-                for obj, mat_path in objects_to_process:
-                    main_scene.collection.objects.link(obj)
-                    # Now that the object is in the scene, assign its material
-                    if mat_path in material_map:
-                        obj.data.materials.append(material_map[mat_path])
-                    final_object_list.append(obj)
+                context.view_layer.update()
 
-                # Part D: Final Post-Processing
                 if addon_prefs.remix_import_original_textures and is_blend_file_saved():
                     base_dir = os.path.dirname(file_paths[0])
-                    attach_original_textures(final_object_list, context, base_dir)
+                    attach_original_textures(final_object_list, context, base_dir, material_map)
 
                 bpy.ops.object.select_all(action='DESELECT')
                 for obj in final_object_list:
@@ -1912,7 +1943,13 @@ if IS_BLENDER_CONTEXT:
                         batch_mirror_objects_optimized(context.selected_objects, context)
                     if addon_prefs.flip_normals_import:
                         batch_flip_normals_optimized(context.selected_objects, context)
-                    bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
+                    
+                    batch_apply_transforms_optimized(
+                        context.selected_objects, 
+                        apply_location=True, 
+                        apply_rotation=True, 
+                        apply_scale=True 
+                    )
             
                 bpy.ops.object.select_all(action='DESELECT')
                 
@@ -1964,7 +2001,10 @@ if IS_BLENDER_CONTEXT:
             usd_importer_addon = context.preferences.addons.get('io_scene_usd')
             if usd_importer_addon:
                 importer_prefs = usd_importer_addon.preferences
-                attrs_to_backup = ['axis_forward', 'axis_up', 'scale', 'import_materials', 'import_meshes'] # Add more if needed
+                # --- SURGICAL CHANGE START ---
+                # Add 'import_uv_maps' to the list of settings to manage.
+                attrs_to_backup = ['axis_forward', 'axis_up', 'scale', 'import_materials', 'import_meshes', 'import_uv_maps'] # Add more if needed
+                # --- SURGICAL CHANGE END ---
                 for attr in attrs_to_backup:
                     if hasattr(importer_prefs, attr):
                         original_importer_settings[attr] = getattr(importer_prefs, attr)
@@ -1981,10 +2021,15 @@ if IS_BLENDER_CONTEXT:
                     if hasattr(importer_prefs, 'axis_forward'):
                         importer_prefs.axis_forward = user_selected_forward_axis
                         logging.info(f"Remix import: Set USD importer axis_forward to '{user_selected_forward_axis}'.")
-                    # Set other "default" UMI-like settings
-                    if hasattr(importer_prefs, 'import_materials'): importer_prefs.import_materials = 'USD_PREVIEW_SURFACE'
-                    if hasattr(importer_prefs, 'import_meshes'): importer_prefs.import_meshes = True
-                    # Add other desired defaults for USD import here
+                    # --- SURGICAL CHANGE START ---
+                    # Explicitly enable material and UV map import before the operation.
+                    if hasattr(importer_prefs, 'import_materials'): 
+                        importer_prefs.import_materials = 'USD_PREVIEW_SURFACE'
+                    if hasattr(importer_prefs, 'import_meshes'): 
+                        importer_prefs.import_meshes = True
+                    if hasattr(importer_prefs, 'import_uv_maps'): 
+                        importer_prefs.import_uv_maps = True
+                    # --- SURGICAL CHANGE END ---
         
                 if context.window.scene != target_scene:
                     context.window.scene = target_scene
@@ -2078,19 +2123,11 @@ if IS_BLENDER_CONTEXT:
                 return {'CANCELLED'}
 
             remix_import_lock = True
-            logging.info("Lock acquired for USD import process (Remix).")
-
-            main_scene = context.scene
-            import_scene_temp = None
-            all_imported_usd_filepaths = []
-            base_dir_for_textures = ""
-            all_imported_objects_from_temp = []
-            # --- FIX: Store names early, as strings survive object deletion ---
-            imported_object_names = []
-
+            logging.info("Lock acquired for High-Performance Remix USD import.")
+            total_start_time = time.perf_counter()
 
             try:
-                # --- Step 1 & 2: Fetch and determine file paths (Unchanged) ---
+                # --- Step 1: Fetch prim paths from Remix server ---
                 assets_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
                 response = make_request_with_retries('GET', assets_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
                 if not response or response.status_code != 200:
@@ -2105,115 +2142,159 @@ if IS_BLENDER_CONTEXT:
                     self.report({'WARNING'}, "No mesh assets found in Remix server selection.")
                     return {'CANCELLED'}
 
+                # --- Step 2: Resolve prim paths to local USD file paths ---
                 first_mesh_path = mesh_prim_paths[0]
                 segments = first_mesh_path.strip('/').split('/')
                 if len(segments) < 3:
-                    self.report({'ERROR'}, f"Cannot determine reference prim from path: {first_mesh_path}")
-                    return {'CANCELLED'}
-            
+                    raise RuntimeError(f"Cannot determine reference prim from path: {first_mesh_path}")
+
                 ref_prim_for_path_api = '/' + '/'.join(segments[:3])
                 encoded_ref_prim = urllib.parse.quote(ref_prim_for_path_api, safe='')
                 file_paths_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_ref_prim}/file-paths"
-            
+
                 response_files = make_request_with_retries('GET', file_paths_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
                 if not response_files or response_files.status_code != 200:
-                    self.report({'ERROR'}, "Failed to retrieve file paths for selected prims.")
-                    return {'CANCELLED'}
+                    raise RuntimeError("Failed to retrieve file paths for selected prims.")
 
                 file_data = response_files.json()
                 try:
                     base_dir_source = file_data['reference_paths'][0][1][1]
                     base_dir_for_textures = os.path.dirname(base_dir_source).replace('\\', '/')
                 except (IndexError, KeyError, TypeError):
-                     self.report({'ERROR'}, "Could not determine base directory from server response.")
-                     return {'CANCELLED'}
+                    raise RuntimeError("Could not determine base directory from server response.")
 
+                usd_files_to_import = []
                 for mesh_path in mesh_prim_paths:
                     mesh_name = mesh_path.strip('/').split('/')[2]
                     usd_path = os.path.join(base_dir_for_textures, "meshes", f"{mesh_name}.usd").replace('\\', '/')
-                    if os.path.exists(usd_path) and usd_path not in all_imported_usd_filepaths:
-                        all_imported_usd_filepaths.append(usd_path)
+                    if os.path.exists(usd_path) and usd_path not in usd_files_to_import:
+                        usd_files_to_import.append(usd_path)
 
-                if not all_imported_usd_filepaths:
-                    self.report({'INFO'}, "No new USD files from Remix selection to import.")
+                if not usd_files_to_import:
+                    self.report({'INFO'}, "No valid USD files found on disk for the Remix selection.")
                     return {'FINISHED'}
 
-                # --- Step 3: Import into a temporary scene (Unchanged) ---
-                temp_scene_name = f"Remix_Import_Temp_{uuid.uuid4().hex[:8]}"
-                import_scene_temp = bpy.data.scenes.new(temp_scene_name)
-            
-                imported_obj_map = self._perform_usd_import_into_scene(context, import_scene_temp, all_imported_usd_filepaths, addon_prefs)
-                all_imported_objects_from_temp = [obj for obj_list in imported_obj_map.values() for obj in obj_list]
+                # --- Step 3: Use the high-performance parallel scanner to extract all data ---
+                logging.info(f"--- [Remix Importer] Stage 1: Scanning {len(usd_files_to_import)} USD file(s) in parallel... ---")
+                all_mesh_data = []
+                detected_up_axis = None
+                
+                # Directly use the same worker function as the other importer
+                from .usd_scanner import scan_and_extract_data_for_file
+                
+                ctx = multiprocessing.get_context('spawn')
+                with ctx.Pool(processes=max(1, os.cpu_count() -1)) as pool:
+                    results_iterator = pool.imap_unordered(scan_and_extract_data_for_file, usd_files_to_import)
+                    for result in results_iterator:
+                        if result is None: continue
+                        up_axis, data_list = result
+                        if detected_up_axis is None and up_axis in ('Y', 'Z'):
+                            detected_up_axis = up_axis
+                        if data_list:
+                            all_mesh_data.extend(data_list)
+                
+                if not all_mesh_data:
+                    self.report({'WARNING'}, "Scan complete, but no valid mesh geometry was found in the files.")
+                    return {'CANCELLED'}
 
-                if not all_imported_objects_from_temp and import_scene_temp.objects:
-                    all_imported_objects_from_temp = list(import_scene_temp.objects)
+                # --- Step 4: Build Blender objects from the extracted data (High-Performance) ---
+                logging.info(f"--- [Remix Importer] Stage 2: Building {len(all_mesh_data)} Blender objects... ---")
+                main_scene = context.scene
+                final_object_list = []
+                
+                material_map = {}
+                unique_material_paths = {data['material_path'] for data in all_mesh_data if data.get('material_path')}
 
-                if not all_imported_objects_from_temp:
-                     self.report({'WARNING'}, "No objects were imported from Remix.")
-                     return {'CANCELLED'}
-            
-                # --- FIX: Get the names of all imported objects before any are deleted ---
-                imported_object_names = [obj.name for obj in all_imported_objects_from_temp if obj]
+                for usd_mat_path in unique_material_paths:
+                    match = re.search(r'([A-Fa-f0-9]{16})', usd_mat_path)
+                    mat_name = match.group(1) if match else usd_mat_path.split('/')[-1] or "UnnamedMaterial"
+                    mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
+                    material_map[usd_mat_path] = mat
 
-                # --- Step 4: Transfer, Finalize, and Cleanup (Main logic change is here) ---
-                context.window.scene = main_scene
-                for obj in all_imported_objects_from_temp:
-                    if obj and obj.name in import_scene_temp.objects:
-                        for coll in list(obj.users_collection):
-                            coll.objects.unlink(obj)
-                        main_scene.collection.objects.link(obj)
-            
+                # --- SURGICAL CHANGE START ---
+                # Add the axis conflict validation check before creating the matrix.
+                source_up_axis = detected_up_axis or addon_prefs.usd_import_up_axis
+                source_forward_axis = addon_prefs.usd_import_forward_axis
+                up_axis_base = source_up_axis.replace('NEGATIVE_', '')
+                forward_axis_base = source_forward_axis.replace('NEGATIVE_', '')
+
+                if up_axis_base == forward_axis_base:
+                    logging.warning(f"Axis conflict detected during Remix import: Up ('{source_up_axis}') and Forward ('{source_forward_axis}') are the same.")
+                    # Sensible override: if up is Y, forward becomes Z. Otherwise, forward becomes Y.
+                    if up_axis_base == 'Y':
+                        source_forward_axis = 'Z'
+                    else:
+                        source_forward_axis = 'Y'
+                    logging.warning(f" > Overriding Forward Axis to '{source_forward_axis}' to resolve conflict.")
+
+                correction_matrix = bpy_extras.io_utils.axis_conversion(
+                    from_forward=source_forward_axis, # Use the potentially corrected forward axis
+                    from_up=source_up_axis,          # Use the original up axis
+                    to_forward='-Y',
+                    to_up='Z',
+                ).to_4x4()
+                # --- SURGICAL CHANGE END ---
+                
+                scale_matrix = Matrix.Scale(addon_prefs.remix_import_scale, 4)
+
+                for data in all_mesh_data:
+                    counts = data['counts']
+                    if counts['verts'] == 0 or counts['faces'] == 0: continue
+
+                    mesh_name = data['name'].replace(':', '_')
+                    new_mesh = bpy.data.meshes.new(name=f"{mesh_name}_mesh")
+                    
+                    new_mesh.vertices.add(counts['verts'])
+                    new_mesh.loops.add(counts['loops'])
+                    new_mesh.polygons.add(counts['faces'])
+                
+                    new_mesh.vertices.foreach_set("co", data['verts_co'].ravel())
+                    new_mesh.loops.foreach_set("vertex_index", data['loop_verts'])
+                    new_mesh.polygons.foreach_set("loop_start", data['loop_starts'])
+                    new_mesh.polygons.foreach_set("loop_total", data['loop_totals'])
+
+                    if 'uvs' in data and data.get('uv_interpolation'):
+                        uv_layer = new_mesh.uv_layers.new(name="UVMap")
+                        if data['uv_interpolation'] == 'faceVarying' and len(data['uvs']) == counts['loops']:
+                            uv_layer.data.foreach_set("uv", data['uvs'].ravel())
+                        elif data['uv_interpolation'] == 'vertex' and len(data['uvs']) == counts['verts']:
+                            loop_uvs = data['uvs'][data['loop_verts']]
+                            uv_layer.data.foreach_set("uv", loop_uvs.ravel())
+
+                    new_mesh.validate()
+                    new_mesh.update()
+
+                    new_obj = bpy.data.objects.new(mesh_name, new_mesh)
+                    new_obj.matrix_world = correction_matrix @ Matrix(data["matrix_world"]) @ scale_matrix
+                    
+                    mat_path = data.get('material_path')
+                    if mat_path in material_map:
+                        new_obj.data.materials.append(material_map[mat_path])
+                    
+                    main_scene.collection.objects.link(new_obj)
+                    final_object_list.append(new_obj)
+
+                context.view_layer.update()
+
+                # --- Step 5: Post-processing and Texture Attachment ---
                 bpy.ops.object.select_all(action='DESELECT')
-                active_obj_set = False
-                for name in imported_object_names:
-                    obj = main_scene.objects.get(name)
-                    if obj:
-                        obj.select_set(True)
-                        if not active_obj_set:
-                            context.view_layer.objects.active = obj
-                            active_obj_set = True
+                for obj in final_object_list:
+                    obj.select_set(True)
+                if final_object_list:
+                    context.view_layer.objects.active = final_object_list[0]
 
                 if context.selected_objects:
                     if addon_prefs.mirror_import:
                         batch_mirror_objects_optimized(context.selected_objects, context)
                     if addon_prefs.flip_normals_import:
                         batch_flip_normals_optimized(context.selected_objects, context)
-                
-                    bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
+                    
+                    batch_apply_transforms_optimized(context.selected_objects, True, True, True)
 
-                    empties_to_delete = [
-                        main_scene.objects.get(name) for name in imported_object_names 
-                        if main_scene.objects.get(name) and main_scene.objects.get(name).type == 'EMPTY'
-                    ]
-                    if empties_to_delete:
-                        bpy.ops.object.select_all(action='DESELECT')
-                        for empty in empties_to_delete:
-                           empty.select_set(True)
-                        if context.selected_objects:
-                            bpy.ops.object.delete()
-                
-                    bpy.ops.object.select_all(action='DESELECT')
-                    surviving_meshes = [
-                        main_scene.objects.get(name) for name in imported_object_names
-                        if main_scene.objects.get(name) and main_scene.objects.get(name).type == 'MESH'
-                    ]
-                
-                    if surviving_meshes:
-                        for mesh in surviving_meshes:
-                            mesh.select_set(True)
-                        context.view_layer.objects.active = surviving_meshes[0]
-                        bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
+                if addon_prefs.remix_import_original_textures:
+                    attach_original_textures(final_object_list, context, base_dir_for_textures, material_map)
 
-                # --- Final Step: Attach Textures using a clean list ---
-                bpy.ops.object.select_all(action='DESELECT')
-            
-                # --- FIX: Rebuild the final list from the scene using the saved names ---
-                final_objects_for_texture = [main_scene.objects.get(name) for name in imported_object_names if main_scene.objects.get(name)]
-
-                if addon_prefs.remix_import_original_textures and base_dir_for_textures and final_objects_for_texture:
-                    attach_original_textures(final_objects_for_texture, context, base_dir_for_textures)
-
-                self.report({'INFO'}, f"Remix import complete. Processed {len(all_imported_usd_filepaths)} file(s).")
+                self.report({'INFO'}, f"Remix import complete. Created {len(final_object_list)} objects.")
                 return {'FINISHED'}
 
             except Exception as e:
@@ -2221,11 +2302,10 @@ if IS_BLENDER_CONTEXT:
                 self.report({'ERROR'}, "A critical error occurred. See system console for details.")
                 return {'CANCELLED'}
             finally:
-                if import_scene_temp and import_scene_temp.name in bpy.data.scenes:
-                    bpy.data.scenes.remove(import_scene_temp, do_unlink=True)
                 remix_import_lock = False
-                logging.info("Lock released for USD import process (Remix).")
-    
+                total_end_time = time.perf_counter()
+                logging.info(f"Lock released. Total Remix import time: {total_end_time - total_start_time:.2f} seconds.")
+                
     class OBJECT_OT_export_and_ingest(Operator):
         bl_idname = "object.export_and_ingest"
         bl_label = "Export and Ingest (Dynamic Workers)"
