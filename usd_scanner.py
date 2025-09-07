@@ -3,6 +3,7 @@
 import numpy as np
 import sys
 import traceback
+import hashlib
 
 try:
     from pxr import Usd, UsdGeom, Gf, UsdShade
@@ -11,10 +12,9 @@ except ImportError:
 
 def scan_and_extract_data_for_file(usd_file_path):
     """
-    WORKER (V11 - VISIBILITY FIX): This version re-introduces the visibility and
-    purpose checks from the old scanner to prevent duplication when importing
-    USD assembly files that reference original scene geometry. It retains the
-    V10 improvements for UV extraction.
+    WORKER (V14 - DEDUPLICATION HASH): This version calculates a unique hash for
+    each mesh based on its geometry, transform, and material. This allows the
+    main addon to detect and skip importing duplicate meshes.
     """
     if Usd is None:
         print(f"FATAL WORKER ERROR: The 'pxr' library could not be imported.", file=sys.stderr)
@@ -34,7 +34,6 @@ def scan_and_extract_data_for_file(usd_file_path):
             if not prim.IsA(UsdGeom.Mesh):
                 continue
 
-            # --- START OF THE FIX: ADD THESE CHECKS BACK IN ---
             imageable = UsdGeom.Imageable(prim)
             if imageable.ComputeVisibility(Usd.TimeCode.Default()) == UsdGeom.Tokens.invisible:
                 continue
@@ -42,9 +41,12 @@ def scan_and_extract_data_for_file(usd_file_path):
             purpose = imageable.ComputePurpose()
             if purpose != UsdGeom.Tokens.default_ and purpose != UsdGeom.Tokens.render:
                 continue
-            # --- END OF THE FIX ---
 
-            # --- START OF THE DEFINITIVE UV FIX (Unchanged) ---
+            parent_name = ""
+            parent_prim = prim.GetParent()
+            if parent_prim and parent_prim.IsValid() and not parent_prim.IsPseudoRoot():
+                parent_name = parent_prim.GetName()
+
             uv_data_np = None
             found_uv_set = None
             uv_interpolation = None
@@ -67,7 +69,6 @@ def scan_and_extract_data_for_file(usd_file_path):
                     uv_data_np = np.array(uv_values, dtype=np.float32)
                     if uv_data_np.ndim == 2 and uv_data_np.shape[1] >= 2:
                         uv_data_np[:, 1] = 1.0 - uv_data_np[:, 1]
-            # --- END OF THE DEFINITIVE UV FIX ---
 
             mesh = UsdGeom.Mesh(prim)
             vertices_attr = mesh.GetPointsAttr().Get()
@@ -105,8 +106,22 @@ def scan_and_extract_data_for_file(usd_file_path):
             except Exception as e:
                 print(f"[Worker DBG]   > !!! CRITICAL ERROR during material lookup for prim {prim.GetPath()}: {e}", file=sys.stderr)
 
+            # --- NEW: Generate the unique content hash ---
+            hasher = hashlib.md5()
+            hasher.update(verts_co_np.tobytes())
+            hasher.update(loop_verts_np.tobytes())
+            hasher.update(np.array(world_transform_matrix).tobytes())
+            hasher.update(material_path_str.encode('utf-8'))
+            mesh_hash = hasher.hexdigest()
+            # --- END NEW ---
+
             extracted_data.append({
-                "name": prim.GetName(), "matrix_world": [list(row) for row in world_transform_matrix],
+                "mesh_hash": mesh_hash, # <-- NEW: Pass the hash back
+                "name": prim.GetName(),
+                "parent_name": parent_name,
+                "prim_path": str(prim.GetPath()),
+                "usd_file_path": usd_file_path,
+                "matrix_world": [list(row) for row in world_transform_matrix],
                 "material_path": material_path_str,
                 "counts": { "verts": len(verts_co_np), "faces": len(face_counts_np), "loops": len(loop_verts_np)},
                 "verts_co": verts_co_np, "loop_verts": loop_verts_np,
