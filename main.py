@@ -1445,15 +1445,17 @@ if IS_BLENDER_CONTEXT:
 
     def handle_special_texture_assignments(self, context, reference_prim, export_data=None):
         """
-        [DEFINITIVE V18 - CORRECTED DATA LOOKUP]
+        [DEFINITIVE V18 - CORRECTED DATA LOOKUP & BATCHED INGEST]
         This version fixes the logical flaw where special texture information was stored
-        by an (object, material) key but retrieved only by material. This version reorganizes
-        the data purely by material, ensuring a correct lookup and assignment.
+        by an (object, material) key but retrieved only by material. It now reorganizes
+        the data purely by material for correct lookup. It also introduces batched
+        ingestion to handle large numbers of textures without server timeouts, processing
+        them in chunks of 5 before performing a single final assignment operation.
         """
         addon_prefs = context.preferences.addons[__name__].preferences
     
         try:
-            logging.info("--- Starting Special Texture Assignment (Corrected Data Lookup) ---")
+            logging.info("--- Starting Special Texture Assignment (Corrected Data Lookup & Batched Ingest) ---")
 
             final_mtl_name_map = (export_data or {}).get("material_name_map", {})
             special_texture_info_by_obj_mat = (export_data or {}).get('bake_info', {}).get('special_texture_info', {})
@@ -1462,19 +1464,17 @@ if IS_BLENDER_CONTEXT:
                 logging.info("No special textures to process.")
                 return {'FINISHED'}
 
-            # --- THIS IS THE FIX: Reorganize the data ---
+            # --- Reorganize the data (No change from previous version) ---
             # Create a new dictionary keyed ONLY by the original material name.
             assignments_by_original_mat_name = defaultdict(list)
             for (obj_name, mat_name), texture_list in special_texture_info_by_obj_mat.items():
                 for texture_data in texture_list:
                      assignments_by_original_mat_name[mat_name].append(texture_data)
-            # --- END OF FIX ---
 
             textures_for_ingest = []
             ingest_dir_server = addon_prefs.remix_ingest_directory.rstrip('/\\')
             server_textures_output_dir = os.path.join(ingest_dir_server, "textures").replace('\\', '/')
 
-            # --- SURGICAL CHANGE START ---
             SPECIAL_TEXTURE_MAP = {
                 "HEIGHT": "height_texture",
                 "EMISSIVE": "emissive_mask_texture",
@@ -1483,9 +1483,8 @@ if IS_BLENDER_CONTEXT:
                 "SINGLE_SCATTERING": "subsurface_color_texture",
                 "MEASUREMENT_DISTANCE": "subsurface_radius_texture"
             }
-            # --- SURGICAL CHANGE END ---
 
-            # This loop now correctly builds the list of files to upload
+            # This loop builds the complete list of files to upload
             for mat_name, texture_list in assignments_by_original_mat_name.items():
                 for texture_data in texture_list:
                     local_path, tex_type = texture_data.get('path'), texture_data.get('type')
@@ -1503,16 +1502,46 @@ if IS_BLENDER_CONTEXT:
                 logging.warning("No valid special textures found to upload.")
                 return {'FINISHED'}
 
-            # --- SURGICAL CHANGE START: Replacing the payload ---
-            logging.info(f"Ingesting {len(textures_for_ingest)} total special textures...")
             base_api_url = addon_prefs.remix_export_url.rstrip('/')
-            ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [ { "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False } ], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [ 0, "Initializing", True ] } }, "check_plugins": [ { "name": "MaterialShaders", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllMaterials" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True, "shader_subidentifiers": { "AperturePBR_Opacity": ".*" } }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToOctahedral", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:normalmap_texture": { "encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal" } }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToDDS", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:diffuse_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:emissive_mask_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:height_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max" ] }, "inputs:metallic_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:normalmap_texture": { "args": [ "--format", "bc5", "--no-mip-gamma-correct" ] }, "inputs:reflectionroughness_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:transmittance_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:subsurface_color_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:subsurface_radius_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]} }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True }, { "channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True }, { "channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds" }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "MassTexturePreview", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "Nothing" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } } ], "resultor_plugins": [ { "name": "FileMetadataWritter", "data": { "channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] } } ] }
-            # --- SURGICAL CHANGE END ---
+            base_ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [ { "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False } ], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [ 0, "Initializing", True ] } }, "check_plugins": [ { "name": "MaterialShaders", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllMaterials" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True, "shader_subidentifiers": { "AperturePBR_Opacity": ".*" } }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToOctahedral", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:normalmap_texture": { "encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal" } }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToDDS", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:diffuse_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:emissive_mask_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:height_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max" ] }, "inputs:metallic_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:normalmap_texture": { "args": [ "--format", "bc5", "--no-mip-gamma-correct" ] }, "inputs:reflectionroughness_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:transmittance_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:subsurface_color_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:subsurface_radius_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]} }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True }, { "channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True }, { "channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds" }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "MassTexturePreview", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "Nothing" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } } ], "resultor_plugins": [ { "name": "FileMetadataWritter", "data": { "channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] } } ] }
+            
+            # --- SURGICAL CHANGE START ---
+            import copy
+            
+            BATCH_SIZE = 5
+            total_textures = len(textures_for_ingest)
+            logging.info(f"Ingesting {total_textures} total special textures in batches of {BATCH_SIZE}...")
+            
+            # Loop through the master list in chunks of BATCH_SIZE
+            for i in range(0, total_textures, BATCH_SIZE):
+                batch = textures_for_ingest[i:i + BATCH_SIZE]
+                batch_number = (i // BATCH_SIZE) + 1
+                total_batches = (total_textures + BATCH_SIZE - 1) // BATCH_SIZE
+                
+                logging.info(f"  > Processing Ingest Batch {batch_number}/{total_batches} ({len(batch)} textures)...")
+                
+                # Create a deep copy of the payload for this specific batch
+                ingest_payload = copy.deepcopy(base_ingest_payload)
+                
+                # Set the dynamic data for this batch
+                ingest_payload["context_plugin"]["data"]["input_files"] = batch
+                ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
 
-            ingest_payload["context_plugin"]["data"]["input_files"] = textures_for_ingest
-            ingest_payload["context_plugin"]["data"]["output_directory"] = server_textures_output_dir
-            ingest_response = make_request_with_retries('POST', f"{base_api_url}/material", json_payload=ingest_payload, verify=addon_prefs.remix_verify_ssl)
-            if not ingest_response or ingest_response.status_code >= 400: return {'CANCELLED'}
+                # Send the request for the current batch
+                ingest_response = make_request_with_retries(
+                    'POST', 
+                    f"{base_api_url}/material", 
+                    json_payload=ingest_payload, 
+                    verify=addon_prefs.remix_verify_ssl
+                )
+                
+                # If any batch fails, abort the entire operation
+                if not ingest_response or ingest_response.status_code >= 400:
+                    logging.error(f"    - Ingest Batch {batch_number} FAILED. Aborting special texture assignment.")
+                    return {'CANCELLED'}
+            
+            logging.info("All special texture ingest batches completed successfully.")
+            # --- SURGICAL CHANGE END ---
 
             stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
             all_inputs_url = f"{stagecraft_api_url_base}/textures/?selection=true&filter_session_prims=false&exists=true"
@@ -1529,7 +1558,7 @@ if IS_BLENDER_CONTEXT:
                             server_mat_name_to_prim_map[material_name_from_server] = base_shader_path
                 except ValueError: continue
         
-            # This final lookup loop is now correct
+            # This final lookup loop is now correct and runs once after all ingests
             final_put_payload_list = []
             for original_blender_name, assignments_list in assignments_by_original_mat_name.items():
                 final_exported_name = final_mtl_name_map.get(original_blender_name)
@@ -1564,7 +1593,7 @@ if IS_BLENDER_CONTEXT:
         except Exception as e:
             logging.error(f"A critical error occurred: {e}", exc_info=True)
             return {'CANCELLED'}
-  
+            
     def _stable_repr(value):
         """Creates a stable, repeatable string representation for various data types."""
         if isinstance(value, (int, str, bool)):
@@ -2347,7 +2376,7 @@ if IS_BLENDER_CONTEXT:
     
         # --- Configuration for Smart Scaling ---
         MAX_POTENTIAL_WORKERS: int = max(1, os.cpu_count()) 
-        INITIAL_WORKER_COUNT: int = 3
+        INITIAL_WORKER_COUNT: int = 2
     
         # --- Event-Driven Stabilization ---
         _initial_tasks_finished_count: int = 0
@@ -2366,24 +2395,6 @@ if IS_BLENDER_CONTEXT:
         CPU_LOW_THRESHOLD: int = 85
         RAM_LOW_THRESHOLD: int = 85
     
-        # --- START OF DEBUGGING SIMULATION ---
-        def _get_system_resources(self):
-            """
-            [DEBUG SIMULATION] This method is modified to always report 99% CPU usage
-            to trigger the worker scale-down logic for debugging purposes.
-            """
-            # In a real scenario, this would use psutil.
-            # We are forcing a high CPU value here.
-            simulated_cpu = 99.0
-            simulated_ram = 50.0 # Keep RAM normal to isolate the CPU trigger
-
-            if PSUTIL_INSTALLED:
-                import psutil
-                # We still get the real RAM usage.
-                simulated_ram = psutil.virtual_memory().percent
-        
-            return simulated_cpu, simulated_ram
-
         def _communication_thread_target(self, worker_process):
             """Dedicated thread to read stdout from a single worker."""
             if not worker_process or not worker_process.stdout: return
@@ -2404,6 +2415,15 @@ if IS_BLENDER_CONTEXT:
         def _launch_new_worker(self, slot_index):
             if slot_index >= len(self._worker_slots): return
             slot = self._worker_slots[slot_index]
+            
+            # --- START OF THE FIX ---
+            # Explicitly check if the slot is idle before trying to launch.
+            # This prevents trying to launch into a slot that might still be shutting down.
+            if slot['status'] != 'idle':
+                logging.warning(f"Attempted to launch worker in slot {slot_index}, but its status was '{slot['status']}'. Aborting launch for this slot.")
+                return
+            # --- END OF THE FIX ---
+            
             if slot['process'] is not None and slot['process'].poll() is None: return
 
             lib_path = get_persistent_lib_path()
@@ -2457,15 +2477,13 @@ if IS_BLENDER_CONTEXT:
 
             except Exception as e:
                 logging.error(f"Could not launch worker for slot {slot_index}: {e}", exc_info=True)
-                slot['status'] = 'failed'
-            
+                slot['status'] = 'failed'            
         
         def _terminate_worker(self, slot_index):
             """
-            [HYBRID SHUTDOWN V2 - AGGRESSIVE FAILSAFE] Gracefully shuts down a worker.
-            1. Sends a 'quit' command and waits for a clean exit.
-            2. If it times out, sends a terminate signal and waits 0.5 seconds.
-            3. If it's still running, forcefully kills the process immediately.
+            [HYBRID SHUTDOWN V3 - CORRECTED STATUS] Gracefully shuts down a worker
+            and correctly sets its slot status to 'idle' upon completion, making it
+            available for reuse by the dynamic scaler.
             """
             if slot_index >= len(self._worker_slots):
                 return
@@ -2491,24 +2509,23 @@ if IS_BLENDER_CONTEXT:
                     logging.warning(f"Worker {slot_index} did not respond to quit command. Forcibly terminating (PID: {worker.pid}).")
                     worker.terminate()
                     try:
-                        # --- THIS IS THE MODIFIED LOGIC ---
                         # Give it only 0.5 seconds to die after the terminate signal.
                         worker.wait(timeout=0.5)
                         logging.info(f"Worker {slot_index} (PID: {worker.pid}) terminated successfully.")
-                        # --- END OF MODIFICATION ---
                     except subprocess.TimeoutExpired:
-                        # --- THIS IS THE MODIFIED LOGIC ---
                         # If it's still alive after 0.5 seconds, use the final, most aggressive method.
                         logging.error(f"Worker {slot_index} (PID: {worker.pid}) did not terminate. Killing process now.")
                         worker.kill()
-                        # --- END OF MODIFICATION ---
                 finally:
                     # --- Final Cleanup ---
                     if worker in ACTIVE_WORKER_PROCESSES:
                         ACTIVE_WORKER_PROCESSES.remove(worker)
                     slot['process'] = None
-                    slot['status'] = 'suspended'
-          
+                    # --- THIS IS THE FIX ---
+                    # The slot is now idle and available for a new worker to be launched into it.
+                    slot['status'] = 'idle'
+                    # --- END OF FIX ---
+                    
         def _material_uses_udims(self, mat):
             """Checks if a material uses any UDIM (tiled) image textures."""
             if not mat or not mat.use_nodes:
@@ -3390,8 +3407,6 @@ if IS_BLENDER_CONTEXT:
                 return {'PASS_THROUGH'}
 
             with self._op_lock:
-                # --- START OF THE DEFINITIVE FIX ---
-                # Phase 0: Check for Completion FIRST. This is the highest priority.
                 if self._finished_tasks >= self._total_tasks and self._operator_state not in ['FINISHING', 'CLEANING_UP']:
                     logging.info("All bake tasks are complete. Moving to finalization.")
                     self._operator_state = 'FINISHING'
@@ -3408,9 +3423,7 @@ if IS_BLENDER_CONTEXT:
                             logging.error(f"A critical error occurred during _finalize_export: {e}", exc_info=True)
                             self.report({'ERROR'}, "Finalization failed. See console for details.")
                             return self._cleanup(context, {'CANCELLED'})
-                # --- END OF THE DEFINITIVE FIX ---
 
-                # --- Phase 1: Process Logs & Worker Results ---
                 try:
                     while not self._log_queue.empty():
                         print(self._log_queue.get_nowait())
@@ -3440,17 +3453,31 @@ if IS_BLENDER_CONTEXT:
                                 slot['tasks_completed'] += 1
                                 if status == "failure":
                                     self._failed_tasks += 1
-                    
+                                
+                                if status == "success":
+                                    task_avg_cpu = sum(slot['task_cpu_readings']) / len(slot['task_cpu_readings']) if slot['task_cpu_readings'] else 0
+                                    task_avg_ram = sum(slot['task_ram_readings']) / len(slot['task_ram_readings']) if slot['task_ram_readings'] else 0
+
+                                    if task_avg_cpu > 0 and task_avg_ram > 0:
+                                        n = sum(s['tasks_completed'] for s in self._worker_slots)
+                                        if n > 0:
+                                            self._running_average_task_cpu = (self._running_average_task_cpu * (n - 1) + task_avg_cpu) / n
+                                            self._running_average_task_ram = (self._running_average_task_ram * (n - 1) + task_avg_ram) / n
+
                                 if self._operator_state == 'STABILIZING':
                                     self._initial_tasks_finished_count += 1
-                                    logging.info(f"Initial task finished. ({self._initial_tasks_finished_count}/{min(self.INITIAL_WORKER_COUNT, self._total_tasks)} needed to start scaling)")
+                                
+                                try:
+                                    active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'ready', 'launching'])
+                                    with open(self._worker_log_path, 'a') as f:
+                                        timestamp = datetime.now().strftime("%H:%M:%S")
+                                        progress = f"({self._finished_tasks}/{self._total_tasks})"
+                                        f.write(f"{timestamp} | Task {progress} complete. | Active Workers: {active_workers}\n")
+                                except Exception as e:
+                                    logging.error(f"Failed to write to worker log file: {e}")
 
-                                if slot['peak_ram_on_task'] > 0:
-                                    n = sum(s['tasks_completed'] for s in self._worker_slots)
-                                    self._running_average_peak_ram = self._running_average_peak_ram * (n - 1) / n if n > 1 else slot['peak_ram_on_task']
-                    
                                 slot['status'] = 'ready'
-                                slot['task_start_time'] = 0 # Reset task timer
+                                slot['task_start_time'] = 0
                     
                             elif status == "error":
                                 logging.error(f"Worker in slot {slot_index} reported a critical error: {result.get('details', 'N/A')}")
@@ -3460,33 +3487,31 @@ if IS_BLENDER_CONTEXT:
                 except Empty:
                     pass
 
-                # --- Phase 2: Dispatch Tasks to Ready Workers ---
                 for i, slot in enumerate(self._worker_slots):
                     if slot['status'] == 'ready' and self._master_task_queue:
                         task_to_dispatch = self._master_task_queue.popleft()
-                        # The global_task_number and total_tasks are now pre-assigned.
-                        # We no longer need to manage a dispatch counter here.
                         task_to_dispatch['task_blend_file'] = bpy.data.filepath
                         try:
                             slot['process'].stdin.write(json.dumps(task_to_dispatch) + "\n")
                             slot['process'].stdin.flush()
                             slot['status'] = 'running'
                             slot['current_task'] = task_to_dispatch
-                            slot['peak_ram_on_task'] = 0
-                            slot['task_start_time'] = time.monotonic() # Start the task timer
+                            slot['task_cpu_readings'].clear()
+                            slot['task_ram_readings'].clear()
+                            slot['task_start_time'] = time.monotonic()
                         except (IOError, BrokenPipeError):
                             logging.error(f"Pipe to worker {i} was broken. Requeueing task and handling failed worker.")
                             self._master_task_queue.appendleft(task_to_dispatch)
-                            # No dispatch counter to decrement anymore.
                             self._handle_failed_worker(i, requeue_task=False)
 
-                # --- Phase 3: Main State Machine Logic ---
                 current_time = time.monotonic()
+                self._sample_and_record_resources()
                 cpu_now, ram_now = self._get_system_resources()
-                self._update_peak_utilization(cpu_now, ram_now)
 
                 if self._operator_state == 'RAMPING_UP':
                     logging.info("--- State: Ramping Up ---")
+                    _, self._baseline_ram = self._get_system_resources()
+                    logging.info(f"Captured baseline RAM at {self._baseline_ram:.1f}% before worker launch.")
                     bpy.ops.wm.save_mainfile()
         
                     num_to_launch = min(len(self._worker_slots), self.INITIAL_WORKER_COUNT, self._total_tasks)
@@ -3494,49 +3519,116 @@ if IS_BLENDER_CONTEXT:
                     for i in range(num_to_launch):
                         self._launch_new_worker(i)
         
-                    self._initial_tasks_finished_count = 0
                     self._operator_state = 'STABILIZING'
                     logging.info(f"Entering stabilization. Waiting for {num_to_launch} initial task(s) to complete.")
 
                 elif self._operator_state == 'STABILIZING':
                     num_required = min(self.INITIAL_WORKER_COUNT, self._total_tasks)
                     if self._initial_tasks_finished_count >= num_required:
-                        logging.info("--- State: Stabilization Finished (event-driven). Switching to Running. ---")
+                        logging.info("--- State: Stabilization Finished. Switching to dynamic Running mode. ---")
                         self._operator_state = 'RUNNING'
                         self._next_resource_check_time = current_time
+
+                elif self._operator_state == 'COOLDOWN':
+                    if current_time >= self._cooldown_end_time:
+                        logging.info("--- State: Cooldown Finished. Returning to RUNNING for re-evaluation. ---")
+                        self._operator_state = 'RUNNING'
 
                 elif self._operator_state == 'RUNNING':
                     if current_time >= self._next_resource_check_time:
                         self._next_resource_check_time = current_time + self.RESOURCE_CHECK_INTERVAL_SEC
-            
-                        is_cpu_high = cpu_now > self.CPU_HIGH_THRESHOLD
-                        is_ram_high = ram_now > self.RAM_HIGH_THRESHOLD
-
-                        if is_cpu_high or is_ram_high:
+                        
+                        running_worker_count = sum(1 for s in self._worker_slots if s['status'] in ['running', 'ready', 'launching'])
+                        
+                        if cpu_now > self.CPU_HIGH_THRESHOLD or ram_now > self.RAM_HIGH_THRESHOLD:
                             self._high_usage_counter += 1
                             if self._high_usage_counter >= self.HIGH_USAGE_SUSTAINED_CHECKS:
-                                logging.warning(f"Sustained high resource usage detected (CPU:{cpu_now}%, RAM:{ram_now}%). Initiating scale-down.")
-                            
-                                running_workers = [(i, s) for i, s in enumerate(self._worker_slots) if s['status'] in ['running', 'ready']]
-                            
-                                if len(running_workers) > self.INITIAL_WORKER_COUNT:
-                                    if is_cpu_high and not is_ram_high:
-                                        running_workers.sort(key=lambda item: item[1].get('task_start_time', 0))
-                                        slot_to_terminate_index, _ = running_workers[0]
-                                        logging.warning(f"  > High CPU is the primary issue. Terminating longest-running worker (Slot {slot_to_terminate_index}) as a precaution against stalls.")
-                                        self._handle_failed_worker(slot_to_terminate_index, requeue_task=True)
-                                    elif is_ram_high:
-                                        running_workers.sort(key=lambda item: item[1]['tasks_completed'])
-                                        slot_to_terminate_index, _ = running_workers[0]
-                                        logging.warning(f"  > High RAM is the primary issue. Terminating least productive worker (Slot {slot_to_terminate_index}).")
-                                        self._handle_failed_worker(slot_to_terminate_index, requeue_task=True)
-                            
+                                logging.warning(f"Sustained high usage (CPU:{cpu_now:.1f}%, RAM:{ram_now:.1f}%). Calculating scale-down.")
+                                cpu_overage = max(0, cpu_now - self.CPU_HIGH_THRESHOLD)
+                                ram_overage = max(0, ram_now - self.RAM_HIGH_THRESHOLD)
+                                num_to_term_cpu = math.ceil(cpu_overage / self._running_average_task_cpu) if self._running_average_task_cpu > 1 else 0
+                                num_to_term_ram = math.ceil(ram_overage / self._running_average_task_ram) if self._running_average_task_ram > 1 else 0
+                                
+                                num_to_terminate = max(num_to_term_cpu, num_to_term_ram, 1)
+                                num_to_terminate = min(num_to_terminate, max(0, running_worker_count - 1))
+
+                                if num_to_terminate > 0:
+                                    logging.warning(f" > System over-utilized. Terminating {num_to_terminate} worker(s).")
+                                    candidates = sorted([(i, s) for i, s in enumerate(self._worker_slots) if s['status'] in ['running', 'ready']], key=lambda item: item[1]['tasks_completed'])
+                                    for i in range(min(num_to_terminate, len(candidates))):
+                                        slot_index, _ = candidates[i]
+                                        logging.warning(f"   - Terminating least productive worker in slot {slot_index}.")
+                                        self._handle_failed_worker(slot_index, requeue_task=True)
+                                    
+                                    logging.info(f" > Entering COOLDOWN state for {self.COOLDOWN_DURATION_SEC} seconds.")
+                                    self._operator_state = 'COOLDOWN'
+                                    self._cooldown_end_time = current_time + self.COOLDOWN_DURATION_SEC
                                 self._high_usage_counter = 0
                         else:
                             self._high_usage_counter = 0
+                        
+                        has_idle_slots = any(s['status'] == 'idle' for s in self._worker_slots)
+                        try:
+                            with open(self._worker_log_path, 'a') as f:
+                                timestamp = datetime.now().strftime("%H:%M:%S")
+                                f.write(f"--- {timestamp} | RUNNING State Check ---\n")
+                                f.write(f"  > Current Resources: CPU={cpu_now:.1f}%, RAM={ram_now:.1f}%\n")
+                                f.write(f"  > High Usage Counter: {self._high_usage_counter}\n")
+                                f.write(f"  > Pre-condition check:\n")
+                                f.write(f"    - High usage sustained? {'Yes' if self._high_usage_counter > 0 else 'No'}\n")
+                                f.write(f"    - Idle worker slots available? {'Yes' if has_idle_slots else 'No'}\n")
+                                f.write(f"    - Tasks in queue? {'Yes' if self._master_task_queue else 'No'}\n")
 
-                # --- Phase 4: Crash & Stall Detection ---
-                TASK_TIMEOUT_SECONDS = 300 # 5 minutes
+                                if self._high_usage_counter == 0 and has_idle_slots and self._master_task_queue:
+                                    f.write(f"  > All pre-conditions met. Evaluating scale-up...\n")
+                                    f.write(f"    - Avg Worker Impact: CPU={self._running_average_task_cpu:.1f}%, RAM={self._running_average_task_ram:.1f}%\n")
+                                    cpu_headroom = self.CPU_LOW_THRESHOLD - cpu_now
+                                    ram_headroom = self.RAM_LOW_THRESHOLD - ram_now
+                                    f.write(f"    - Available Headroom: CPU={cpu_headroom:.1f}%, RAM={ram_headroom:.1f}%\n")
+                                    f.write(f"    - Low Thresholds: CPU={self.CPU_LOW_THRESHOLD}%, RAM={self.RAM_LOW_THRESHOLD}%\n")
+
+                                    if self._running_average_task_cpu < cpu_headroom and self._running_average_task_ram < ram_headroom:
+                                        f.write(f"  > Decision: Scale-up conditions MET. Calculating number of new workers...\n")
+                                        num_by_cpu = math.floor(cpu_headroom / self._running_average_task_cpu) if self._running_average_task_cpu > 1 else float('inf')
+                                        num_by_ram = math.floor(ram_headroom / self._running_average_task_ram) if self._running_average_task_ram > 1 else float('inf')
+                                        idle_slot_indices = [i for i, s in enumerate(self._worker_slots) if s['status'] == 'idle']
+                                        num_to_launch = min(num_by_cpu, num_by_ram, len(idle_slot_indices), len(self._master_task_queue))
+                                        f.write(f"      - Max new workers by CPU: {int(num_by_cpu) if num_by_cpu != float('inf') else 'inf'}\n")
+                                        f.write(f"      - Max new workers by RAM: {int(num_by_ram) if num_by_ram != float('inf') else 'inf'}\n")
+                                        f.write(f"      - Available idle slots: {len(idle_slot_indices)}\n")
+                                        f.write(f"      - Queued tasks: {len(self._master_task_queue)}\n")
+                                        f.write(f"      - FINAL LAUNCH COUNT: {num_to_launch}\n")
+                                    else:
+                                        f.write(f"  > Decision: Scale-up conditions NOT MET (average worker cost exceeds available headroom).\n")
+                                else:
+                                    f.write(f"  > One or more pre-conditions failed. No scale-up evaluation.\n")
+                        except Exception as e:
+                            logging.error(f"Failed to write to worker debug log: {e}")
+
+                        if self._high_usage_counter == 0 and has_idle_slots and self._master_task_queue:
+                            cpu_headroom = self.CPU_LOW_THRESHOLD - cpu_now
+                            ram_headroom = self.RAM_LOW_THRESHOLD - ram_now
+                            
+                            if self._running_average_task_cpu < cpu_headroom and self._running_average_task_ram < ram_headroom:
+                                num_by_cpu = math.floor(cpu_headroom / self._running_average_task_cpu) if self._running_average_task_cpu > 1 else float('inf')
+                                num_by_ram = math.floor(ram_headroom / self._running_average_task_ram) if self._running_average_task_ram > 1 else float('inf')
+                                
+                                idle_slot_indices = [i for i, s in enumerate(self._worker_slots) if s['status'] == 'idle']
+                                num_to_launch = min(num_by_cpu, num_by_ram, len(idle_slot_indices), len(self._master_task_queue))
+                                
+                                # --- START OF SURGICAL CHANGE ---
+                                if num_to_launch > 0:
+                                    logging.info(f"Low resource usage (CPU:{cpu_now:.1f}%, RAM:{ram_now:.1f}%). Scaling up by {num_to_launch} worker(s).")
+                                    for i in range(num_to_launch):
+                                        self._launch_new_worker(idle_slot_indices[i])
+                                    
+                                    # Enter a cooldown period immediately after launching workers to prevent a race condition.
+                                    logging.info(f" > Entering COOLDOWN state for {self.COOLDOWN_DURATION_SEC} seconds after scale-up.")
+                                    self._operator_state = 'COOLDOWN'
+                                    self._cooldown_end_time = current_time + self.COOLDOWN_DURATION_SEC
+                                # --- END OF SURGICAL CHANGE ---
+                
+                TASK_TIMEOUT_SECONDS = 300
                 for i, slot in enumerate(self._worker_slots):
                     if slot.get('process') and slot['process'].poll() is not None and slot['status'] in ['running', 'launching']:
                         logging.error(f"Worker in slot {i} (PID: {slot.get('process').pid}) has crashed unexpectedly!")
@@ -3547,7 +3639,6 @@ if IS_BLENDER_CONTEXT:
                         logging.error(f"Worker in slot {i} (PID: {slot.get('process').pid}) has been running the same task for over {TASK_TIMEOUT_SECONDS} seconds. Assuming stall and terminating.")
                         self._handle_failed_worker(i, requeue_task=True)
     
-                # --- Phase 5: UI Update ---
                 if self._operator_state != 'FINISHING':
                     progress = (self._finished_tasks / self._total_tasks) * 100 if self._total_tasks > 0 else 100
                     active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'launching', 'ready'])
@@ -3558,7 +3649,7 @@ if IS_BLENDER_CONTEXT:
                     context.workspace.status_text_set(status_text)
 
                 return {'PASS_THROUGH'}
-                    
+                
         def _is_geonodes_generator(self, obj):
             """
             [MODIFIED FROM ADDON 2]
@@ -3591,21 +3682,66 @@ if IS_BLENDER_CONTEXT:
                 return True
 
             return False
-
+            
+        #def _get_system_resources(self):
+            #"""
+            #[DEBUG SIMULATION] This method is modified to always report 99% CPU and RAM usage
+            #to trigger the worker scale-down logic for debugging purposes.
+            #"""
+            # Always return maxed-out values to force scale-down.
+            #return 99.0, 99.0
+            
         def _get_system_resources(self):
-            """Helper to get current CPU and RAM usage, returns (0,0) if psutil fails."""
+            """
+            [SURGICALLY CHANGED FOR RELIABILITY]
+            Helper to get current CPU and RAM usage. Adds a small interval to the
+            cpu_percent call to ensure it returns a meaningful, non-zero value
+            instead of relying on a previous call's timing.
+            """
+            # --- START OF SURGICAL CHANGE ---
             if PSUTIL_INSTALLED:
                 import psutil
-                return psutil.cpu_percent(), psutil.virtual_memory().percent
-            return 0, 0
+                # Adding a small interval makes this a blocking call, but it ensures
+                # we get a reliable reading compared to the last time it was called.
+                return psutil.cpu_percent(interval=0.1), psutil.virtual_memory().percent
+            # --- END OF SURGICAL CHANGE ---
+            return 0, 0            
+            
+        def _sample_and_record_resources(self):
+            """
+            [SURGICALLY CHANGED FOR MARGINAL RAM]
+            Samples current system resources. For RAM, it records the MARGINAL usage,
+            which is the current total usage minus the baseline captured before any
+            workers were launched. This provides a better metric for the actual
+            cost of a worker task.
+            """
+            if not PSUTIL_INSTALLED:
+                return
 
-        def _update_peak_utilization(self, cpu, ram):
-            """Updates the peak utilization for all currently running workers."""
+            # --- START OF SURGICAL CHANGE ---
+            cpu_now, ram_now = self._get_system_resources()
+
             for slot in self._worker_slots:
                 if slot['status'] == 'running':
-                    slot['peak_cpu_since_ready'] = max(slot['peak_cpu_since_ready'], cpu)
-                    # Update the new per-task peak RAM tracker
+                    # CPU usage is already a good proxy for marginal cost.
+                    slot['task_cpu_readings'].append(cpu_now)
+                    
+                    # Calculate and record the marginal RAM usage above the baseline.
+                    # max(0, ...) prevents negative values if system RAM fluctuates downwards.
+                    marginal_ram = max(0, ram_now - self._baseline_ram)
+                    slot['task_ram_readings'].append(marginal_ram)
+            # --- END OF SURGICAL CHANGE ---
+            
+        def _update_peak_utilization(self, cpu, ram):
+            """Updates the PER-TASK peak utilization for all currently running workers."""
+            # --- SURGICAL CHANGE START ---
+            # This logic now updates the per-task trackers, which are reset
+            # every time a new task is dispatched to a worker slot.
+            for slot in self._worker_slots:
+                if slot['status'] == 'running':
+                    slot['peak_cpu_on_task'] = max(slot['peak_cpu_on_task'], cpu)
                     slot['peak_ram_on_task'] = max(slot['peak_ram_on_task'], ram)
+            # --- SURGICAL CHANGE END ---
       
         def _preflight_validation(self, objects_to_process):
             """
@@ -3728,6 +3864,17 @@ if IS_BLENDER_CONTEXT:
             export_lock = True
 
             self._op_lock = Lock()
+            
+            # --- NEW: Setup for worker count logging ---
+            self._worker_log_path = r"C:\Users\Friss\Documents\RemixIngestor 2.48\worker_log.txt"
+            try:
+                os.makedirs(os.path.dirname(self._worker_log_path), exist_ok=True)
+                with open(self._worker_log_path, 'w') as f:
+                    f.write(f"--- New Export Session Started at {datetime.now().isoformat()} ---\n")
+            except Exception as e:
+                logging.error(f"Failed to create or clear worker log file: {e}")
+            # --- END NEW ---
+            
             self._operator_state = 'INITIALIZING'
             self._export_data = {
                 "objects_for_export": [], "bake_info": {}, "temp_files_to_clean": set(),
@@ -3741,7 +3888,19 @@ if IS_BLENDER_CONTEXT:
             self._finished_tasks = 0
             self._failed_tasks = 0
             self._high_usage_counter = 0
-            self._running_average_peak_ram = 5.0
+            
+            self._running_average_task_cpu = 15.0
+            # --- START OF SURGICAL CHANGE ---
+            # This running average will now correctly track MARGINAL RAM usage.
+            self._running_average_task_ram = 5.0
+            # This new variable will store the system RAM state before any workers are launched.
+            self._baseline_ram = 0.0
+            # --- END OF SURGICAL CHANGE ---
+            self._initial_tasks_finished_count = 0
+            
+            # --- NEW: Add state for cooldown logic ---
+            self._cooldown_end_time = 0.0
+            self.COOLDOWN_DURATION_SEC = 5.0 # Wait 5 seconds before re-evaluating after a scale-down
 
             try:
                 if not is_blend_file_saved():
@@ -3812,8 +3971,6 @@ if IS_BLENDER_CONTEXT:
                             if self._material_uses_exr(mat):
                                 objects_requiring_exr_conversion.add(obj)
         
-                # --- SURGICAL FIX START ---
-                # Initialize the map that will bridge the conversion and caching steps.
                 exr_to_png_map = {}
 
                 if all_materials_cached:
@@ -3829,7 +3986,6 @@ if IS_BLENDER_CONTEXT:
                     if objects_requiring_exr_conversion:
                         logging.info(f"Running non-destructive EXR conversion for {len(objects_requiring_exr_conversion)} object(s).")
                 
-                        # Call the non-destructive function. It returns a map of {exr_path: png_path}.
                         success, exr_to_png_map = convert_exr_textures_to_png(
                             context, 
                             list(objects_requiring_exr_conversion), 
@@ -3838,8 +3994,6 @@ if IS_BLENDER_CONTEXT:
                         if not success:
                             raise RuntimeError("Failed to convert EXR textures to PNG.")
 
-                        # This is for the baking workers. It tells them which PNG to use
-                        # when they see an EXR in the temp .blend file.
                         if exr_to_png_map:
                             logging.info(f"Merging {len(exr_to_png_map)} EXR->PNG conversions into the main texture map for workers...")
                             main_texture_map = self._export_data['texture_translation_map']
@@ -3853,14 +4007,12 @@ if IS_BLENDER_CONTEXT:
                     else:
                         logging.info("No uncached materials use EXR textures. Skipping EXR conversion.")
 
-                # Pass the map to the collection function. This is the crucial communication step.
                 all_tasks, _, _, _ = self.collect_bake_tasks(
                     context, 
                     self._export_data["objects_for_export"], 
                     self._export_data,
-                    exr_to_png_map  # Pass the map here
+                    exr_to_png_map
                 )
-                # --- SURGICAL FIX END ---
 
                 if all_tasks:
                     logging.info(f"Preparing {len(all_tasks)} isolated .blend files for workers...")
@@ -3909,9 +4061,10 @@ if IS_BLENDER_CONTEXT:
                 self._worker_slots = [{
                     'status': 'idle', 'process': None, 'current_task': None, 
                     'launch_time': 0, 'ready_time': 0,
-                    'peak_cpu_since_ready': 0, 
-                    'peak_ram_on_task': 0,
-                    'tasks_completed': 0
+                    'task_cpu_readings': [], 
+                    'task_ram_readings': [], 
+                    'tasks_completed': 0,
+                    'task_start_time': 0
                 } for _ in range(num_potential_slots)]
     
                 self._operator_state = 'RAMPING_UP'
@@ -3923,7 +4076,7 @@ if IS_BLENDER_CONTEXT:
                 logging.error(f"Export failed during setup: {e}", exc_info=True)
                 self.report({'ERROR'}, f"Export setup failed: {e}")
                 return self._cleanup(context, {'CANCELLED'})
-        
+                
         def _handle_failed_worker(self, slot_index, requeue_task=True):
             """
             Manages a worker that has stopped, either by crashing or by being
