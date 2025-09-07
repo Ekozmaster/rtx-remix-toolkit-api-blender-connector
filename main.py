@@ -1830,7 +1830,6 @@ if IS_BLENDER_CONTEXT:
                 logging.info(f"--- [Importer] Stage 2: Building and finalizing {len(all_mesh_data)} Blender objects... ---")
                 stage2_start_time = time.perf_counter()
                 
-                # OPTIMIZATION: Create all materials in a single pre-pass to avoid redundant lookups.
                 material_map = {}
                 unique_material_paths = {data['material_path'] for data in all_mesh_data if data.get('material_path')}
 
@@ -1846,7 +1845,6 @@ if IS_BLENDER_CONTEXT:
                     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
                     material_map[usd_mat_path] = mat
                 
-                # OPTIMIZATION: Pre-calculate axis and scale matrices once outside the loop.
                 source_up_axis = detected_up_axis or addon_prefs.usd_import_up_axis
                 source_forward_axis = addon_prefs.usd_import_forward_axis
                 up_axis_base = source_up_axis.replace('NEGATIVE_', '')
@@ -1870,44 +1868,59 @@ if IS_BLENDER_CONTEXT:
                     logging.info(f"Applying uniform import scale factor of {import_scale} during matrix composition.")
                 
                 final_object_list = []
+                # --- SURGICAL CHANGE: Add set and counter for deduplication ---
+                seen_hashes = set()
+                skipped_count = 0
+                # --- END SURGICAL CHANGE ---
+
                 for data in all_mesh_data:
+                    # --- SURGICAL CHANGE: Check for duplicate hash ---
+                    mesh_hash = data.get("mesh_hash")
+                    if not mesh_hash or mesh_hash in seen_hashes:
+                        if mesh_hash: # Only log if it was a valid hash duplicate
+                            logging.info(f"Skipping duplicate mesh (Hash: {mesh_hash[:10]}...).")
+                            skipped_count += 1
+                        continue # Skip this mesh
+                    
+                    seen_hashes.add(mesh_hash)
+                    # --- END SURGICAL CHANGE ---
+
                     counts = data['counts']
                     if counts['verts'] == 0 or counts['faces'] == 0: continue
 
-                    mesh_name = data['name'].replace(':', '_')
+                    parent_name = data.get('parent_name', '')
+                    if parent_name:
+                        mesh_name = parent_name.replace(':', '_')
+                        logging.debug(f"Using parent prim name for object: '{mesh_name}'")
+                    else:
+                        mesh_name = data['name'].replace(':', '_')
+                        logging.debug(f"Parent name not found, falling back to prim name: '{mesh_name}'")
+                    
                     new_mesh = bpy.data.meshes.new(name=f"{mesh_name}_mesh")
                     
-                    # OPTIMIZATION: Pre-allocate all geometry arrays in single operations.
                     new_mesh.vertices.add(counts['verts'])
                     new_mesh.loops.add(counts['loops'])
                     new_mesh.polygons.add(counts['faces'])
                 
-                    # OPTIMIZATION: Use foreach_set for direct, high-speed memory transfer of geometry data.
                     new_mesh.vertices.foreach_set("co", data['verts_co'].ravel())
                     new_mesh.loops.foreach_set("vertex_index", data['loop_verts'])
                     new_mesh.polygons.foreach_set("loop_start", data['loop_starts'])
                     new_mesh.polygons.foreach_set("loop_total", data['loop_totals'])
 
-                    # --- OPTIMIZED UV HANDLING ---
                     uv_data = data.get('uvs')
                     uv_interpolation = data.get('uv_interpolation')
                     
                     if uv_data is not None and uv_interpolation is not None:
                         uv_layer = new_mesh.uv_layers.new(name="UVMap")
                     
-                        # Case A: UVs are per-face-corner (faceVarying). This is a direct copy.
                         if uv_interpolation == 'faceVarying':
                             if len(uv_data) == counts['loops']:
-                                # OPTIMIZATION: Direct memory copy for perfectly formatted UVs.
                                 uv_layer.data.foreach_set("uv", uv_data.ravel())
                         
-                        # Case B: UVs are per-vertex. They must be "expanded" to the per-loop format.
                         elif uv_interpolation == 'vertex':
                             if len(uv_data) == counts['verts']:
-                                # OPTIMIZATION: Use ultra-fast NumPy indexing to expand vertex UVs to loop UVs in memory.
                                 loop_verts_np = data['loop_verts']
                                 loop_uvs_np = uv_data[loop_verts_np]
-                                # OPTIMIZATION: Direct memory copy of the newly constructed loop UV array.
                                 uv_layer.data.foreach_set("uv", loop_uvs_np.ravel())
                     
                     new_mesh.validate(verbose=False)
@@ -1916,7 +1929,6 @@ if IS_BLENDER_CONTEXT:
                     new_obj = bpy.data.objects.new(mesh_name, new_mesh)
                     source_transform = Matrix(data["matrix_world"])
                     
-                    # OPTIMIZATION: Combine all transformations into a single matrix multiplication.
                     new_obj.matrix_world = correction_matrix @ source_transform @ scale_matrix
                     
                     mat_path = data.get('material_path')
@@ -1956,7 +1968,9 @@ if IS_BLENDER_CONTEXT:
                 stage2_end_time = time.perf_counter()
                 logging.info(f" > Stage 2 completed in {stage2_end_time - stage2_start_time:.2f}s.")
 
-                self.report({'INFO'}, f"Import complete. Created {len(final_object_list)} objects.")
+                # --- SURGICAL CHANGE: Update the final report message ---
+                self.report({'INFO'}, f"Import complete. Created {len(final_object_list)} objects (skipped {skipped_count} duplicates).")
+                # --- END SURGICAL CHANGE ---
                 return {'FINISHED'}
 
             except Exception as e:
@@ -2179,7 +2193,6 @@ if IS_BLENDER_CONTEXT:
                 all_mesh_data = []
                 detected_up_axis = None
                 
-                # Directly use the same worker function as the other importer
                 from .usd_scanner import scan_and_extract_data_for_file
                 
                 ctx = multiprocessing.get_context('spawn')
@@ -2211,8 +2224,6 @@ if IS_BLENDER_CONTEXT:
                     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
                     material_map[usd_mat_path] = mat
 
-                # --- SURGICAL CHANGE START ---
-                # Add the axis conflict validation check before creating the matrix.
                 source_up_axis = detected_up_axis or addon_prefs.usd_import_up_axis
                 source_forward_axis = addon_prefs.usd_import_forward_axis
                 up_axis_base = source_up_axis.replace('NEGATIVE_', '')
@@ -2220,7 +2231,6 @@ if IS_BLENDER_CONTEXT:
 
                 if up_axis_base == forward_axis_base:
                     logging.warning(f"Axis conflict detected during Remix import: Up ('{source_up_axis}') and Forward ('{source_forward_axis}') are the same.")
-                    # Sensible override: if up is Y, forward becomes Z. Otherwise, forward becomes Y.
                     if up_axis_base == 'Y':
                         source_forward_axis = 'Z'
                     else:
@@ -2228,12 +2238,11 @@ if IS_BLENDER_CONTEXT:
                     logging.warning(f" > Overriding Forward Axis to '{source_forward_axis}' to resolve conflict.")
 
                 correction_matrix = bpy_extras.io_utils.axis_conversion(
-                    from_forward=source_forward_axis, # Use the potentially corrected forward axis
-                    from_up=source_up_axis,          # Use the original up axis
+                    from_forward=source_forward_axis,
+                    from_up=source_up_axis,
                     to_forward='-Y',
                     to_up='Z',
                 ).to_4x4()
-                # --- SURGICAL CHANGE END ---
                 
                 scale_matrix = Matrix.Scale(addon_prefs.remix_import_scale, 4)
 
@@ -2241,7 +2250,16 @@ if IS_BLENDER_CONTEXT:
                     counts = data['counts']
                     if counts['verts'] == 0 or counts['faces'] == 0: continue
 
-                    mesh_name = data['name'].replace(':', '_')
+                    # --- SURGICAL CHANGE (Cleaned-up Naming Logic) ---
+                    usd_filepath = data.get('usd_file_path', '')
+                    if usd_filepath:
+                        base_filename = os.path.basename(usd_filepath)
+                        mesh_name, _ = os.path.splitext(base_filename)
+                    else:
+                        # Fallback if the path is missing for any reason
+                        mesh_name = data['name'].replace(':', '_')
+                    # --- END SURGICAL CHANGE ---
+
                     new_mesh = bpy.data.meshes.new(name=f"{mesh_name}_mesh")
                     
                     new_mesh.vertices.add(counts['verts'])
