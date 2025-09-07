@@ -3467,15 +3467,6 @@ if IS_BLENDER_CONTEXT:
                                 if self._operator_state == 'STABILIZING':
                                     self._initial_tasks_finished_count += 1
                                 
-                                try:
-                                    active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'ready', 'launching'])
-                                    with open(self._worker_log_path, 'a') as f:
-                                        timestamp = datetime.now().strftime("%H:%M:%S")
-                                        progress = f"({self._finished_tasks}/{self._total_tasks})"
-                                        f.write(f"{timestamp} | Task {progress} complete. | Active Workers: {active_workers}\n")
-                                except Exception as e:
-                                    logging.error(f"Failed to write to worker log file: {e}")
-
                                 slot['status'] = 'ready'
                                 slot['task_start_time'] = 0
                     
@@ -3568,43 +3559,6 @@ if IS_BLENDER_CONTEXT:
                             self._high_usage_counter = 0
                         
                         has_idle_slots = any(s['status'] == 'idle' for s in self._worker_slots)
-                        try:
-                            with open(self._worker_log_path, 'a') as f:
-                                timestamp = datetime.now().strftime("%H:%M:%S")
-                                f.write(f"--- {timestamp} | RUNNING State Check ---\n")
-                                f.write(f"  > Current Resources: CPU={cpu_now:.1f}%, RAM={ram_now:.1f}%\n")
-                                f.write(f"  > High Usage Counter: {self._high_usage_counter}\n")
-                                f.write(f"  > Pre-condition check:\n")
-                                f.write(f"    - High usage sustained? {'Yes' if self._high_usage_counter > 0 else 'No'}\n")
-                                f.write(f"    - Idle worker slots available? {'Yes' if has_idle_slots else 'No'}\n")
-                                f.write(f"    - Tasks in queue? {'Yes' if self._master_task_queue else 'No'}\n")
-
-                                if self._high_usage_counter == 0 and has_idle_slots and self._master_task_queue:
-                                    f.write(f"  > All pre-conditions met. Evaluating scale-up...\n")
-                                    f.write(f"    - Avg Worker Impact: CPU={self._running_average_task_cpu:.1f}%, RAM={self._running_average_task_ram:.1f}%\n")
-                                    cpu_headroom = self.CPU_LOW_THRESHOLD - cpu_now
-                                    ram_headroom = self.RAM_LOW_THRESHOLD - ram_now
-                                    f.write(f"    - Available Headroom: CPU={cpu_headroom:.1f}%, RAM={ram_headroom:.1f}%\n")
-                                    f.write(f"    - Low Thresholds: CPU={self.CPU_LOW_THRESHOLD}%, RAM={self.RAM_LOW_THRESHOLD}%\n")
-
-                                    if self._running_average_task_cpu < cpu_headroom and self._running_average_task_ram < ram_headroom:
-                                        f.write(f"  > Decision: Scale-up conditions MET. Calculating number of new workers...\n")
-                                        num_by_cpu = math.floor(cpu_headroom / self._running_average_task_cpu) if self._running_average_task_cpu > 1 else float('inf')
-                                        num_by_ram = math.floor(ram_headroom / self._running_average_task_ram) if self._running_average_task_ram > 1 else float('inf')
-                                        idle_slot_indices = [i for i, s in enumerate(self._worker_slots) if s['status'] == 'idle']
-                                        num_to_launch = min(num_by_cpu, num_by_ram, len(idle_slot_indices), len(self._master_task_queue))
-                                        f.write(f"      - Max new workers by CPU: {int(num_by_cpu) if num_by_cpu != float('inf') else 'inf'}\n")
-                                        f.write(f"      - Max new workers by RAM: {int(num_by_ram) if num_by_ram != float('inf') else 'inf'}\n")
-                                        f.write(f"      - Available idle slots: {len(idle_slot_indices)}\n")
-                                        f.write(f"      - Queued tasks: {len(self._master_task_queue)}\n")
-                                        f.write(f"      - FINAL LAUNCH COUNT: {num_to_launch}\n")
-                                    else:
-                                        f.write(f"  > Decision: Scale-up conditions NOT MET (average worker cost exceeds available headroom).\n")
-                                else:
-                                    f.write(f"  > One or more pre-conditions failed. No scale-up evaluation.\n")
-                        except Exception as e:
-                            logging.error(f"Failed to write to worker debug log: {e}")
-
                         if self._high_usage_counter == 0 and has_idle_slots and self._master_task_queue:
                             cpu_headroom = self.CPU_LOW_THRESHOLD - cpu_now
                             ram_headroom = self.RAM_LOW_THRESHOLD - ram_now
@@ -3864,16 +3818,6 @@ if IS_BLENDER_CONTEXT:
             export_lock = True
 
             self._op_lock = Lock()
-            
-            # --- NEW: Setup for worker count logging ---
-            self._worker_log_path = r"C:\Users\Friss\Documents\RemixIngestor 2.48\worker_log.txt"
-            try:
-                os.makedirs(os.path.dirname(self._worker_log_path), exist_ok=True)
-                with open(self._worker_log_path, 'w') as f:
-                    f.write(f"--- New Export Session Started at {datetime.now().isoformat()} ---\n")
-            except Exception as e:
-                logging.error(f"Failed to create or clear worker log file: {e}")
-            # --- END NEW ---
             
             self._operator_state = 'INITIALIZING'
             self._export_data = {
