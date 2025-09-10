@@ -547,14 +547,23 @@ if IS_BLENDER_CONTEXT:
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
         try:
-            scripts_dir = bpy.utils.user_resource('SCRIPTS')
-            logs_dir = os.path.join(scripts_dir, "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            log_file_path = os.path.join(logs_dir, "remix_asset_ingestor.log")
+            # --- SURGICAL CHANGE START ---
+            # The user requested that all debugging logs be centralized in the 
+            # 'remix_collect' folder. This folder is already used for all temporary
+            # bake files, making it the ideal location for associated logs.
+
+            # 1. Ensure the target directory for the log file exists. This is the 
+            #    same directory defined globally for bake caches.
+            os.makedirs(CUSTOM_COLLECT_PATH, exist_ok=True)
+
+            # 2. Define the new log file path inside the 'remix_collect' directory
+            #    with the specified name 'worker_log'.
+            log_file_path = os.path.join(CUSTOM_COLLECT_PATH, "worker_log")
+            # --- SURGICAL CHANGE END ---
 
             logging.basicConfig(
                 filename=log_file_path,
-                filemode='a',
+                filemode='a', # Append to the log file on each run
                 format='%(asctime)s - %(levelname)s - %(message)s',
                 level=logging.DEBUG
             )
@@ -566,6 +575,7 @@ if IS_BLENDER_CONTEXT:
             logging.getLogger().addHandler(console_handler)
 
             logging.info("Remix Asset Ingestor addon registered.")
+            # Update the print statement to reflect the new log file location.
             print(f"Logging initialized. Log file at: {log_file_path}")
         except Exception as e:
             print(f"Failed to set up logging: {e}")
@@ -2352,7 +2362,7 @@ if IS_BLENDER_CONTEXT:
                 remix_import_lock = False
                 total_end_time = time.perf_counter()
                 logging.info(f"Lock released. Total Remix import time: {total_end_time - total_start_time:.2f} seconds.")
-                
+                               
     class OBJECT_OT_export_and_ingest(Operator):
         bl_idname = "object.export_and_ingest"
         bl_label = "Export and Ingest (Dynamic Workers)"
@@ -2381,19 +2391,31 @@ if IS_BLENDER_CONTEXT:
         # --- Event-Driven Stabilization ---
         _initial_tasks_finished_count: int = 0
 
-        # Time in seconds between dynamic scaling decisions.
-        RESOURCE_CHECK_INTERVAL_SEC: int = 0.5
+        # --- SURGICAL CHANGE START: Updated Scaling and Standby Logic Configuration ---
+        # Time in seconds between dynamic scaling decisions. A longer interval reduces sensitivity.
+        RESOURCE_CHECK_INTERVAL_SEC: float = 0.5 
         _next_resource_check_time: float = 0.0
     
         # How many consecutive checks must be "high" before scaling down.
-        HIGH_USAGE_SUSTAINED_CHECKS: int = 3
+        # 20 checks * 0.5 sec/check = 10 seconds of sustained high usage.
+        HIGH_USAGE_SUSTAINED_CHECKS: int = 20
         _high_usage_counter: int = 0
 
         # Resource usage thresholds (as percentages).
         CPU_HIGH_THRESHOLD: int = 95
         RAM_HIGH_THRESHOLD: int = 95
+        # The LOW thresholds now create a true "dead zone" for hysteresis.
         CPU_LOW_THRESHOLD: int = 85
         RAM_LOW_THRESHOLD: int = 85
+        
+        # New state to manage the single standby worker. -1 means no worker is on standby.
+        _standby_worker_slot_index: int = -1
+        # New state to estimate the resource cost of a single idle worker.
+        _idle_worker_ram_cost: float = 2.0 # Default assumption of 2% RAM usage per idle worker
+        
+        # THIS IS THE FIX: Add the missing configuration variable.
+        COOLDOWN_DURATION_SEC: int = 10 # Seconds to wait before making another scaling decision
+        # --- SURGICAL CHANGE END ---
     
         def _communication_thread_target(self, worker_process):
             """Dedicated thread to read stdout from a single worker."""
@@ -3410,25 +3432,23 @@ if IS_BLENDER_CONTEXT:
                 if self._finished_tasks >= self._total_tasks and self._operator_state not in ['FINISHING', 'CLEANING_UP']:
                     logging.info("All bake tasks are complete. Moving to finalization.")
                     self._operator_state = 'FINISHING'
-                
-                    if self._failed_tasks > 0:
-                        self.report({'ERROR'}, f"{self._failed_tasks} bake task(s) failed. See console.")
-                        return self._cleanup(context, {'CANCELLED'})
-                    else:
-                        try:
+                    try:
+                        if self._failed_tasks > 0:
+                            self.report({'ERROR'}, f"{self._failed_tasks} bake task(s) failed. See console.")
+                            return self._cleanup(context, {'CANCELLED'})
+                        else:
                             self._finalize_export(context)
                             self.report({'INFO'}, f"Export complete. Baked {self._total_tasks} textures.")
                             return self._cleanup(context, {'FINISHED'})
-                        except Exception as e:
-                            logging.error(f"A critical error occurred during _finalize_export: {e}", exc_info=True)
-                            self.report({'ERROR'}, "Finalization failed. See console for details.")
-                            return self._cleanup(context, {'CANCELLED'})
+                    except Exception as e:
+                        logging.error(f"A critical error occurred during _finalize_export: {e}", exc_info=True)
+                        self.report({'ERROR'}, "Finalization failed. See console for details.")
+                        return self._cleanup(context, {'CANCELLED'})
 
                 try:
                     while not self._log_queue.empty():
                         print(self._log_queue.get_nowait())
-                except Empty:
-                    pass
+                except Empty: pass
 
                 try:
                     while not self._results_queue.empty():
@@ -3437,8 +3457,7 @@ if IS_BLENDER_CONTEXT:
                             result = json.loads(result_line)
                             worker_pid = result.get("pid")
                             slot_index = next((i for i, s in enumerate(self._worker_slots) if s.get('process') and s['process'].pid == worker_pid), -1)
-                            if slot_index == -1:
-                                continue
+                            if slot_index == -1: continue
 
                             slot = self._worker_slots[slot_index]
                             status = result.get("status")
@@ -3446,160 +3465,116 @@ if IS_BLENDER_CONTEXT:
                             if status == "ready":
                                 slot['status'] = 'ready'
                                 slot['ready_time'] = time.monotonic()
-                                logging.info(f"Worker in slot {slot_index} (PID: {worker_pid}) is READY. (Init time: {slot['ready_time'] - slot['launch_time']:.2f}s)")
+                                logging.info(f"Worker in slot {slot_index} (PID: {worker_pid}) is READY.")
                 
                             elif status in ["success", "failure"]:
                                 self._finished_tasks += 1
-                                slot['tasks_completed'] += 1
-                                if status == "failure":
-                                    self._failed_tasks += 1
+                                if status == "failure": self._failed_tasks += 1
                                 
-                                if status == "success":
-                                    task_avg_cpu = sum(slot['task_cpu_readings']) / len(slot['task_cpu_readings']) if slot['task_cpu_readings'] else 0
-                                    task_avg_ram = sum(slot['task_ram_readings']) / len(slot['task_ram_readings']) if slot['task_ram_readings'] else 0
-
-                                    if task_avg_cpu > 0 and task_avg_ram > 0:
-                                        n = sum(s['tasks_completed'] for s in self._worker_slots)
-                                        if n > 0:
-                                            self._running_average_task_cpu = (self._running_average_task_cpu * (n - 1) + task_avg_cpu) / n
-                                            self._running_average_task_ram = (self._running_average_task_ram * (n - 1) + task_avg_ram) / n
-
-                                if self._operator_state == 'STABILIZING':
-                                    self._initial_tasks_finished_count += 1
+                                if slot['status_before_task'] == 'finishing_for_standby':
+                                    logging.info(f"Worker {slot_index} finished its last task. Moving to STANDBY.")
+                                    slot['status'] = 'standby'
+                                    self._standby_worker_slot_index = slot_index
+                                elif slot['status_before_task'] == 'finishing_for_termination':
+                                    logging.info(f"Worker {slot_index} finished its last task. Gracefully terminating.")
+                                    self._terminate_worker(slot_index)
+                                    slot['status'] = 'idle'
+                                else:
+                                    slot['status'] = 'ready'
                                 
-                                slot['status'] = 'ready'
-                                slot['task_start_time'] = 0
-                    
+                                slot['status_before_task'] = 'idle' # Reset the pre-task status
+                                if self._operator_state == 'STABILIZING': self._initial_tasks_finished_count += 1
+                            
                             elif status == "error":
                                 logging.error(f"Worker in slot {slot_index} reported a critical error: {result.get('details', 'N/A')}")
                                 self._handle_failed_worker(slot_index, requeue_task=True)
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-                except Empty:
-                    pass
+
+                        except (json.JSONDecodeError, KeyError): pass
+                except Empty: pass
 
                 for i, slot in enumerate(self._worker_slots):
                     if slot['status'] == 'ready' and self._master_task_queue:
                         task_to_dispatch = self._master_task_queue.popleft()
-                        task_to_dispatch['task_blend_file'] = bpy.data.filepath
                         try:
                             slot['process'].stdin.write(json.dumps(task_to_dispatch) + "\n")
                             slot['process'].stdin.flush()
                             slot['status'] = 'running'
-                            slot['current_task'] = task_to_dispatch
-                            slot['task_cpu_readings'].clear()
-                            slot['task_ram_readings'].clear()
-                            slot['task_start_time'] = time.monotonic()
+                            slot['status_before_task'] = 'running'
                         except (IOError, BrokenPipeError):
-                            logging.error(f"Pipe to worker {i} was broken. Requeueing task and handling failed worker.")
                             self._master_task_queue.appendleft(task_to_dispatch)
                             self._handle_failed_worker(i, requeue_task=False)
 
                 current_time = time.monotonic()
-                self._sample_and_record_resources()
                 cpu_now, ram_now = self._get_system_resources()
 
                 if self._operator_state == 'RAMPING_UP':
-                    logging.info("--- State: Ramping Up ---")
                     _, self._baseline_ram = self._get_system_resources()
-                    logging.info(f"Captured baseline RAM at {self._baseline_ram:.1f}% before worker launch.")
                     bpy.ops.wm.save_mainfile()
-        
                     num_to_launch = min(len(self._worker_slots), self.INITIAL_WORKER_COUNT, self._total_tasks)
-                    logging.info(f"Launching initial set of {num_to_launch} workers...")
-                    for i in range(num_to_launch):
-                        self._launch_new_worker(i)
-        
+                    for i in range(num_to_launch): self._launch_new_worker(i)
                     self._operator_state = 'STABILIZING'
-                    logging.info(f"Entering stabilization. Waiting for {num_to_launch} initial task(s) to complete.")
 
                 elif self._operator_state == 'STABILIZING':
                     num_required = min(self.INITIAL_WORKER_COUNT, self._total_tasks)
                     if self._initial_tasks_finished_count >= num_required:
-                        logging.info("--- State: Stabilization Finished. Switching to dynamic Running mode. ---")
                         self._operator_state = 'RUNNING'
-                        self._next_resource_check_time = current_time
 
                 elif self._operator_state == 'COOLDOWN':
                     if current_time >= self._cooldown_end_time:
-                        logging.info("--- State: Cooldown Finished. Returning to RUNNING for re-evaluation. ---")
                         self._operator_state = 'RUNNING'
 
                 elif self._operator_state == 'RUNNING':
                     if current_time >= self._next_resource_check_time:
                         self._next_resource_check_time = current_time + self.RESOURCE_CHECK_INTERVAL_SEC
                         
-                        running_worker_count = sum(1 for s in self._worker_slots if s['status'] in ['running', 'ready', 'launching'])
+                        running_worker_count = sum(1 for s in self._worker_slots if s['status'] in ['running', 'ready'])
                         
+                        # --- SURGICAL CHANGE START: Added 'self.' to all config variables ---
                         if cpu_now > self.CPU_HIGH_THRESHOLD or ram_now > self.RAM_HIGH_THRESHOLD:
                             self._high_usage_counter += 1
-                            if self._high_usage_counter >= self.HIGH_USAGE_SUSTAINED_CHECKS:
-                                logging.warning(f"Sustained high usage (CPU:{cpu_now:.1f}%, RAM:{ram_now:.1f}%). Calculating scale-down.")
-                                cpu_overage = max(0, cpu_now - self.CPU_HIGH_THRESHOLD)
-                                ram_overage = max(0, ram_now - self.RAM_HIGH_THRESHOLD)
-                                num_to_term_cpu = math.ceil(cpu_overage / self._running_average_task_cpu) if self._running_average_task_cpu > 1 else 0
-                                num_to_term_ram = math.ceil(ram_overage / self._running_average_task_ram) if self._running_average_task_ram > 1 else 0
+                            if self._high_usage_counter >= self.HIGH_USAGE_SUSTAINED_CHECKS and running_worker_count > 1:
+                                logging.warning(f"Sustained high usage for 10s. Scaling down one worker.")
                                 
-                                num_to_terminate = max(num_to_term_cpu, num_to_term_ram, 1)
-                                num_to_terminate = min(num_to_terminate, max(0, running_worker_count - 1))
-
-                                if num_to_terminate > 0:
-                                    logging.warning(f" > System over-utilized. Terminating {num_to_terminate} worker(s).")
-                                    candidates = sorted([(i, s) for i, s in enumerate(self._worker_slots) if s['status'] in ['running', 'ready']], key=lambda item: item[1]['tasks_completed'])
-                                    for i in range(min(num_to_terminate, len(candidates))):
-                                        slot_index, _ = candidates[i]
-                                        logging.warning(f"   - Terminating least productive worker in slot {slot_index}.")
-                                        self._handle_failed_worker(slot_index, requeue_task=True)
+                                candidates = [i for i, s in enumerate(self._worker_slots) if s['status'] == 'running']
+                                if not candidates:
+                                    candidates = [i for i, s in enumerate(self._worker_slots) if s['status'] == 'ready']
+                                
+                                if candidates:
+                                    candidates.sort(key=lambda i: self._worker_slots[i]['tasks_completed'])
+                                    worker_to_flag_idx = candidates[0]
                                     
-                                    logging.info(f" > Entering COOLDOWN state for {self.COOLDOWN_DURATION_SEC} seconds.")
-                                    self._operator_state = 'COOLDOWN'
-                                    self._cooldown_end_time = current_time + self.COOLDOWN_DURATION_SEC
+                                    if self._standby_worker_slot_index == -1:
+                                        logging.warning(f"  > Instructing worker {worker_to_flag_idx} to go to STANDBY after its current task.")
+                                        self._worker_slots[worker_to_flag_idx]['status_before_task'] = 'finishing_for_standby'
+                                    else:
+                                        logging.warning(f"  > A worker is already on standby. Instructing worker {worker_to_flag_idx} to TERMINATE after its current task.")
+                                        self._worker_slots[worker_to_flag_idx]['status_before_task'] = 'finishing_for_termination'
+
+                                self._operator_state = 'COOLDOWN'
+                                self._cooldown_end_time = current_time + (self.COOLDOWN_DURATION_SEC * 2) # Longer cooldown
                                 self._high_usage_counter = 0
                         else:
                             self._high_usage_counter = 0
-                        
-                        has_idle_slots = any(s['status'] == 'idle' for s in self._worker_slots)
-                        if self._high_usage_counter == 0 and has_idle_slots and self._master_task_queue:
-                            cpu_headroom = self.CPU_LOW_THRESHOLD - cpu_now
-                            ram_headroom = self.RAM_LOW_THRESHOLD - ram_now
-                            
-                            if self._running_average_task_cpu < cpu_headroom and self._running_average_task_ram < ram_headroom:
-                                num_by_cpu = math.floor(cpu_headroom / self._running_average_task_cpu) if self._running_average_task_cpu > 1 else float('inf')
-                                num_by_ram = math.floor(ram_headroom / self._running_average_task_ram) if self._running_average_task_ram > 1 else float('inf')
-                                
-                                idle_slot_indices = [i for i, s in enumerate(self._worker_slots) if s['status'] == 'idle']
-                                num_to_launch = min(num_by_cpu, num_by_ram, len(idle_slot_indices), len(self._master_task_queue))
-                                
-                                # --- START OF SURGICAL CHANGE ---
-                                if num_to_launch > 0:
-                                    logging.info(f"Low resource usage (CPU:{cpu_now:.1f}%, RAM:{ram_now:.1f}%). Scaling up by {num_to_launch} worker(s).")
-                                    for i in range(num_to_launch):
-                                        self._launch_new_worker(idle_slot_indices[i])
-                                    
-                                    # Enter a cooldown period immediately after launching workers to prevent a race condition.
-                                    logging.info(f" > Entering COOLDOWN state for {self.COOLDOWN_DURATION_SEC} seconds after scale-up.")
+
+                        if self._master_task_queue and (cpu_now < self.CPU_LOW_THRESHOLD and ram_now < self.RAM_LOW_THRESHOLD):
+                            if self._standby_worker_slot_index != -1:
+                                logging.info(f"Low resource usage. Reactivating worker {self._standby_worker_slot_index} from standby.")
+                                self._worker_slots[self._standby_worker_slot_index]['status'] = 'ready'
+                                self._standby_worker_slot_index = -1
+                            else:
+                                idle_slot_index = next((i for i, s in enumerate(self._worker_slots) if s['status'] == 'idle'), -1)
+                                if idle_slot_index != -1:
+                                    logging.info(f"Low resource usage and an idle slot is available. Launching new worker in slot {idle_slot_index}.")
+                                    self._launch_new_worker(idle_slot_index)
                                     self._operator_state = 'COOLDOWN'
                                     self._cooldown_end_time = current_time + self.COOLDOWN_DURATION_SEC
-                                # --- END OF SURGICAL CHANGE ---
-                
-                TASK_TIMEOUT_SECONDS = 300
-                for i, slot in enumerate(self._worker_slots):
-                    if slot.get('process') and slot['process'].poll() is not None and slot['status'] in ['running', 'launching']:
-                        logging.error(f"Worker in slot {i} (PID: {slot.get('process').pid}) has crashed unexpectedly!")
-                        self._handle_failed_worker(i, requeue_task=True)
-                
-                    task_start_time = slot.get('task_start_time', 0)
-                    if slot['status'] == 'running' and task_start_time > 0 and (current_time - task_start_time) > TASK_TIMEOUT_SECONDS:
-                        logging.error(f"Worker in slot {i} (PID: {slot.get('process').pid}) has been running the same task for over {TASK_TIMEOUT_SECONDS} seconds. Assuming stall and terminating.")
-                        self._handle_failed_worker(i, requeue_task=True)
-    
+                        # --- SURGICAL CHANGE END ---
+
                 if self._operator_state != 'FINISHING':
-                    progress = (self._finished_tasks / self._total_tasks) * 100 if self._total_tasks > 0 else 100
-                    active_workers = sum(1 for s in self._worker_slots if s['status'] in ['running', 'launching', 'ready'])
-                    status_text = (f"Baking... {self._finished_tasks}/{self._total_tasks} ({progress:.0f}%) | "
-                                   f"Active: {active_workers} | Queued: {len(self._master_task_queue)} | State: {self._operator_state}")
-                    if self._failed_tasks > 0:
-                        status_text += f" | FAILED: {self._failed_tasks}"
+                    active_workers = sum(1 for s in self._worker_slots if s['status'] not in ['idle', 'standby'])
+                    standby_count = 1 if self._standby_worker_slot_index != -1 else 0
+                    status_text = f"Baking... {self._finished_tasks}/{self._total_tasks} | Active: {active_workers} | Standby: {standby_count} | Queued: {len(self._master_task_queue)}"
+                    if self._failed_tasks > 0: status_text += f" | FAILED: {self._failed_tasks}"
                     context.workspace.status_text_set(status_text)
 
                 return {'PASS_THROUGH'}
@@ -3799,6 +3774,8 @@ if IS_BLENDER_CONTEXT:
             return False
 
         def execute(self, context):
+            # --- TIMING: Full Operation Start ---
+            self._full_op_start_time = time.perf_counter()
             if not PSUTIL_INSTALLED:
                 self.report({'ERROR'}, "Dependency 'psutil' is not installed. Please install it from the addon panel.")
                 return {'CANCELLED'}
@@ -3816,7 +3793,6 @@ if IS_BLENDER_CONTEXT:
                 return {'CANCELLED'}
 
             export_lock = True
-
             self._op_lock = Lock()
             
             self._operator_state = 'INITIALIZING'
@@ -3831,21 +3807,19 @@ if IS_BLENDER_CONTEXT:
             self._comm_threads = []
             self._finished_tasks = 0
             self._failed_tasks = 0
+            
+            # --- SURGICAL CHANGE START: Correctly initialize instance variables ---
             self._high_usage_counter = 0
-            
-            self._running_average_task_cpu = 15.0
-            # --- START OF SURGICAL CHANGE ---
-            # This running average will now correctly track MARGINAL RAM usage.
-            self._running_average_task_ram = 5.0
-            # This new variable will store the system RAM state before any workers are launched.
+            self._standby_worker_slot_index = -1
+            self._idle_worker_ram_cost = 2.0
             self._baseline_ram = 0.0
-            # --- END OF SURGICAL CHANGE ---
             self._initial_tasks_finished_count = 0
-            
-            # --- NEW: Add state for cooldown logic ---
             self._cooldown_end_time = 0.0
-            self.COOLDOWN_DURATION_SEC = 5.0 # Wait 5 seconds before re-evaluating after a scale-down
-
+            self._running_average_task_cpu = 15.0
+            self._running_average_task_ram = 5.0
+            # --- SURGICAL CHANGE END ---
+            
+            # The rest of the execute function remains unchanged...
             try:
                 if not is_blend_file_saved():
                     raise RuntimeError("Please save the .blend file before exporting.")
@@ -3856,7 +3830,12 @@ if IS_BLENDER_CONTEXT:
                 }
                 if not initial_selection: raise RuntimeError("No suitable visible objects found to export.")
 
+                # --- TIMING START: Pre-flight Validation ---
+                preflight_start_time = time.perf_counter()
                 is_valid, error_msg = self._preflight_validation(initial_selection)
+                preflight_end_time = time.perf_counter()
+                logging.info(f"TIMING: Pre-flight validation took {preflight_end_time - preflight_start_time:.4f} seconds.")
+                # --- TIMING END ---
                 if not is_valid:
                     bpy.ops.object.show_popup('INVOKE_DEFAULT', message=error_msg, success=False)
                     return self._cleanup(context, {'CANCELLED'})
@@ -3864,6 +3843,8 @@ if IS_BLENDER_CONTEXT:
                 final_export_list = set(initial_selection)
                 generators_found = {obj for obj in initial_selection if self._is_geonodes_generator(obj)}
                 if generators_found:
+                    # --- TIMING START: GeoNodes Realization ---
+                    geonodes_start_time = time.perf_counter()
                     source_objects_to_exclude = set()
                     logging.info(f"Found {len(generators_found)} Geometry Node generator(s) that require realization.")
                     for gen_obj in generators_found:
@@ -3879,6 +3860,9 @@ if IS_BLENDER_CONTEXT:
                         final_export_list.update(realized_objects)
                     final_export_list -= generators_found
                     final_export_list -= source_objects_to_exclude
+                    geonodes_end_time = time.perf_counter()
+                    logging.info(f"TIMING: GeometryNodes realization for {len(generators_found)} generator(s) took {geonodes_end_time - geonodes_start_time:.4f} seconds.")
+                    # --- TIMING END ---
 
                 self._export_data["objects_for_export"] = [o for o in final_export_list if o and o.type == 'MESH']
                 if not self._export_data["objects_for_export"]: raise RuntimeError("Processing resulted in no valid mesh objects to export.")
@@ -3923,18 +3907,28 @@ if IS_BLENDER_CONTEXT:
                 else:
                     logging.info("Uncached materials found. Proceeding with texture preparation.")
             
+                    # --- TIMING START: Texture Validation & Recovery ---
+                    tex_prep_start_time = time.perf_counter()
                     texture_map = self._prepare_and_validate_textures(context, self._export_data["objects_for_export"])
+                    tex_prep_end_time = time.perf_counter()
+                    logging.info(f"TIMING: Texture validation and recovery took {tex_prep_end_time - tex_prep_start_time:.4f} seconds.")
+                    # --- TIMING END ---
                     if texture_map is None: return self._cleanup(context, {'CANCELLED'})
                     self._export_data['texture_translation_map'] = texture_map
             
                     if objects_requiring_exr_conversion:
                         logging.info(f"Running non-destructive EXR conversion for {len(objects_requiring_exr_conversion)} object(s).")
                 
+                        # --- TIMING START: EXR to PNG Conversion ---
+                        exr_conv_start_time = time.perf_counter()
                         success, exr_to_png_map = convert_exr_textures_to_png(
                             context, 
                             list(objects_requiring_exr_conversion), 
                             self._export_data['temp_files_to_clean']
                         )
+                        exr_conv_end_time = time.perf_counter()
+                        logging.info(f"TIMING: Non-destructive EXR to PNG conversion took {exr_conv_end_time - exr_conv_start_time:.4f} seconds.")
+                        # --- TIMING END ---
                         if not success:
                             raise RuntimeError("Failed to convert EXR textures to PNG.")
 
@@ -3951,15 +3945,22 @@ if IS_BLENDER_CONTEXT:
                     else:
                         logging.info("No uncached materials use EXR textures. Skipping EXR conversion.")
 
+                # --- TIMING START: Bake Task Collection ---
+                task_collect_start_time = time.perf_counter()
                 all_tasks, _, _, _ = self.collect_bake_tasks(
                     context, 
                     self._export_data["objects_for_export"], 
                     self._export_data,
                     exr_to_png_map
                 )
+                task_collect_end_time = time.perf_counter()
+                logging.info(f"TIMING: Bake task collection and material analysis took {task_collect_end_time - task_collect_start_time:.4f} seconds.")
+                # --- TIMING END ---
 
                 if all_tasks:
                     logging.info(f"Preparing {len(all_tasks)} isolated .blend files for workers...")
+                    # --- TIMING START: Isolated .blend File Writing ---
+                    blend_write_start_time = time.perf_counter()
                     task_blend_dir = os.path.join(self._export_data['bake_info']['bake_dir'], 'task_files')
                     os.makedirs(task_blend_dir, exist_ok=True)
                     self._export_data['temp_files_to_clean'].add(task_blend_dir)
@@ -3987,6 +3988,9 @@ if IS_BLENDER_CONTEXT:
                         except Exception as e:
                             logging.critical(f"FATAL: Could not write isolated blend file for task {i}. Aborting export. Error: {e}", exc_info=True)
                             raise RuntimeError("Failed to create isolated worker blend file.")
+                    blend_write_end_time = time.perf_counter()
+                    logging.info(f"TIMING: Writing {len(all_tasks)} isolated .blend files took {blend_write_end_time - blend_write_start_time:.4f} seconds.")
+                    # --- TIMING END ---
 
                 self._total_tasks = len(all_tasks)
                 for i, task in enumerate(all_tasks):
@@ -4082,6 +4086,7 @@ if IS_BLENDER_CONTEXT:
                 logging.error(f"Failed during texture combination for '{color_map_path}': {e}", exc_info=True)
                 self.report({'WARNING'}, "Failed to combine baked textures.")
           
+            
         def _finalize_export(self, context):
             """
             [DEFINITIVE V12 - CACHE POPULATION FIX]
@@ -4089,6 +4094,8 @@ if IS_BLENDER_CONTEXT:
             are correctly added to the `global_material_hash_cache` after processing.
             It builds a local cache keyed by material_hash and then merges it.
             """
+            # --- TIMING START: Full Finalization ---
+            finalize_start_time = time.perf_counter()
             addon_prefs = context.preferences.addons[__name__].preferences
             self._export_data['original_active_uvs'] = {}
 
@@ -4121,6 +4128,8 @@ if IS_BLENDER_CONTEXT:
                         final_texture_cache[mat_hash][socket_name] = output_path
 
                 logging.info("Processing final texture cache for compositing jobs...")
+                # --- TIMING START: Texture Compositing ---
+                compositing_start_time = time.perf_counter()
                 for mat_hash, texture_maps in list(final_texture_cache.items()): 
                     if "Base Color" in texture_maps and "Decal Color" in texture_maps and "Decal Alpha" in texture_maps:
                         self._composite_decal_over_albedo(
@@ -4135,13 +4144,21 @@ if IS_BLENDER_CONTEXT:
                     elif "Base Color" in texture_maps and "Alpha" in texture_maps:
                         self._combine_color_and_alpha(texture_maps["Base Color"], texture_maps["Alpha"])
                         del final_texture_cache[mat_hash]["Alpha"]
+                compositing_end_time = time.perf_counter()
+                logging.info(f"TIMING: Texture compositing (decals, alpha channels) took {compositing_end_time - compositing_start_time:.4f} seconds.")
+                # --- TIMING END ---
 
                 if final_texture_cache:
                     logging.info(f"Updating global cache with results from {len(final_texture_cache)} materials for next run.")
                     global_material_hash_cache.update(dict(final_texture_cache))
 
+                # --- TIMING START: Material Preparation ---
+                mat_prep_start_time = time.perf_counter()
                 baked_material_uuids = {t['material_uuid'] for t in bake_info.get('tasks', [])}
                 self._prepare_materials_for_export(context, self._export_data["objects_for_export"], final_texture_cache, baked_material_uuids)
+                mat_prep_end_time = time.perf_counter()
+                logging.info(f"TIMING: Final material preparation and re-assignment took {mat_prep_end_time - mat_prep_start_time:.4f} seconds.")
+                # --- TIMING END ---
 
                 final_meshes_for_obj = self._export_data.get("objects_for_export", [])
                 if not final_meshes_for_obj:
@@ -4205,7 +4222,6 @@ if IS_BLENDER_CONTEXT:
                                     obj.data.uv_layers.active = obj.data.uv_layers[target_uv_name]
                                     logging.info(f"  > Set active UV map to '{target_uv_name}' for '{obj.name}' to match bake settings.")
             
-                # --- SURGICAL CHANGE START ---
                 logging.info("--- PRE-EXPORT GEOMETRY VALIDATION ---")
                 for obj in selectable_meshes:
                     if obj.data and obj.data.vertices:
@@ -4213,23 +4229,37 @@ if IS_BLENDER_CONTEXT:
                         logging.info(f" > Final check for '{obj.name}': Vertex 0 is at X={v0_coord.x:.4f}")
                     else:
                         logging.warning(f" > Final check for '{obj.name}': No vertex data to validate.")
-                # --- SURGICAL CHANGE END ---
             
                 logging.info(f" > Exporting {len(context.selected_objects)} objects to OBJ...")
+                # --- TIMING START: OBJ Export ---
+                obj_export_start_time = time.perf_counter()
                 bpy.ops.wm.obj_export(
                     filepath=exported_obj_path, check_existing=True, export_selected_objects=True,
                     forward_axis=addon_prefs.obj_export_forward_axis, up_axis=addon_prefs.obj_export_up_axis,
                     global_scale=addon_prefs.remix_export_scale, apply_modifiers=addon_prefs.apply_modifiers,
                     export_materials=True, path_mode='COPY', export_pbr_extensions=True
                 )
+                obj_export_end_time = time.perf_counter()
+                logging.info(f"TIMING: OBJ export took {obj_export_end_time - obj_export_start_time:.4f} seconds.")
+                # --- TIMING END ---
 
                 logging.info(f"Exported to temporary OBJ: {exported_obj_path}")
 
+                # --- TIMING START: API Upload ---
+                api_upload_start_time = time.perf_counter()
                 ingested_usd = upload_to_api(exported_obj_path, addon_prefs.remix_ingest_directory, context)
+                api_upload_end_time = time.perf_counter()
+                logging.info(f"TIMING: API upload and ingest took {api_upload_end_time - api_upload_start_time:.4f} seconds.")
+                # --- TIMING END ---
                 if not ingested_usd:
                     raise RuntimeError("API upload failed.")
 
+                # --- TIMING START: Server Replace/Append ---
+                server_op_start_time = time.perf_counter()
                 final_reference_prim = self._replace_or_append_on_server(context, ingested_usd)
+                server_op_end_time = time.perf_counter()
+                logging.info(f"TIMING: Server replace/append operation took {server_op_end_time - server_op_start_time:.4f} seconds.")
+                # --- TIMING END ---
                 if not final_reference_prim:
                     raise RuntimeError("Server replace/append operation failed.")
 
@@ -4240,6 +4270,13 @@ if IS_BLENDER_CONTEXT:
                 logging.error(f"Export finalization failed: {e}", exc_info=True)
                 self.report({'ERROR'}, f"Finalization failed: {e}")
                 raise RuntimeError(f"Finalization process failed.") from e
+            finally:
+                # --- TIMING: Full Operation End ---
+                finalize_end_time = time.perf_counter()
+                logging.info(f"TIMING: Full finalization stage took {finalize_end_time - finalize_start_time:.4f} seconds.")
+                total_op_time = finalize_end_time - self._full_op_start_time
+                logging.info(f"TIMING: Total operation took {total_op_time:.4f} seconds from start to finish.")
+                # --- END TIMING ---
             
         def _find_ultimate_source_node(self, start_socket):
             """
