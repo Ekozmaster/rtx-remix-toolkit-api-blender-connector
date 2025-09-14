@@ -68,7 +68,12 @@ def scan_and_extract_data_for_file(usd_file_path):
                 if uv_values:
                     uv_data_np = np.array(uv_values, dtype=np.float32)
                     if uv_data_np.ndim == 2 and uv_data_np.shape[1] >= 2:
-                        uv_data_np[:, 1] = 1.0 - uv_data_np[:, 1]
+                        # --- SURGICAL CHANGE START ---
+                        # The line that performed the vertical flip has been commented out to disable it.
+                        # uv_data_np[:, 1] = 1.0 - uv_data_np[:, 1]
+                        # The 'pass' statement is added to ensure the 'if' block is syntactically correct.
+                        pass
+                        # --- SURGICAL CHANGE END ---
 
             mesh = UsdGeom.Mesh(prim)
             vertices_attr = mesh.GetPointsAttr().Get()
