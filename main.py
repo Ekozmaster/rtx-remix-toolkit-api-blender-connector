@@ -3612,14 +3612,6 @@ if IS_BLENDER_CONTEXT:
 
             return False
             
-        #def _get_system_resources(self):
-            #"""
-            #[DEBUG SIMULATION] This method is modified to always report 99% CPU and RAM usage
-            #to trigger the worker scale-down logic for debugging purposes.
-            #"""
-            # Always return maxed-out values to force scale-down.
-            #return 99.0, 99.0
-            
         def _get_system_resources(self):
             """
             [SURGICALLY CHANGED FOR RELIABILITY]
@@ -3819,8 +3811,31 @@ if IS_BLENDER_CONTEXT:
             self._running_average_task_ram = 5.0
             # --- SURGICAL CHANGE END ---
             
-            # The rest of the execute function remains unchanged...
             try:
+                # --- SURGICAL CHANGE START: This is the corrected pre-flight check ---
+                logging.info("--- Starting Pre-flight Remix Selection Check ---")
+                selection_check_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_prims=false&exists=true"
+                headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
+                
+                response = make_request_with_retries('GET', selection_check_url, headers=headers, verify=addon_prefs.remix_verify_ssl)
+
+                if not response or response.status_code != 200:
+                    # FIX: Use the dedicated popup operator instead of self.report
+                    bpy.ops.object.show_popup('INVOKE_DEFAULT', message="Could not connect to Remix to verify selection.", success=False)
+                    logging.error("Pre-flight check failed: Could not connect to Remix server.")
+                    return self._cleanup(context, {'CANCELLED'})
+
+                data = response.json()
+                prim_paths = data.get("prim_paths", data.get("asset_paths", []))
+
+                if not prim_paths:
+                    bpy.ops.object.show_popup('INVOKE_DEFAULT', message="Nothing is selected in Remix.", success=False)
+                    logging.warning("Pre-flight check failed: No prims are selected in Remix.")
+                    return self._cleanup(context, {'CANCELLED'})
+                
+                logging.info(f"--- Pre-flight check PASSED. Found {len(prim_paths)} selected prim(s) in Remix. ---")
+                # --- SURGICAL CHANGE END ---
+
                 if not is_blend_file_saved():
                     raise RuntimeError("Please save the .blend file before exporting.")
 
