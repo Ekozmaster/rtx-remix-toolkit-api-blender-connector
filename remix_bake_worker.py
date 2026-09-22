@@ -368,7 +368,7 @@ def _bake_base_albedo_pass(setup_data, task, final_mix_shader_original, active_o
                 bpy.data.images.remove(source_img)
                 log("     - Successfully copied pixels from: %s", os.path.basename(original_path))
             except Exception as e:
-                log("    - Pass 1 ERROR: Could not load or copy original base color from '%s': %e. Result will be black.", original_path, e)
+                log("    - Pass 1 ERROR: Could not load or copy original base color from '%s': %s. Result will be black.", original_path, e)
                 img.pixels = [0.0] * len(img.pixels) # Fill with black on failure
         else:
             log("    - Pass 1 WARNING: Original base color path was not provided or not found. Result will be black.")
@@ -669,8 +669,10 @@ def _perform_simple_bake(setup_data, task, active_output_node):
         socket_to_bake = _get_socket_to_bake(nt, task['target_socket_name'])
 
         if not socket_to_bake:
-            log(f" > SIMPLE BAKE WARNING: Could not find socket '{task['target_socket_name']}'. Skipping.")
-            return
+            log(f" > SIMPLE BAKE ERROR: Could not find socket '{task['target_socket_name']}'.")
+            raise RuntimeError(
+                f"Could not find bake socket '{task['target_socket_name']}' for task '{task.get('material_name')}'."
+            )
 
         original_from_socket = None
         original_to_socket = None
@@ -705,6 +707,8 @@ def _perform_simple_bake(setup_data, task, active_output_node):
             
             bpy.ops.object.bake(type='EMIT', use_clear=True, margin=16)
             img.save()
+            if not task.get('output_path') or not os.path.isfile(task['output_path']):
+                raise RuntimeError(f"Bake completed but output file was not created: {task.get('output_path')}")
 
         finally:
             if emission_node.name in nt.nodes:
@@ -720,6 +724,8 @@ def _perform_simple_bake(setup_data, task, active_output_node):
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.bake(type=bake_type, use_clear=True, margin=16)
         img.save()
+        if not task.get('output_path') or not os.path.isfile(task['output_path']):
+            raise RuntimeError(f"Bake completed but output file was not created: {task.get('output_path')}")
         
 def perform_single_bake_operation(obj, original_mat, task):
     """
@@ -772,6 +778,8 @@ def perform_single_bake_operation(obj, original_mat, task):
                 nt.links.new(main_shader_link_from, main_shader_link_to)
             
             _composite_decal_bakes(setup_data['img'], decal_albedo_img, decal_alpha_img)
+            if not task.get('output_path') or not os.path.isfile(task['output_path']):
+                raise RuntimeError(f"Bake completed but final output file was not created: {task.get('output_path')}")
 
         else:
             _perform_simple_bake(setup_data, task, active_output_node)
@@ -862,6 +870,16 @@ def persistent_worker_loop():
             _apply_texture_translation_map(task)
 
             obj = bpy.data.objects.get(task['object_name'])
+            if not obj:
+                raise RuntimeError(f"Could not find object '{task['object_name']}' in loaded task file.")
+
+            # A library written with bpy.data.libraries.write contains the object
+            # datablock, but it does not place that object in the active scene.
+            view_layer = bpy.context.view_layer
+            if obj.name not in view_layer.objects:
+                bpy.context.scene.collection.objects.link(obj)
+                view_layer.update()
+
             # --- START OF THE FIX ---
             # Find the specific material datablock that is assigned to the object,
             # matching the identifiers from the task. This is more robust than a global search.

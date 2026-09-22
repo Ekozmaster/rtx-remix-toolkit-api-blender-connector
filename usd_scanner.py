@@ -111,14 +111,18 @@ def scan_and_extract_data_for_file(usd_file_path):
             except Exception as e:
                 print(f"[Worker DBG]   > !!! CRITICAL ERROR during material lookup for prim {prim.GetPath()}: {e}", file=sys.stderr)
 
-            # --- NEW: Generate the unique content hash ---
+            # Generate a content/topology hash that includes face boundaries and UVs,
+            # not just the flattened face-vertex index stream.
             hasher = hashlib.md5()
             hasher.update(verts_co_np.tobytes())
             hasher.update(loop_verts_np.tobytes())
-            hasher.update(np.array(world_transform_matrix).tobytes())
+            hasher.update(face_counts_np.tobytes())
+            hasher.update(np.array(world_transform_matrix, dtype=np.float64).tobytes())
             hasher.update(material_path_str.encode('utf-8'))
+            hasher.update(str(uv_interpolation).encode('utf-8'))
+            if uv_data_np is not None:
+                hasher.update(uv_data_np.tobytes())
             mesh_hash = hasher.hexdigest()
-            # --- END NEW ---
 
             extracted_data.append({
                 "mesh_hash": mesh_hash, # <-- NEW: Pass the hash back

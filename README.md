@@ -16,3 +16,11 @@ Select the mesh you want to attach the new mesh to. Press export. The add-on wil
 If the mesh in Remix is a past version, it will be replaced instead. Make sure to name your meshes different names to others in your scene or they will be replaced instead!
 
 ![image](https://github.com/user-attachments/assets/d287cd8f-5c02-4255-97a0-7070c3d12896)
+
+## RTX Remix REST API port discovery
+
+The connector does not require RTX Remix to stay on port 8011. RTX Remix Toolkit can
+fall back to another available HTTP port (for example 8048). The addon first tries the
+configured server URL, then inspects local Windows TCP listeners and checks the
+OpenAPI schema for RTX Remix routes. The discovered port is used for import, export,
+asset selection, file-path lookups, and texture ingestion.

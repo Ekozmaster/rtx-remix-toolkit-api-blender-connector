@@ -2,7 +2,7 @@ bl_info = {
     "name": "Remix Asset Ingestion",
     "blender": (4, 2, 0),
     "category": "Helper",
-    "version": (3, 5, 0), # Incremented version
+    "version": (3, 5, 4), # dynamic Remix REST port discovery
     "author": "Frisser :) (Integrated Baking by Gemini)",
     "description": "Export mesh assets as OBJ, with parallel texture baking, ingest into Remix with versioning, and handle multiple textures.",
     "location": "View3D > Remix Ingestor",
@@ -26,7 +26,6 @@ if IS_BLENDER_CONTEXT:
     import bpy
     import requests
     import os
-    import logging
     import tempfile
     import time
     import shutil
@@ -40,6 +39,7 @@ if IS_BLENDER_CONTEXT:
     from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
     import bpy_extras.io_utils
     import urllib.parse
+    import socket
     import subprocess
     from pathlib import Path
     from mathutils import Vector, Matrix
@@ -169,6 +169,28 @@ if IS_BLENDER_CONTEXT:
             PILLOW_INSTALLED = False
             logging.warning("Dependency 'Pillow' is NOT installed.")
 
+    class REMIX_OT_test_server_connection(Operator):
+        bl_idname = "remix.test_server_connection"
+        bl_label = "Test Remix Server Connection"
+        bl_description = "Test the RTX Remix Toolkit REST API connection"
+
+        def execute(self, context):
+            try:
+                stagecraft_url, verify_ssl = get_remix_server_settings(context)
+                ok, detail = check_remix_server_status(stagecraft_url, verify_ssl)
+                if ok:
+                    self.report({'INFO'}, f"RTX Remix REST API connected: {detail}")
+                    logging.info("RTX Remix REST API connection test succeeded: %s", detail)
+                    return {'FINISHED'}
+
+                self.report({'ERROR'}, f"RTX Remix REST API unavailable: {detail}")
+                logging.error("RTX Remix REST API connection test failed: %s", detail)
+                return {'CANCELLED'}
+            except Exception as e:
+                self.report({'ERROR'}, f"RTX Remix connection test failed: {e}")
+                logging.error("RTX Remix connection test failed", exc_info=True)
+                return {'CANCELLED'}
+
     class REMIX_OT_install_dependency(Operator):
         """(CORRECTED V4 - Sentinel File) Installs a library into a local 'lib' folder and creates a persistent restart flag."""
         bl_idname = "remix.install_dependency"
@@ -200,7 +222,8 @@ if IS_BLENDER_CONTEXT:
                 logging.error(f"Failed to install {dependency_name}: Python executable not found.")
                 queue_ref.put(('ERROR', "Python executable not found."))
             finally:
-                check_dependencies()
+                # Blender's bpy API is not thread-safe. Dependency verification is
+                # performed by the modal operator on Blender's main thread.
                 queue_ref.put(('FINISHED', ''))
 
         def modal(self, context, event):
@@ -212,6 +235,8 @@ if IS_BLENDER_CONTEXT:
                 while True:
                     report_type, message = self._queue.get_nowait()
                     if report_type == 'FINISHED':
+                        # Verify dependencies on Blender's main thread only.
+                        check_dependencies()
                         is_finished = True
                     else:
                         self.report({report_type}, message)
@@ -266,17 +291,19 @@ if IS_BLENDER_CONTEXT:
 
     def cleanup_orphan_directories():
         """
-        [DEFINITIVE FIX V2] Scans and cleans ALL addon-related temporary directories on startup.
-        - Wipes the entire bake cache ('remix_collect') to ensure a fresh start.
-        - Intelligently removes only orphaned session folders ('remix_finalize') from crashed instances.
+        Clean orphaned export-finalization sessions on startup.
+
+        The shared bake/cache directory is deliberately NOT wiped here because a
+        second Blender instance may be using it while this addon is starting.
         """
         if not PSUTIL_INSTALLED:
             logging.warning("Orphan cleanup skipped: 'psutil' is not installed.")
             return
 
         import psutil
-        # List of all base paths that the addon might create temp folders in.
-        paths_to_scan = [CUSTOM_COLLECT_PATH, CUSTOM_FINALIZE_PATH]
+        # Only finalize sessions have an explicit PID lock and can therefore be
+        # safely identified as orphaned. The shared bake/cache path is left intact.
+        paths_to_scan = [CUSTOM_FINALIZE_PATH]
     
         logging.info(f"Startup cleanup: Scanning custom paths...")
 
@@ -284,22 +311,7 @@ if IS_BLENDER_CONTEXT:
             if not os.path.exists(base_path):
                 continue
 
-            # --- THIS IS THE CORRECTED LOGIC ---
-            # If we are scanning the bake cache directory, wipe its contents completely.
-            if os.path.normpath(base_path) == os.path.normpath(CUSTOM_COLLECT_PATH):
-                logging.info(f"Wiping bake cache directory: {base_path}")
-                try:
-                    for item_name in os.listdir(base_path):
-                        item_path = os.path.join(base_path, item_name)
-                        if os.path.isdir(item_path):
-                            shutil.rmtree(item_path)
-                        else:
-                            os.remove(item_path)
-                except Exception as e:
-                    logging.error(f"Failed to wipe bake cache directory '{base_path}': {e}")
-                # Continue to the next path in paths_to_scan
-                continue
-
+            # Only process lock-protected finalize session directories below.
             # For all other paths (i.e., remix_finalize), use the existing orphan-check logic.
             logging.info(f"Scanning for orphaned session directories in: {base_path}")
             try:
@@ -379,9 +391,12 @@ if IS_BLENDER_CONTEXT:
         # --- Server Settings ---
         remix_server_url: StringProperty(
             name="Server URL",
-            description="URL of the Remix server (e.g., http://localhost:8011/stagecraft).",
-            default="http://localhost:8011/stagecraft",
-            subtype='NONE' # Use 'NONE' to avoid registration errors
+            description=(
+                "RTX Remix REST API URL. Accepts either the server root "
+                "(http://127.0.0.1:8011) or /stagecraft. The addon normalizes it automatically."
+            ),
+            default="http://127.0.0.1:8011/stagecraft",
+            subtype='NONE'
         )
         remix_export_url: StringProperty(
             name="Export API URL",
@@ -535,6 +550,7 @@ if IS_BLENDER_CONTEXT:
             layout.prop(self, "apply_modifiers")
             layout.prop(self, "remix_server_url")
             layout.prop(self, "remix_export_url")
+            layout.operator("remix.test_server_connection", text="Test Remix Server Connection", icon='URL')
             layout.prop(self, "spp_exe")
             layout.prop(self, "export_folder")
 
@@ -1229,6 +1245,218 @@ if IS_BLENDER_CONTEXT:
     def ensure_single_leading_slash(path):
         return f'/{path.lstrip("/")}'
 
+    DEFAULT_REMIX_SERVER_URL = "http://127.0.0.1:8011/stagecraft"
+    REMIX_API_VERSION = "1.0"
+
+    def normalize_remix_stagecraft_url(raw_url):
+        """
+        Normalize the user-provided RTX Remix REST URL to the /stagecraft base.
+
+        The RTX Remix docs expose the REST API at the server root (default
+        http://127.0.0.1:8011), while StageCraft endpoints live below
+        /stagecraft. Older versions of this addon asked users to enter
+        /stagecraft explicitly. Accept both forms so stored preferences from
+        either version continue to work.
+        """
+        raw_url = (raw_url or "").strip()
+        if not raw_url:
+            raw_url = DEFAULT_REMIX_SERVER_URL
+
+        if "://" not in raw_url:
+            raw_url = "http://" + raw_url
+
+        try:
+            parsed = urllib.parse.urlsplit(raw_url)
+        except ValueError:
+            return DEFAULT_REMIX_SERVER_URL
+
+        scheme = parsed.scheme or "http"
+        netloc = parsed.netloc
+        if not netloc:
+            return DEFAULT_REMIX_SERVER_URL
+
+        # NVIDIA documents 127.0.0.1 as the canonical local endpoint.
+        # Normalize localhost to it as well to avoid hostname/IPv6 resolution
+        # differences on Windows when the Toolkit is bound to IPv4.
+        try:
+            host = parsed.hostname
+            if host and host.lower() == "localhost":
+                host_port = netloc.rsplit("@", 1)[-1]
+                if ":" in host_port and not host_port.endswith("]"):
+                    host_port = host_port.rsplit(":", 1)[-1]
+                    netloc = f"127.0.0.1:{host_port}"
+                else:
+                    netloc = "127.0.0.1"
+        except ValueError:
+            return DEFAULT_REMIX_SERVER_URL
+
+        path = parsed.path.rstrip("/")
+        lowered = path.lower()
+        if lowered in ("", "/"):
+            path = "/stagecraft"
+        elif not lowered.endswith("/stagecraft"):
+            path = path + "/stagecraft"
+
+        return urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
+
+    def get_remix_api_root_url(stagecraft_url):
+        """Return the REST API root from a normalized /stagecraft URL."""
+        normalized = normalize_remix_stagecraft_url(stagecraft_url)
+        parsed = urllib.parse.urlsplit(normalized)
+        path = parsed.path.rstrip("/")
+        if path.lower().endswith("/stagecraft"):
+            path = path[:-len("/stagecraft")] or "/"
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+
+    def get_remix_server_settings(context=None):
+        """Return normalized StageCraft URL and SSL verification setting."""
+        stagecraft_url = DEFAULT_REMIX_SERVER_URL
+        verify_ssl = True
+
+        try:
+            if context is None:
+                context = bpy.context
+            addon_prefs = context.preferences.addons[__name__].preferences
+            stagecraft_url = normalize_remix_stagecraft_url(
+                addon_prefs.remix_server_url
+            )
+            verify_ssl = bool(addon_prefs.remix_verify_ssl)
+        except (AttributeError, KeyError, TypeError, RuntimeError):
+            logging.warning(
+                "Could not access Remix addon preferences; using default REST API URL %s.",
+                DEFAULT_REMIX_SERVER_URL,
+            )
+
+        return stagecraft_url, verify_ssl
+
+    def _probe_remix_http_root(root_url, verify_ssl=True, timeout=1.5):
+        """Probe a local RTX Remix HTTP server root and return (ok, detail)."""
+        schema_url = f"{root_url.rstrip('/')}/openapi.json"
+        try:
+            response = requests.get(schema_url, timeout=timeout, verify=verify_ssl)
+        except requests.exceptions.RequestException as e:
+            return False, f"{type(e).__name__}: {e}"
+
+        if not 200 <= response.status_code < 300:
+            return False, f"HTTP {response.status_code} from {schema_url}"
+
+        try:
+            paths = response.json()["paths"]
+        except (ValueError, KeyError, TypeError):
+            return False, f"Invalid OpenAPI schema from {schema_url}"
+
+        required_paths = (
+            "/stagecraft/assets/",
+            "/ingestcraft/mass-validator/queue/model",
+        )
+        if not isinstance(paths, dict) or not all(path in paths for path in required_paths):
+            return False, f"OpenAPI schema from {schema_url} is not RTX Remix Toolkit"
+
+        return True, f"Verified RTX Remix Toolkit at {schema_url}"
+
+    def _list_local_listening_ports():
+        """Return TCP listening ports reported by Windows netstat, if available."""
+        ports = []
+        try:
+            completed = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ports
+
+        netstat_output = completed.stdout or ""
+        for line in netstat_output.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[0].upper() != "TCP":
+                continue
+            local = parts[1]
+            state = parts[3].upper()
+            if state != "LISTENING":
+                continue
+            if not (local.startswith("127.0.0.1:") or local.startswith("0.0.0.0:") or local.startswith("[::]:")):
+                continue
+            try:
+                port = int(local.rsplit(":", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if 1 <= port <= 65535 and port not in ports:
+                ports.append(port)
+        return ports
+
+    def discover_remix_server_url(stagecraft_url, verify_ssl=True):
+        """
+        Resolve the actual local RTX Remix REST server.
+
+        RTX Remix Toolkit can fall back to another available port when the
+        configured/default port is unavailable. Probe the configured port
+        first, then local LISTENING TCP ports reported by Windows netstat.
+        """
+        normalized = normalize_remix_stagecraft_url(stagecraft_url)
+        configured_root = get_remix_api_root_url(normalized)
+
+        candidates = []
+        parsed = urllib.parse.urlsplit(configured_root)
+        configured_host = parsed.hostname or "127.0.0.1"
+        configured_port = parsed.port
+        if configured_port:
+            candidates.append(configured_port)
+
+        # The documented default and the port observed in RTX Remix Toolkit
+        # fallback logs are prioritized for fast discovery.
+        for port in (8011, 8048):
+            if port not in candidates:
+                candidates.append(port)
+
+        for port in _list_local_listening_ports():
+            if port not in candidates:
+                candidates.append(port)
+
+        for port in candidates:
+            root = f"{parsed.scheme or 'http'}://{configured_host}:{port}"
+            ok, detail = _probe_remix_http_root(root, verify_ssl=verify_ssl, timeout=1.25)
+            if ok:
+                discovered = f"{root}/stagecraft"
+                return discovered, detail
+
+        return None, (
+            f"No reachable RTX Remix REST server found. Tried configured {configured_root} "
+            f"and detected local LISTENING HTTP ports. Verify that the Remix Toolkit HTTP "
+            f"service is enabled and running."
+        )
+
+    def remap_url_to_remix_server(raw_url, discovered_stagecraft_url):
+        """Keep an endpoint path while replacing its host/port with the discovered Remix server."""
+        raw_url = (raw_url or "").strip()
+        if not raw_url:
+            return raw_url
+        try:
+            raw = urllib.parse.urlsplit(raw_url if "://" in raw_url else "http://" + raw_url)
+            discovered = urllib.parse.urlsplit(discovered_stagecraft_url)
+            if not raw.netloc or not discovered.netloc:
+                return raw_url.rstrip("/")
+            return urllib.parse.urlunsplit((
+                discovered.scheme or raw.scheme or "http",
+                discovered.netloc,
+                raw.path.rstrip("/"),
+                raw.query,
+                raw.fragment,
+            ))
+        except ValueError:
+            return raw_url.rstrip("/")
+
+    def check_remix_server_status(stagecraft_url, verify_ssl=True):
+        """Check the RTX Remix REST server, including automatic port discovery."""
+        discovered_url, detail = discover_remix_server_url(stagecraft_url, verify_ssl)
+        if discovered_url:
+            return True, f"{detail}; using {discovered_url}"
+        return False, detail
+
     def flip_normals_api(obj):
         try:
             if obj and obj.type == 'MESH':
@@ -1251,39 +1479,55 @@ if IS_BLENDER_CONTEXT:
         
     def fetch_selected_mesh_prim_paths():
         """
-        Fetches the list of currently-selected mesh prim paths from the Remix server.
-        Returns a list of paths (each with a single leading slash) under "/meshes/".
-        Falls back to a default server URL if addon preferences are unavailable.
+        Fetch the currently selected mesh Prim paths from RTX Remix.
+
+        The function accepts both the current documented REST root and the
+        historical addon preference value ending in /stagecraft. It also logs
+        the actual HTTP response when the request fails instead of collapsing
+        all failures into an empty selection.
         """
         try:
-            # Default in case preferences aren't accessible
-            server_url_base = "http://localhost:8011/stagecraft"
-            verify_ssl_cert = True
+            server_url_base, verify_ssl_cert = get_remix_server_settings()
+            discovered_url, discovery_detail = discover_remix_server_url(server_url_base, verify_ssl_cert)
+            if not discovered_url:
+                logging.error("RTX Remix REST API discovery failed: %s", discovery_detail)
+                return []
+            server_url_base = discovered_url
+            url = (
+                f"{server_url_base}/assets"
+                f"?selection=true&prim_types=models&filter_session_assets=false&exists=true"
+            )
 
-            # Attempt to read the user’s configured server URL and SSL setting
-            try:
-                context = bpy.context
-                addon_prefs = context.preferences.addons[__name__].preferences
-                server_url_base = addon_prefs.remix_server_url.rstrip('/')
-                verify_ssl_cert = addon_prefs.remix_verify_ssl
-                url = f"{server_url_base}/assets/?selection=true&filter_session_assets=false&exists=true"
-            except (AttributeError, KeyError):
-                logging.warning(
-                    "fetch_selected_mesh_prim_paths: Could not get addon_prefs from context. Using default URL."
+            headers = {
+                'accept': f'application/lightspeed.remix.service+json; version={REMIX_API_VERSION}'
+            }
+            response = make_request_with_retries(
+                'GET', url, headers=headers, verify=verify_ssl_cert
+            )
+
+            if not response or not (200 <= response.status_code < 300):
+                detail = (
+                    f"HTTP {response.status_code}" if response else "No response"
                 )
-                url = f"{server_url_base}/assets/?selection=true&filter_session_assets=false&exists=true"
-
-            headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
-            response = make_request_with_retries('GET', url, headers=headers, verify=verify_ssl_cert)
-
-            if not response or response.status_code != 200:
+                if response is not None and response.text:
+                    body = response.text.strip().replace("\n", " ")
+                    if len(body) > 400:
+                        body = body[:400] + "..."
+                    detail += f"; body: {body}"
                 logging.error(
-                    f"Failed to fetch selected mesh prim paths. Status: "
-                    f"{response.status_code if response else 'No Response'}"
+                    "Failed to fetch selected mesh Prim paths from %s (%s).",
+                    url,
+                    detail,
                 )
                 return []
 
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError as e:
+                logging.error(
+                    "Remix server returned non-JSON data for %s: %s", url, e
+                )
+                return []
 
             # First, look for the modern "prim_paths" key; fall back to "asset_paths"
             asset_or_prim_paths = data.get("prim_paths")
@@ -1423,8 +1667,15 @@ if IS_BLENDER_CONTEXT:
     def select_mesh_prim_in_remix(reference_prim, context):
         addon_prefs = context.preferences.addons[__name__].preferences
         try:
+            configured_server_url = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+            discovered_server_url, discovery_detail = discover_remix_server_url(
+                configured_server_url, bool(addon_prefs.remix_verify_ssl)
+            )
+            if not discovered_server_url:
+                logging.error("RTX Remix REST API discovery failed while selecting prim: %s", discovery_detail)
+                return False
             encoded_prim = urllib.parse.quote(reference_prim, safe='')
-            url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/selection/{encoded_prim}"
+            url = f"{discovered_server_url}/assets/selection/{encoded_prim}"
             headers = {
                 'accept': 'application/lightspeed.remix.service+json; version=1.0'
             }
@@ -1512,7 +1763,16 @@ if IS_BLENDER_CONTEXT:
                 logging.warning("No valid special textures found to upload.")
                 return {'FINISHED'}
 
-            base_api_url = addon_prefs.remix_export_url.rstrip('/')
+            stagecraft_configured = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+            discovered_stagecraft_url, discovery_detail = discover_remix_server_url(
+                stagecraft_configured, bool(addon_prefs.remix_verify_ssl)
+            )
+            if not discovered_stagecraft_url:
+                logging.error("RTX Remix REST API discovery failed before texture ingest: %s", discovery_detail)
+                return {'CANCELLED'}
+            base_api_url = remap_url_to_remix_server(
+                addon_prefs.remix_export_url, discovered_stagecraft_url
+            )
             base_ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [ { "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False } ], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [ 0, "Initializing", True ] } }, "check_plugins": [ { "name": "MaterialShaders", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllMaterials" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True, "shader_subidentifiers": { "AperturePBR_Opacity": ".*" } }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToOctahedral", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:normalmap_texture": { "encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal" } }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToDDS", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:diffuse_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:emissive_mask_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:height_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max" ] }, "inputs:metallic_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:normalmap_texture": { "args": [ "--format", "bc5", "--no-mip-gamma-correct" ] }, "inputs:reflectionroughness_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:transmittance_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:subsurface_color_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:subsurface_radius_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]} }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True }, { "channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True }, { "channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds" }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "MassTexturePreview", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "Nothing" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } } ], "resultor_plugins": [ { "name": "FileMetadataWritter", "data": { "channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] } } ] }
             
             # --- SURGICAL CHANGE START ---
@@ -1553,7 +1813,7 @@ if IS_BLENDER_CONTEXT:
             logging.info("All special texture ingest batches completed successfully.")
             # --- SURGICAL CHANGE END ---
 
-            stagecraft_api_url_base = addon_prefs.remix_server_url.rstrip('/')
+            stagecraft_api_url_base = discovered_stagecraft_url
             all_inputs_url = f"{stagecraft_api_url_base}/textures/?selection=true&filter_session_prims=false&exists=true"
             all_inputs_response = make_request_with_retries('GET', all_inputs_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
             if not all_inputs_response or all_inputs_response.status_code != 200: return {'CANCELLED'}
@@ -1634,84 +1894,104 @@ if IS_BLENDER_CONTEXT:
 
     def _hash_image(img, image_hash_cache):
         """
-        [DEFINITIVE V2 - UDIM AWARE]
-        Calculates a hash for an image datablock. It is now fully UDIM-aware,
-        iterating through all existing tile files and hashing their content
-        to ensure that changes to any tile will correctly invalidate the cache.
+        Calculate a content hash for a Blender image datablock.
+
+        Disk-backed images are cached using file signatures (path, size, mtime),
+        so edits to a texture invalidate the cache. UDIM sets include every tile.
+        Packed/generated images are hashed from their actual in-memory contents and
+        are intentionally not cached because their pixels may change without a file
+        timestamp changing.
         """
         if not img:
             return "NO_IMAGE_DATABLOCK"
 
-        cache_key = img.name_full if hasattr(img, 'name_full') else str(id(img))
-        if image_hash_cache is not None and cache_key in image_hash_cache:
-            return image_hash_cache[cache_key]
-
         calculated_digest = None
+        cache_key = None
         hasher = hashlib.md5()
 
+        def _hash_file_contents(file_path, digest):
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+
         try:
-            # --- NEW: UDIM HASHING LOGIC ---
-            if img.source == 'TILED':
-                logging.debug(f"  > Hashing UDIM set for '{img.name}'...")
-                found_any_tiles = False
-                # Sort tiles by number for a consistent hash order
-                sorted_tiles = sorted(img.tiles, key=lambda t: t.number)
-            
-                for tile in sorted_tiles:
-                    # Construct the real path for each tile file
+            source = getattr(img, 'source', 'NONE')
+
+            if source == 'TILED':
+                tiles = []
+                for tile in sorted(img.tiles, key=lambda t: t.number):
                     tile_path = abspath(img.filepath_raw.replace('<UDIM>', str(tile.number)))
                     if os.path.isfile(tile_path):
-                        found_any_tiles = True
-                        # Add the tile number to the hash to account for swaps
-                        hasher.update(str(tile.number).encode('utf-8'))
-                        # Add the content of the tile file to the hash
-                        with open(tile_path, "rb") as f:
-                            buf = f.read(131072) # Read first 128kb is enough
-                            hasher.update(buf)
+                        stat = os.stat(tile_path)
+                        tiles.append((tile.number, tile_path, stat.st_size, stat.st_mtime_ns))
                     else:
-                        # If a tile is missing, we still add its number to the hash
-                        # to differentiate from a set that doesn't have this tile defined.
-                        hasher.update(f"missing_{tile.number}".encode('utf-8'))
+                        tiles.append((tile.number, tile_path, None, None))
+
+                cache_key = ('TILED', tuple(tiles))
+                if image_hash_cache is not None and cache_key in image_hash_cache:
+                    return image_hash_cache[cache_key]
+
+                found_any_tiles = False
+                for tile_number, tile_path, size, mtime_ns in tiles:
+                    hasher.update(f"tile:{tile_number}|".encode('utf-8'))
+                    if os.path.isfile(tile_path):
+                        found_any_tiles = True
+                        hasher.update(f"size:{size}|mtime:{mtime_ns}|".encode('utf-8'))
+                        _hash_file_contents(tile_path, hasher)
+                    else:
+                        hasher.update(b"missing|")
 
                 if found_any_tiles:
                     calculated_digest = hasher.hexdigest()
-                else:
-                    logging.warning(f"  > UDIM set '{img.name}' has no valid tile files on disk.")
-                    # Fall through to the fallback hash method if no tiles were found
 
-            # --- EXISTING LOGIC FOR STANDARD TEXTURES ---
-            if calculated_digest is None:
-                if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
-                    data_to_hash = bytes(img.packed_file.data[:131072])
-                    hasher.update(data_to_hash)
+            if calculated_digest is None and source != 'TILED':
+                filepath_raw = getattr(img, 'filepath_raw', '') or ''
+                resolved_abs_path = abspath(filepath_raw) if filepath_raw else ''
+                if resolved_abs_path and os.path.isfile(resolved_abs_path):
+                    stat = os.stat(resolved_abs_path)
+                    cache_key = ('FILE', resolved_abs_path, stat.st_size, stat.st_mtime_ns)
+                    if image_hash_cache is not None and cache_key in image_hash_cache:
+                        return image_hash_cache[cache_key]
+
+                    hasher.update(f"file:{resolved_abs_path}|size:{stat.st_size}|mtime:{stat.st_mtime_ns}|".encode('utf-8'))
+                    _hash_file_contents(resolved_abs_path, hasher)
                     calculated_digest = hasher.hexdigest()
-            
-                elif hasattr(img, 'filepath_raw') and img.filepath_raw:
-                    resolved_abs_path = abspath(img.filepath_raw)
-                    if os.path.isfile(resolved_abs_path):
-                        with open(resolved_abs_path, "rb") as f:
-                            data_from_file = f.read(131072)
-                        hasher.update(data_from_file)
-                        calculated_digest = hasher.hexdigest()
 
-            # --- FALLBACK FOR GENERATED OR INVALID TEXTURES ---
-            if calculated_digest is None:
-                fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
-                hasher.update(fallback_data.encode('utf-8'))
+            if calculated_digest is None and getattr(img, 'packed_file', None):
+                packed_data = bytes(img.packed_file.data)
+                hasher.update(b"packed|")
+                hasher.update(packed_data)
                 calculated_digest = hasher.hexdigest()
+                cache_key = None
+
+            if calculated_digest is None:
+                # Generated/unsupported images: hash the actual pixel buffer so the
+                # cache cannot silently reuse a result after pixel edits.
+                try:
+                    pixels = img.pixels[:]
+                    hasher.update(b"pixels|")
+                    hasher.update(str(tuple(getattr(img, 'size', (0, 0, 0)))).encode('utf-8'))
+                    hasher.update(np.asarray(pixels, dtype=np.float32).tobytes())
+                    calculated_digest = hasher.hexdigest()
+                    cache_key = None
+                except Exception:
+                    fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{source}"
+                    hasher.update(fallback_data.encode('utf-8'))
+                    calculated_digest = hasher.hexdigest()
+                    cache_key = None
 
         except Exception as e:
-            logging.error(f"[_hash_image Error] Hashing failed for '{img.name}': {e}", exc_info=True)
-            # Ensure a failsafe hash is always returned
-            fallback_data = f"ERROR_FALLBACK|{getattr(img, 'name_full', 'N/A')}"
+            logging.error(f"[_hash_image Error] Hashing failed for '{getattr(img, 'name', 'N/A')}': {e}", exc_info=True)
+            fallback_data = f"ERROR_FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
             hasher.update(fallback_data.encode('utf-8'))
             calculated_digest = hasher.hexdigest()
+            cache_key = None
 
-        if image_hash_cache is not None:
+        if image_hash_cache is not None and cache_key is not None:
             image_hash_cache[cache_key] = calculated_digest
 
         return calculated_digest
-    
+
     def get_material_hash(mat, obj=None, material_slot_index=None, force=True, image_hash_cache=None, bake_method='EMIT_HIJACK', ignore_mesh_context=False):
         """
         [PRODUCTION VERSION - HYBRID HASHING] Calculates a highly detailed hash.
@@ -2180,16 +2460,73 @@ if IS_BLENDER_CONTEXT:
             total_start_time = time.perf_counter()
 
             try:
-                # --- Step 1: Fetch prim paths from Remix server ---
-                assets_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_assets=false&exists=true"
-                response = make_request_with_retries('GET', assets_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
-                if not response or response.status_code != 200:
-                    self.report({'ERROR'}, "Failed to connect to Remix server for asset list.")
+                # --- Step 1: Fetch selected prim paths directly. The asset endpoint is
+                # the authoritative connection test; a separate /status endpoint is not
+                # part of the documented Remix REST API. ---
+                server_url_base = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+                verify_ssl = bool(addon_prefs.remix_verify_ssl)
+                discovered_url, discovery_detail = discover_remix_server_url(server_url_base, verify_ssl)
+                if not discovered_url:
+                    self.report({'ERROR'}, f"RTX Remix REST API unavailable: {discovery_detail}")
+                    logging.error("RTX Remix REST API discovery failed during import: %s", discovery_detail)
+                    return {'CANCELLED'}
+                server_url_base = discovered_url
+                logging.info("Using discovered RTX Remix REST API endpoint: %s", server_url_base)
+
+                assets_url = (
+                    f"{server_url_base}/assets"
+                    f"?selection=true&prim_types=models&filter_session_assets=false&exists=true"
+                )
+                response = make_request_with_retries(
+                    'GET',
+                    assets_url,
+                    headers={
+                        'accept': f'application/lightspeed.remix.service+json; version={REMIX_API_VERSION}'
+                    },
+                    verify=verify_ssl,
+                )
+                if not response or not (200 <= response.status_code < 300):
+                    detail = (
+                        f"HTTP {response.status_code}" if response else "No response"
+                    )
+                    if response is not None and response.text:
+                        body = response.text.strip().replace("\n", " ")
+                        if len(body) > 400:
+                            body = body[:400] + "..."
+                        detail += f"; body: {body}"
+                    self.report(
+                        {'ERROR'},
+                        f"Remix asset list request failed: {detail}"
+                    )
+                    logging.error(
+                        "Asset list request failed for %s: %s", assets_url, detail
+                    )
                     return {'CANCELLED'}
 
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    self.report(
+                        {'ERROR'},
+                        "Remix returned invalid JSON for the asset list."
+                    )
+                    logging.error(
+                        "Invalid JSON from %s: %s\nResponse body: %s",
+                        assets_url,
+                        e,
+                        response.text[:1000],
+                    )
+                    return {'CANCELLED'}
+
                 prim_paths = data.get("prim_paths", data.get("asset_paths", []))
-                mesh_prim_paths = [path for path in prim_paths if "/meshes/" in path.lower()]
+                if not isinstance(prim_paths, list):
+                    raise RuntimeError(
+                        f"Unexpected asset-list response: 'prim_paths' is {type(prim_paths).__name__}, expected a list."
+                    )
+                mesh_prim_paths = [
+                    path for path in prim_paths
+                    if isinstance(path, str) and "/meshes/" in path.lower()
+                ]
 
                 if not mesh_prim_paths:
                     self.report({'WARNING'}, "No mesh assets found in Remix server selection.")
@@ -2203,9 +2540,16 @@ if IS_BLENDER_CONTEXT:
 
                 ref_prim_for_path_api = '/' + '/'.join(segments[:3])
                 encoded_ref_prim = urllib.parse.quote(ref_prim_for_path_api, safe='')
-                file_paths_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_ref_prim}/file-paths"
+                file_paths_url = f"{server_url_base}/assets/{encoded_ref_prim}/file-paths"
 
-                response_files = make_request_with_retries('GET', file_paths_url, headers={'accept': 'application/lightspeed.remix.service+json; version=1.0'}, verify=addon_prefs.remix_verify_ssl)
+                response_files = make_request_with_retries(
+                    'GET',
+                    file_paths_url,
+                    headers={
+                        'accept': f'application/lightspeed.remix.service+json; version={REMIX_API_VERSION}'
+                    },
+                    verify=verify_ssl,
+                )
                 if not response_files or response_files.status_code != 200:
                     raise RuntimeError("Failed to retrieve file paths for selected prims.")
 
@@ -2401,6 +2745,14 @@ if IS_BLENDER_CONTEXT:
         HIGH_USAGE_SUSTAINED_CHECKS: int = 20
         _high_usage_counter: int = 0
 
+        # Prevent malformed tasks or permanently broken worker environments from
+        # being requeued forever after worker-level errors.
+        MAX_WORKER_TASK_RETRIES: int = 2
+
+        # A Blender worker can fail during startup without exiting. Treat a worker
+        # that never reports READY within this window as a failed worker.
+        WORKER_READY_TIMEOUT_SEC: float = 60.0
+
         # Resource usage thresholds (as percentages).
         CPU_HIGH_THRESHOLD: int = 95
         RAM_HIGH_THRESHOLD: int = 95
@@ -2483,6 +2835,8 @@ if IS_BLENDER_CONTEXT:
         
                 slot['process'] = worker
                 slot['status'] = 'launching'
+                slot['status_before_task'] = 'idle'
+                slot['current_task'] = None
                 slot['launch_time'] = time.monotonic()
 
                 comm_thread = threading.Thread(target=self._communication_thread_target, args=(worker,), daemon=True)
@@ -2502,52 +2856,53 @@ if IS_BLENDER_CONTEXT:
                 slot['status'] = 'failed'            
         
         def _terminate_worker(self, slot_index):
-            """
-            [HYBRID SHUTDOWN V3 - CORRECTED STATUS] Gracefully shuts down a worker
-            and correctly sets its slot status to 'idle' upon completion, making it
-            available for reuse by the dynamic scaler.
-            """
+            """Gracefully stop a worker and always reset its slot state."""
             if slot_index >= len(self._worker_slots):
                 return
 
             slot = self._worker_slots[slot_index]
             worker = slot.get('process')
 
-            if worker and worker.poll() is None:
-                logging.info(f"Attempting graceful shutdown for worker in slot {slot_index} (PID: {worker.pid})...")
-                try:
-                    # --- Step 1: The Polite Request ---
-                    quit_command = json.dumps({"action": "quit"}) + "\n"
-                    worker.stdin.write(quit_command)
-                    worker.stdin.flush()
-                    worker.stdin.close() # Signal that we're done writing
-
-                    # --- Step 2: The Waiting Period (5 seconds) ---
-                    worker.wait(timeout=5)
-                    logging.info(f"Worker {slot_index} (PID: {worker.pid}) shut down gracefully.")
-
-                except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
-                    # --- Step 3: The Forceful Takedown (if graceful shutdown fails) ---
-                    logging.warning(f"Worker {slot_index} did not respond to quit command. Forcibly terminating (PID: {worker.pid}).")
-                    worker.terminate()
+            try:
+                if worker and worker.poll() is None:
+                    logging.info(f"Attempting graceful shutdown for worker in slot {slot_index} (PID: {worker.pid})...")
                     try:
-                        # Give it only 0.5 seconds to die after the terminate signal.
-                        worker.wait(timeout=0.5)
-                        logging.info(f"Worker {slot_index} (PID: {worker.pid}) terminated successfully.")
+                        if worker.stdin and not worker.stdin.closed:
+                            worker.stdin.write(json.dumps({"action": "quit"}) + "\n")
+                            worker.stdin.flush()
+                            worker.stdin.close()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
+
+                    try:
+                        worker.wait(timeout=5)
+                        logging.info(f"Worker {slot_index} (PID: {worker.pid}) shut down gracefully.")
                     except subprocess.TimeoutExpired:
-                        # If it's still alive after 0.5 seconds, use the final, most aggressive method.
-                        logging.error(f"Worker {slot_index} (PID: {worker.pid}) did not terminate. Killing process now.")
-                        worker.kill()
-                finally:
-                    # --- Final Cleanup ---
-                    if worker in ACTIVE_WORKER_PROCESSES:
-                        ACTIVE_WORKER_PROCESSES.remove(worker)
-                    slot['process'] = None
-                    # --- THIS IS THE FIX ---
-                    # The slot is now idle and available for a new worker to be launched into it.
-                    slot['status'] = 'idle'
-                    # --- END OF FIX ---
-                    
+                        logging.warning(f"Worker {slot_index} did not respond to quit. Terminating (PID: {worker.pid}).")
+                        try:
+                            worker.terminate()
+                            worker.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            logging.error(f"Worker {slot_index} did not terminate. Killing process (PID: {worker.pid}).")
+                            worker.kill()
+                            try:
+                                worker.wait(timeout=1)
+                            except subprocess.TimeoutExpired:
+                                pass
+                        except OSError:
+                            pass
+            finally:
+                if worker in ACTIVE_WORKER_PROCESSES:
+                    ACTIVE_WORKER_PROCESSES.remove(worker)
+                slot['process'] = None
+                slot['status'] = 'idle'
+                slot['status_before_task'] = 'idle'
+                slot['current_task'] = None
+                slot['launch_time'] = 0
+                slot['ready_time'] = 0
+                if self._standby_worker_slot_index == slot_index:
+                    self._standby_worker_slot_index = -1
+
         def _material_uses_udims(self, mat):
             """Checks if a material uses any UDIM (tiled) image textures."""
             if not mat or not mat.use_nodes:
@@ -3470,6 +3825,7 @@ if IS_BLENDER_CONTEXT:
                             elif status in ["success", "failure"]:
                                 self._finished_tasks += 1
                                 if status == "failure": self._failed_tasks += 1
+                                slot['current_task'] = None
                                 
                                 if slot['status_before_task'] == 'finishing_for_standby':
                                     logging.info(f"Worker {slot_index} finished its last task. Moving to STANDBY.")
@@ -3492,17 +3848,47 @@ if IS_BLENDER_CONTEXT:
                         except (json.JSONDecodeError, KeyError): pass
                 except Empty: pass
 
+                # Detect workers that exited without sending a final JSON result.
+                # This covers crashes, OOM termination, and abnormal process exits.
+                for i, slot in enumerate(self._worker_slots):
+                    worker = slot.get('process')
+                    status = slot.get('status')
+                    if worker and status in {'launching', 'running'}:
+                        exit_code = worker.poll()
+                        if exit_code is not None:
+                            logging.error(
+                                f"Worker in slot {i} (PID: {worker.pid}) exited unexpectedly "
+                                f"with code {exit_code} while status was '{status}'."
+                            )
+                            self._handle_failed_worker(i, requeue_task=(status == 'running'))
+                            if self._operator_state not in {'FINISHING', 'CLEANING_UP'} and self._master_task_queue:
+                                self._launch_new_worker(i)
+                            continue
+
+                        if status == 'launching' and time.monotonic() - slot.get('launch_time', 0) > self.WORKER_READY_TIMEOUT_SEC:
+                            logging.error(
+                                f"Worker in slot {i} (PID: {worker.pid}) did not report READY within "
+                                f"{self.WORKER_READY_TIMEOUT_SEC:.0f} seconds. Restarting worker."
+                            )
+                            self._handle_failed_worker(i, requeue_task=False)
+                            if self._operator_state not in {'FINISHING', 'CLEANING_UP'} and self._master_task_queue:
+                                self._launch_new_worker(i)
+
                 for i, slot in enumerate(self._worker_slots):
                     if slot['status'] == 'ready' and self._master_task_queue:
                         task_to_dispatch = self._master_task_queue.popleft()
                         try:
+                            # Keep the in-flight task attached to the slot before writing
+                            # to stdin so any broken pipe or process death can recover it.
+                            slot['current_task'] = task_to_dispatch
                             slot['process'].stdin.write(json.dumps(task_to_dispatch) + "\n")
                             slot['process'].stdin.flush()
                             slot['status'] = 'running'
                             slot['status_before_task'] = 'running'
-                        except (IOError, BrokenPipeError):
-                            self._master_task_queue.appendleft(task_to_dispatch)
-                            self._handle_failed_worker(i, requeue_task=False)
+                            slot['task_start_time'] = time.monotonic()
+                        except (IOError, BrokenPipeError, OSError, ValueError) as e:
+                            logging.error(f"Failed to dispatch task to worker {i}: {e}")
+                            self._handle_failed_worker(i, requeue_task=True)
 
                 current_time = time.monotonic()
                 cpu_now, ram_now = self._get_system_resources()
@@ -3814,7 +4200,14 @@ if IS_BLENDER_CONTEXT:
             try:
                 # --- SURGICAL CHANGE START: This is the corrected pre-flight check ---
                 logging.info("--- Starting Pre-flight Remix Selection Check ---")
-                selection_check_url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/?selection=true&filter_session_prims=false&exists=true"
+                configured_server_url = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+                discovered_server_url, discovery_detail = discover_remix_server_url(
+                    configured_server_url, bool(addon_prefs.remix_verify_ssl)
+                )
+                if not discovered_server_url:
+                    logging.error("RTX Remix REST API discovery failed during selection check: %s", discovery_detail)
+                    return {'CANCELLED'}
+                selection_check_url = f"{discovered_server_url}/assets/?selection=true&filter_session_prims=false&exists=true"
                 headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
                 
                 response = make_request_with_retries('GET', selection_check_url, headers=headers, verify=addon_prefs.remix_verify_ssl)
@@ -3982,10 +4375,31 @@ if IS_BLENDER_CONTEXT:
 
                     for i, task in enumerate(all_tasks):
                         obj = bpy.data.objects.get(task['object_name'])
-                        mat = bpy.data.materials.get(task['material_name'])
-                        if not obj or not mat:
-                            logging.error(f"Could not find object or material for task {i}. Skipping file creation.")
-                            continue
+                        if not obj:
+                            raise RuntimeError(
+                                f"Could not find object '{task.get('object_name')}' for task {i}."
+                            )
+
+                        # Material names are not unique in Blender, so resolve by UUID
+                        # on the object's actual material slots whenever possible.
+                        material_uuid = task.get('material_uuid')
+                        mat = None
+                        if material_uuid:
+                            for slot in obj.material_slots:
+                                if slot.material and slot.material.get('uuid') == material_uuid:
+                                    mat = slot.material
+                                    break
+                        if mat is None:
+                            mat = next(
+                                (slot.material for slot in obj.material_slots
+                                 if slot.material and slot.material.name == task.get('material_name')),
+                                None
+                            )
+                        if mat is None:
+                            raise RuntimeError(
+                                f"Could not resolve material '{task.get('material_name')}' "
+                                f"(UUID: {material_uuid}) on object '{obj.name}' for task {i}."
+                            )
                 
                         datablocks_to_save = set()
                         datablocks_to_save.add(obj)
@@ -4042,22 +4456,36 @@ if IS_BLENDER_CONTEXT:
                 
         def _handle_failed_worker(self, slot_index, requeue_task=True):
             """
-            Manages a worker that has stopped, either by crashing or by being
-            gracefully terminated. Can requeue the task it was working on.
+            Recover a stopped worker. An in-flight task is requeued up to
+            MAX_WORKER_TASK_RETRIES; after that it is counted as failed so export
+            progress cannot remain stuck forever.
             """
-            if slot_index >= len(self._worker_slots): return
-    
+            if slot_index >= len(self._worker_slots):
+                return
+
             slot = self._worker_slots[slot_index]
-    
-            # If requested, put the task it was working on back at the front of the queue.
-            if requeue_task and 'current_task' in slot and slot['current_task']:
-                task = slot['current_task']
-                self._master_task_queue.appendleft(task)
-                logging.warning(f"Requeueing task for material '{task.get('material_name')}' from failed worker {slot_index}.")
-    
-            slot['current_task'] = None
-            slot['flagged_for_termination'] = False # Reset flag
-            self._terminate_worker(slot_index) # This will terminate the process and set status to 'suspended'
+            task = slot.get('current_task')
+
+            if requeue_task and task:
+                retries = int(task.get('_worker_retries', 0)) + 1
+                task['_worker_retries'] = retries
+                if retries <= self.MAX_WORKER_TASK_RETRIES:
+                    self._master_task_queue.appendleft(task)
+                    logging.warning(
+                        f"Requeueing task for material '{task.get('material_name')}' "
+                        f"from failed worker {slot_index} (retry {retries}/{self.MAX_WORKER_TASK_RETRIES})."
+                    )
+                else:
+                    self._finished_tasks += 1
+                    self._failed_tasks += 1
+                    if self._operator_state == 'STABILIZING':
+                        self._initial_tasks_finished_count += 1
+                    logging.error(
+                        f"Task for material '{task.get('material_name')}' exceeded the maximum "
+                        f"worker retry count and is being marked as failed."
+                    )
+
+            self._terminate_worker(slot_index)
 
         def _combine_color_and_alpha(self, color_map_path, alpha_mask_path):
             """
@@ -4864,7 +5292,14 @@ if IS_BLENDER_CONTEXT:
     def upload_to_api(obj_path, ingest_dir, context):
         addon_prefs = context.preferences.addons[__name__].preferences
         try:
-            url = addon_prefs.remix_export_url.rstrip('/') + "/model"
+            configured_stagecraft = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+            discovered_stagecraft, discovery_detail = discover_remix_server_url(
+                configured_stagecraft, bool(addon_prefs.remix_verify_ssl)
+            )
+            if not discovered_stagecraft:
+                logging.error("RTX Remix REST API discovery failed before model ingest: %s", discovery_detail)
+                return None
+            url = remap_url_to_remix_server(addon_prefs.remix_export_url, discovered_stagecraft) + "/model"
             abs_obj_path = os.path.abspath(obj_path).replace('\\', '/')
             meshes_subdir = os.path.join(ingest_dir, "meshes").replace('\\', '/')
 
@@ -4981,7 +5416,13 @@ if IS_BLENDER_CONTEXT:
         """
         addon_prefs = context.preferences.addons[__name__].preferences
         try:
-            server_url = addon_prefs.remix_server_url.rstrip('/')
+            configured_server_url = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+            server_url, discovery_detail = discover_remix_server_url(
+                configured_server_url, bool(addon_prefs.remix_verify_ssl)
+            )
+            if not server_url:
+                logging.error("RTX Remix REST API discovery failed while checking existing prims: %s", discovery_detail)
+                return None, None
             get_url = f"{server_url}/assets/?selection=false&filter_session_assets=false&exists=true"
             headers = {'accept': 'application/lightspeed.remix.service+json; version=1.0'}
 
@@ -5079,7 +5520,14 @@ if IS_BLENDER_CONTEXT:
             logging.debug(f"Encoded trimmed prim path: {encoded_path}")
             print(f"Encoded trimmed prim path: {encoded_path}")
 
-            url = f"{addon_prefs.remix_server_url.rstrip('/')}/assets/{encoded_path}/file-paths"
+            configured_server_url = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+            discovered_server_url, discovery_detail = discover_remix_server_url(
+                configured_server_url, bool(addon_prefs.remix_verify_ssl)
+            )
+            if not discovered_server_url:
+                logging.error("RTX Remix REST API discovery failed while fetching file paths: %s", discovery_detail)
+                return None
+            url = f"{discovered_server_url}/assets/{encoded_path}/file-paths"
             logging.debug(f"Constructed PUT URL: {url}")
             print(f"Constructed PUT URL: {url}")
 
@@ -5151,11 +5599,14 @@ if IS_BLENDER_CONTEXT:
             logging.debug(f"Encoded parent prim path: {encoded_parent_prim}")
             print(f"Encoded parent prim path: {encoded_parent_prim}")
 
-            base_url = addon_prefs.remix_server_url.rstrip('/')
-            if base_url.endswith('/stagecraft'):
-                append_url = f"{base_url}/assets/{encoded_parent_prim}/file-paths"
-            else:
-                append_url = f"{base_url}/stagecraft/assets/{encoded_parent_prim}/file-paths"
+            configured_server_url = normalize_remix_stagecraft_url(addon_prefs.remix_server_url)
+            discovered_server_url, discovery_detail = discover_remix_server_url(
+                configured_server_url, bool(addon_prefs.remix_verify_ssl)
+            )
+            if not discovered_server_url:
+                logging.error("RTX Remix REST API discovery failed while appending mesh: %s", discovery_detail)
+                return False, None
+            append_url = f"{discovered_server_url}/assets/{encoded_parent_prim}/file-paths"
             logging.debug(f"Constructed append URL: {append_url}")
             print(f"Constructed append URL: {append_url}")
 
@@ -5419,6 +5870,7 @@ if IS_BLENDER_CONTEXT:
         # --- The new generalized installer and restart operators ---
         REMIX_OT_install_dependency,
         REMIX_OT_restart_blender,
+        REMIX_OT_test_server_connection,
         OBJECT_OT_flip_normals_on_selected,
     ]           
     
@@ -5453,12 +5905,6 @@ if IS_BLENDER_CONTEXT:
             for cls in classes:
                 bpy.utils.register_class(cls)
 
-            # --- START OF THE FIX ---
-            # The line causing the NameError has been removed. There was no definition
-            # for the 'CustomSettingsBackup' class, so this PointerProperty could not be created.
-            # bpy.types.Scene.remix_custom_settings_backup = PointerProperty(type=CustomSettingsBackup) # <-- REMOVED THIS LINE
-            # --- END OF THE FIX ---
-
             bpy.types.Scene.remix_asset_number = CollectionProperty(type=AssetNumberItem)
         
             # This flag is still useful for showing the "Installing..." message.
@@ -5485,13 +5931,12 @@ if IS_BLENDER_CONTEXT:
             try: bpy.utils.unregister_class(cls)
             except RuntimeError: pass
         
-        try:
-            del bpy.types.Scene.remix_asset_number
-            del bpy.types.Scene.remix_custom_settings_backup
-            # Remove the now-unused property.
-            del bpy.types.Scene.remix_is_installing_dependency
-        except (AttributeError, TypeError):
-            pass
+        for prop_name in ('remix_asset_number', 'remix_is_installing_dependency'):
+            try:
+                if hasattr(bpy.types.Scene, prop_name):
+                    delattr(bpy.types.Scene, prop_name)
+            except (AttributeError, TypeError):
+                pass
         
         log.info("Remix Ingestor addon unregistered.")
 
