@@ -24,3 +24,10 @@ fall back to another available HTTP port (for example 8048). The addon first tri
 configured server URL, then inspects local Windows TCP listeners and checks the
 OpenAPI schema for RTX Remix routes. The discovered port is used for import, export,
 asset selection, file-path lookups, and texture ingestion.
+
+## Toolkit compatibility
+
+Version 3.5.5 reads the running Toolkit's OpenAPI schema before ingestion and sends
+the supported ConvertToDDS settings. It also uses recovered image files when the
+original texture paths are missing. Restart Blender or Bforartists after updating
+the add-on so the new Python code is loaded.
