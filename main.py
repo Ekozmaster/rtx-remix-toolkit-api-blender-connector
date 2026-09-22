@@ -2,7 +2,7 @@ bl_info = {
     "name": "Remix Asset Ingestion",
     "blender": (4, 2, 0),
     "category": "Helper",
-    "version": (3, 5, 4), # dynamic Remix REST port discovery
+    "version": (3, 5, 5), # Toolkit DDS schema and recovered texture compatibility
     "author": "Frisser :) (Integrated Baking by Gemini)",
     "description": "Export mesh assets as OBJ, with parallel texture baking, ingest into Remix with versioning, and handle multiple textures.",
     "location": "View3D > Remix Ingestor",
@@ -1450,6 +1450,50 @@ if IS_BLENDER_CONTEXT:
         except ValueError:
             return raw_url.rstrip("/")
 
+    def adapt_dds_payload_for_toolkit(payload, stagecraft_url, schema_name, verify_ssl=True):
+        """Translate legacy DDS options when the running Toolkit uses typed settings."""
+        schema_url = f"{get_remix_api_root_url(stagecraft_url)}/openapi.json"
+        response = requests.get(schema_url, timeout=5, verify=verify_ssl)
+        response.raise_for_status()
+        schema = response.json()["components"]["schemas"][schema_name]
+        default_plugins = schema["properties"]["check_plugins"]["default"]
+        server_dds = next(plugin for plugin in default_plugins if plugin["name"] == "ConvertToDDS")
+        server_dds_data = server_dds["data"]
+
+        for plugin in payload["check_plugins"]:
+            if plugin["name"] != "ConvertToDDS":
+                continue
+            data = plugin["data"]
+            if "conversion_settings" not in server_dds_data:
+                return payload  # Older Toolkit versions still accept conversion_args.
+
+            legacy_args = data.pop("conversion_args", None)
+            if legacy_args is None:
+                return payload
+
+            settings = {}
+            for attribute, entry in legacy_args.items():
+                args = entry["args"]
+                if "--format" not in args:
+                    raise ValueError(f"Missing DDS format for {attribute}")
+                block_format = args[args.index("--format") + 1]
+                if "--mip-gamma-correct" in args:
+                    gamma_encoded = True
+                elif "--no-mip-gamma-correct" in args:
+                    gamma_encoded = False
+                else:
+                    raise ValueError(f"Missing DDS gamma setting for {attribute}")
+                converted = {"block_format": block_format, "gamma_encoded": gamma_encoded}
+                if "--mip-filter" in args:
+                    converted["mip_filter"] = args[args.index("--mip-filter") + 1]
+                settings[attribute] = converted
+
+            data["conversion_settings"] = settings
+            logging.info("Using typed ConvertToDDS settings required by RTX Remix Toolkit.")
+            return payload
+
+        return payload
+
     def check_remix_server_status(stagecraft_url, verify_ssl=True):
         """Check the RTX Remix REST server, including automatic port discovery."""
         discovered_url, detail = discover_remix_server_url(stagecraft_url, verify_ssl)
@@ -1775,6 +1819,11 @@ if IS_BLENDER_CONTEXT:
             )
             base_ingest_payload = { "executor": 1, "name": "Material(s)", "context_plugin": { "name": "TextureImporter", "data": { "allow_empty_input_files_list": True, "channel": "Default", "context_name": "ingestcraft", "cook_mass_template": True, "create_context_if_not_exist": True, "create_output_directory_if_missing": True, "data_flows": [ { "channel": "Default", "name": "InOutData", "push_input_data": True, "push_output_data": False } ], "default_output_endpoint": "/stagecraft/assets/default-directory", "expose_mass_queue_action_ui": False, "expose_mass_ui": True, "global_progress_value": 0, "hide_context_ui": True, "input_files": [], "output_directory": "", "progress": [ 0, "Initializing", True ] } }, "check_plugins": [ { "name": "MaterialShaders", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllMaterials" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "ignore_not_convertable_shaders": False, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True, "shader_subidentifiers": { "AperturePBR_Opacity": ".*" } }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToOctahedral", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files_normal", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:normalmap_texture": { "encoding_attr": "inputs:encoding", "replace_suffix": "_Normal", "suffix": "_OTH_Normal" } }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files_normal", "name": "InOutData", "push_input_data": True, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "ConvertToDDS", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "AllShaders" } ], "resultor_plugins": [ { "data": { "channel": "cleanup_files", "cleanup_input": True, "cleanup_output": False, "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] }, "name": "FileCleanup" } ], "data": { "channel": "Default", "conversion_args": { "inputs:diffuse_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:emissive_mask_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:height_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct", "--mip-filter", "max" ] }, "inputs:metallic_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:normalmap_texture": { "args": [ "--format", "bc5", "--no-mip-gamma-correct" ] }, "inputs:reflectionroughness_texture": { "args": [ "--format", "bc4", "--no-mip-gamma-correct" ] }, "inputs:transmittance_texture": { "args": [ "--format", "bc7", "--mip-gamma-correct" ] }, "inputs:subsurface_color_texture": {"args": ["--format", "bc7", "--mip-gamma-correct"]}, "inputs:subsurface_radius_texture": {"args": ["--format", "bc4", "--no-mip-gamma-correct"]} }, "cook_mass_template": False, "data_flows": [ { "channel": "cleanup_files", "name": "InOutData", "push_input_data": True, "push_output_data": True }, { "channel": "write_metadata", "name": "InOutData", "push_input_data": False, "push_output_data": True }, { "channel": "ingestion_output", "name": "InOutData", "push_input_data": False, "push_output_data": True } ], "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "replace_udim_textures_by_empty": False, "save_on_fix_failure": True, "suffix": ".rtex.dds" }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } }, { "name": "MassTexturePreview", "selector_plugins": [ { "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "select_from_root_layer_only": False }, "name": "Nothing" } ], "data": { "channel": "Default", "cook_mass_template": False, "expose_mass_queue_action_ui": True, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ], "save_on_fix_failure": True }, "stop_if_fix_failed": True, "context_plugin": { "data": { "channel": "Default", "close_stage_on_exit": False, "cook_mass_template": False, "create_context_if_not_exist": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "hide_context_ui": False, "progress": [ 0, "Initializing", True ], "save_on_exit": False }, "name": "CurrentStage" } } ], "resultor_plugins": [ { "name": "FileMetadataWritter", "data": { "channel": "write_metadata", "cook_mass_template": False, "expose_mass_queue_action_ui": False, "expose_mass_ui": False, "global_progress_value": 0, "progress": [ 0, "Initializing", True ] } } ] }
             
+            base_ingest_payload = adapt_dds_payload_for_toolkit(
+                base_ingest_payload, discovered_stagecraft_url, "AddMaterialItemToQueue",
+                bool(addon_prefs.remix_verify_ssl),
+            )
+
             # --- SURGICAL CHANGE START ---
             import copy
             
@@ -3119,6 +3168,9 @@ if IS_BLENDER_CONTEXT:
             source_node = self._find_ultimate_source_node(socket)
         
             if source_node and source_node.type == 'TEX_IMAGE' and source_node.image:
+                recovered_path = self._export_data.get('texture_translation_map', {}).get(source_node.image.name)
+                if recovered_path and os.path.isfile(recovered_path):
+                    return recovered_path
                 try:
                     filepath = abspath(source_node.image.filepath_from_user())
                     if os.path.exists(filepath):
@@ -5355,6 +5407,10 @@ if IS_BLENDER_CONTEXT:
             # --- Inject dynamic values into the correct payload ---
             payload["context_plugin"]["data"]["input_files"] = [abs_obj_path]
             payload["context_plugin"]["data"]["output_directory"] = meshes_subdir
+            payload = adapt_dds_payload_for_toolkit(
+                payload, discovered_stagecraft, "AddModelItemToQueue",
+                bool(addon_prefs.remix_verify_ssl),
+            )
 
             logging.info(f"Uploading OBJ to {url}")
             # Using the previously corrected make_request_with_retries to get detailed errors
